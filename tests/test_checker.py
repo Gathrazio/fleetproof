@@ -1,0 +1,104 @@
+"""Tests for the independent checker runner — including the separate-process property."""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+from fleetproof.checker import run_check, run_checks
+from fleetproof.checks import Check
+from fleetproof.runlog import list_run_records
+
+
+def _check(cid, run=None, expect=None, block=True):
+    return Check(id=cid, run=run, expect=expect or {"kind": "exit0"}, block=block)
+
+
+def test_exit0_pass_and_fail(tmp_project):
+    ok = run_check(_check("ok", run=f'"{sys.executable}" -c "raise SystemExit(0)"'), tmp_project)
+    bad = run_check(_check("bad", run=f'"{sys.executable}" -c "raise SystemExit(0)"',
+                           expect={"kind": "exit", "code": 5}), tmp_project)
+    assert ok.passed is True
+    assert bad.passed is False
+
+
+def test_exit_specific_code(tmp_project):
+    r = run_check(
+        _check("e3", run=f'"{sys.executable}" -c "raise SystemExit(3)"',
+               expect={"kind": "exit", "code": 3}),
+        tmp_project,
+    )
+    assert r.passed is True and r.returncode == 3
+
+
+def test_regex_match(tmp_project):
+    r = run_check(
+        _check("re", run=f'"{sys.executable}" -c "print(\'hello world\')"',
+               expect={"kind": "regex", "pattern": "hello"}),
+        tmp_project,
+    )
+    assert r.passed is True
+
+
+def test_file_exists(tmp_project):
+    (tmp_project / "artifact.txt").write_text("x", encoding="utf-8")
+    present = run_check(_check("f1", expect={"kind": "file_exists", "path": "artifact.txt"}), tmp_project)
+    absent = run_check(_check("f2", expect={"kind": "file_exists", "path": "nope.txt"}), tmp_project)
+    assert present.passed is True
+    assert absent.passed is False
+
+
+def test_unrunnable_check_is_a_failure_not_a_pass(tmp_project):
+    # A command that cannot complete must never be graded as passing.
+    r = run_check(_check("hang", run=f'"{sys.executable}" -c "import time; time.sleep(5)"'),
+                  tmp_project, timeout=1)
+    assert r.passed is False
+    assert r.returncode is None
+
+
+def test_checker_runs_command_in_a_separate_process(tmp_project):
+    # The independence guarantee, made observable: the check command runs in a
+    # different OS process than the runner/test process.
+    script = tmp_project / "emit_pid.py"
+    script.write_text(
+        "import os, pathlib; pathlib.Path('child_pid.txt').write_text(str(os.getpid()))",
+        encoding="utf-8",
+    )
+    check = _check("pid", run=f'"{sys.executable}" emit_pid.py')
+    report = run_checks([check], cwd=tmp_project, record_to_log=False)
+    assert report.verdict == "pass"
+    child_pid = int((tmp_project / "child_pid.txt").read_text(encoding="utf-8"))
+    assert child_pid != os.getpid()
+
+
+def test_verdict_blocking_vs_nonblocking(tmp_project):
+    checks = [
+        _check("blocking-fail", run=f'"{sys.executable}" -c "raise SystemExit(1)"', block=True),
+        _check("advisory-fail", run=f'"{sys.executable}" -c "raise SystemExit(1)"', block=False),
+    ]
+    report = run_checks(checks, cwd=tmp_project, record_to_log=False)
+    assert report.verdict == "fail"
+    assert len(report.blocking_failures) == 1
+
+    only_advisory = run_checks(
+        [_check("advisory", run=f'"{sys.executable}" -c "raise SystemExit(1)"', block=False)],
+        cwd=tmp_project, record_to_log=False,
+    )
+    # A non-blocking failure does not gate "done".
+    assert only_advisory.verdict == "pass"
+    assert only_advisory.failed == 1
+
+
+def test_run_checks_records_verdict_to_log(tmp_runs, tmp_project):
+    checks = [_check("ok", run=f'"{sys.executable}" -c "raise SystemExit(0)"')]
+    report = run_checks(checks, cwd=tmp_project, record_to_log=True)
+    runs = list_run_records()
+    assert len(runs) == 1
+    check_subs = [s for s in runs[0].sub_invocations if s.tool == "fleetproof" and s.subcmd == "check"]
+    assert len(check_subs) == 1
+    payload = check_subs[0].load_output()
+    assert payload["verdict"] == "pass"
+    assert payload["checks"][0]["id"] == "ok"
+    # The recorder captured the checker's own pid — evidence it recorded from a real process.
+    assert "recorded_from_pid" in payload
