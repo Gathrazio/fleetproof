@@ -3,6 +3,9 @@
   "owner": {
     "name": "Gathrazio"
   },
+  "metadata": {
+    "description": "FleetProof — independent, out-of-band verification for Claude Code agent fleets."
+  },
   "plugins": [
     {
       "name": "fleetproof",
