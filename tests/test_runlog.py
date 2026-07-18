@@ -178,7 +178,7 @@ def test_load_run_missing_returns_none(tmp_runs):
     assert load_run("nope") is None
 
 
-def test_no_gcc_naming_leaked_into_env_constants():
-    # Guardrail: the scrub must be complete.
+def test_env_constants_use_fleetproof_namespace():
+    # Guardrail: every env var this package reads is namespaced.
     for name in (RUN_ID_ENV, runlog.RUNS_DIR_ENV, runlog.PARENT_RUN_ID_ENV, runlog.NO_RECORD_ENV):
         assert name.startswith("FLEETPROOF_")
