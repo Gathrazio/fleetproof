@@ -1,0 +1,260 @@
+"""FleetProof command-line interface.
+
+Stdlib only (argparse) — a verification tool should add as little dependency
+surface as it can. Subcommands:
+
+    init      write a starter .fleetproof/checks.json
+    check     run the independent checker, record the verdict, exit non-zero on block
+    list      list recorded runs, newest first
+    show      show one run and its sub-invocations
+    report    render the self-contained HTML run report
+    cleanup   delete run records older than N days
+    stop-gate Stop-hook entry: emit a Claude Code block decision on a false "done"
+    record    PostToolUse-hook entry: append an evidence record from hook stdin
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# The CLI must not record its own invocations.
+os.environ.setdefault("FLEETPROOF_NO_RECORD", "1")
+
+from . import __version__
+from .checker import format_report_text, run_checks
+from .checks import (
+    CheckSpecError,
+    STARTER_SPEC,
+    default_checks_path,
+    load_checks,
+)
+from .hookgate import record_tool_main, stop_gate_main
+from .report import write_report
+from .runlog import PROJECT_MARKER, list_run_records, load_run, project_root, runs_dir
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    path = Path(args.path) if args.path else default_checks_path()
+    if path.exists() and not args.force:
+        print(f"Refusing to overwrite existing {path} (use --force).", file=sys.stderr)
+        return 1
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(STARTER_SPEC, indent=2) + "\n", encoding="utf-8")
+    print(f"Wrote starter check spec to {path}")
+    print("Edit it to declare what 'done' means for this repo, then run `fleetproof check`.")
+    return 0
+
+
+def _cmd_check(args: argparse.Namespace) -> int:
+    try:
+        checks = load_checks(Path(args.spec) if args.spec else None)
+    except CheckSpecError as e:
+        _emit_error("check_spec_error", str(e), args.format)
+        return 2
+    report = run_checks(checks, record_to_log=not args.no_record)
+    if args.format == "json":
+        payload = report.to_dict()
+        payload["run_id"] = report.run_id
+        print(json.dumps(payload, indent=2))
+    else:
+        print(format_report_text(report))
+    return 1 if report.verdict == "fail" else 0
+
+
+def _cmd_list(args: argparse.Namespace) -> int:
+    records = list_run_records()
+    rows = []
+    for r in records:
+        failed = r.failed_count
+        if args.status == "ok" and failed > 0:
+            continue
+        if args.status == "fail" and failed == 0:
+            continue
+        rows.append(r)
+        if args.limit and len(rows) >= args.limit:
+            break
+    if args.format == "json":
+        print(json.dumps({
+            "runs": [
+                {
+                    "run_id": r.run_id,
+                    "root_tool": r.root_tool,
+                    "started_at": r.started_at,
+                    "sub_count": len(r.sub_invocations),
+                    "failed_count": r.failed_count,
+                }
+                for r in rows
+            ]
+        }, indent=2))
+        return 0
+    if not rows:
+        print("No runs found.")
+        return 0
+    print(f"{'run_id':<24} {'root_tool':<16} {'started':<20} {'subs':>5} {'failed':>7}")
+    for r in rows:
+        print(f"{r.run_id:<24} {(r.root_tool or '-'):<16} "
+              f"{(r.started_at or '-')[:19]:<20} {len(r.sub_invocations):>5} {r.failed_count:>7}")
+    return 0
+
+
+def _cmd_show(args: argparse.Namespace) -> int:
+    r = load_run(args.run_id)
+    if r is None:
+        _emit_error("run_not_found", f"No run record for {args.run_id!r}", args.format)
+        return 1
+    if args.format == "json":
+        print(json.dumps({
+            "run_id": r.run_id,
+            "root_tool": r.root_tool,
+            "started_at": r.started_at,
+            "sub_invocations": [
+                {
+                    "tool": s.tool,
+                    "subcmd": s.subcmd,
+                    "started_at": s.started_at,
+                    "exit_code": s.exit_code,
+                    "duration_ms": s.duration_ms,
+                    "exception_type": s.exception_type,
+                    "record_dir": str(s.record_dir),
+                }
+                for s in r.sub_invocations
+            ],
+        }, indent=2))
+        return 0
+    print(f"{r.run_id}  root_tool={r.root_tool or '-'}  started={(r.started_at or '-')[:19]}")
+    for s in r.sub_invocations:
+        if s.exit_code is None:
+            badge = "?"
+        elif s.exit_code == 0 and not s.exception_type:
+            badge = "ok"
+        else:
+            badge = "fail"
+        dur = f"{s.duration_ms:.1f}ms" if s.duration_ms is not None else "?ms"
+        print(f"  [{badge}] {s.tool} {s.subcmd} ({dur})  {s.record_dir}")
+    return 0
+
+
+def _cmd_report(args: argparse.Namespace) -> int:
+    out = Path(args.output) if args.output else project_root() / PROJECT_MARKER / "fleetproof-report.html"
+    written = write_report(out)
+    print(f"Wrote report to {written}")
+    return 0
+
+
+def _cmd_cleanup(args: argparse.Namespace) -> int:
+    rd = runs_dir()
+    deleted, skipped = [], []
+    if rd.exists():
+        cutoff = datetime.now(timezone.utc) - timedelta(days=args.older_than_days)
+        for run_dir in sorted(rd.iterdir()):
+            if not run_dir.is_dir() or run_dir.name.startswith("."):
+                continue
+            started = _run_started_at(run_dir)
+            if started is None or started >= cutoff:
+                skipped.append(run_dir.name)
+                continue
+            if not args.dry_run:
+                shutil.rmtree(run_dir, ignore_errors=True)
+            deleted.append(run_dir.name)
+    prefix = "DRY RUN " if args.dry_run else ""
+    print(f"{prefix}Deleted {len(deleted)} runs, skipped {len(skipped)}.")
+    return 0
+
+
+def _run_started_at(run_dir: Path) -> datetime | None:
+    record = load_run(run_dir.name)
+    if record and record.started_at:
+        try:
+            return datetime.fromisoformat(record.started_at)
+        except ValueError:
+            pass
+    try:
+        return datetime.fromtimestamp(run_dir.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return None
+
+
+def _cmd_stop_gate(args: argparse.Namespace) -> int:
+    return stop_gate_main()
+
+
+def _cmd_record(args: argparse.Namespace) -> int:
+    # PostToolUse recorder must be allowed to write records.
+    os.environ["FLEETPROOF_NO_RECORD"] = "0"
+    return record_tool_main()
+
+
+def _emit_error(code: str, message: str, fmt: str) -> None:
+    if fmt == "json":
+        print(json.dumps({"ok": False, "error_code": code, "message": message}), file=sys.stderr)
+    else:
+        print(f"error ({code}): {message}", file=sys.stderr)
+
+
+def _add_format(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--format", choices=["human", "json"], default="human",
+                   help="Output format. Use json for agent consumption.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="fleetproof",
+        description="Independent, out-of-band verification for agent fleets.",
+    )
+    parser.add_argument("--version", action="version", version=f"fleetproof {__version__}")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_init = sub.add_parser("init", help="Write a starter .fleetproof/checks.json.")
+    p_init.add_argument("--path", default=None, help="Where to write the spec.")
+    p_init.add_argument("--force", action="store_true", help="Overwrite an existing spec.")
+    p_init.set_defaults(func=_cmd_init)
+
+    p_check = sub.add_parser("check", help="Run the independent checker and record the verdict.")
+    p_check.add_argument("--spec", default=None, help="Path to a check spec (default: .fleetproof/checks.json).")
+    p_check.add_argument("--no-record", action="store_true", help="Do not write to the run log.")
+    _add_format(p_check)
+    p_check.set_defaults(func=_cmd_check)
+
+    p_list = sub.add_parser("list", help="List recorded runs, newest first.")
+    p_list.add_argument("--status", choices=["ok", "fail"], default=None)
+    p_list.add_argument("--limit", type=int, default=20)
+    _add_format(p_list)
+    p_list.set_defaults(func=_cmd_list)
+
+    p_show = sub.add_parser("show", help="Show a run and its sub-invocations.")
+    p_show.add_argument("run_id")
+    _add_format(p_show)
+    p_show.set_defaults(func=_cmd_show)
+
+    p_report = sub.add_parser("report", help="Render the self-contained HTML run report.")
+    p_report.add_argument("-o", "--output", default=None, help="Output HTML path.")
+    p_report.set_defaults(func=_cmd_report)
+
+    p_cleanup = sub.add_parser("cleanup", help="Delete run records older than N days.")
+    p_cleanup.add_argument("--older-than-days", type=int, required=True)
+    p_cleanup.add_argument("--dry-run", action="store_true")
+    p_cleanup.set_defaults(func=_cmd_cleanup)
+
+    p_stop = sub.add_parser("stop-gate", help="Stop-hook entry: emit a block decision on a false 'done'.")
+    p_stop.set_defaults(func=_cmd_stop_gate)
+
+    p_rec = sub.add_parser("record", help="PostToolUse-hook entry: record a tool call from hook stdin.")
+    p_rec.set_defaults(func=_cmd_record)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
