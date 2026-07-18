@@ -1,0 +1,32 @@
+{
+  "checks": [
+    {
+      "id": "tests-pass",
+      "run": "python -m pytest -q",
+      "expect": "exit0",
+      "block": true,
+      "description": "Unit tests must pass before a task can be called done."
+    },
+    {
+      "id": "build-succeeds",
+      "run": "python -m build",
+      "expect": "exit0",
+      "block": true,
+      "description": "The package must build. Edit or delete if you do not ship a package."
+    },
+    {
+      "id": "no-merge-markers",
+      "run": "git grep -nE \"^(<<<<<<<|>>>>>>>)\" -- .",
+      "expect": {"exit": 1},
+      "block": true,
+      "description": "No leftover merge-conflict markers. git grep exits 1 when it finds none, which is the pass condition."
+    },
+    {
+      "id": "changelog-updated",
+      "run": null,
+      "expect": {"file_exists": "CHANGELOG.md"},
+      "block": false,
+      "description": "Advisory (non-blocking) example of a file_exists check."
+    }
+  ]
+}

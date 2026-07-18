@@ -1,0 +1,11 @@
+{
+  "name": "fleetproof",
+  "version": "0.1.0",
+  "description": "Independent, out-of-band verification for agent fleets. Blocks a false 'done' when the checker disagrees.",
+  "author": {
+    "name": "Gathrazio"
+  },
+  "homepage": "https://github.com/Gathrazio/fleetproof",
+  "repository": "https://github.com/Gathrazio/fleetproof",
+  "license": "MIT"
+}

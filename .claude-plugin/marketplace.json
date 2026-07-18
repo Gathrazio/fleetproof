@@ -1,0 +1,13 @@
+{
+  "name": "fleetproof",
+  "owner": {
+    "name": "Gathrazio"
+  },
+  "plugins": [
+    {
+      "name": "fleetproof",
+      "source": ".",
+      "description": "Independent, out-of-band verification for agent fleets — the agent authors checks, a separate process grades them."
+    }
+  ]
+}

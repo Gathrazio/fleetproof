@@ -1,0 +1,3 @@
+#!/usr/bin/env sh
+# POSIX shim: put `fleetproof` on PATH while the plugin is enabled.
+exec python -m fleetproof.cli "$@"
