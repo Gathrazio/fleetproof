@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fleetproof"
+version = "0.1.0"
+description = "Independent, out-of-band verification for agent fleets."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Gathrazio" }]
+keywords = ["agents", "verification", "claude-code", "audit", "run-log"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Quality Assurance",
+]
+# Runtime is stdlib-only on purpose: a verification tool should add as little
+# dependency (and supply-chain) surface as it can get away with.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/Gathrazio/fleetproof"
+Repository = "https://github.com/Gathrazio/fleetproof"
+
+[project.scripts]
+fleetproof = "fleetproof.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

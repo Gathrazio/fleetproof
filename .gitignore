@@ -1,0 +1,13 @@
+# FleetProof's own run log (evidence is regenerated, never committed)
+.fleetproof/runs/
+.fleetproof/fleetproof-report.html
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
