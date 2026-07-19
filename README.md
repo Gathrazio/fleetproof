@@ -120,9 +120,14 @@ This is an early release. Honest boundaries:
 
 - **`python` must be on `PATH`.** The plugin hooks invoke the checker via
   `python "${CLAUDE_PLUGIN_ROOT}/scripts/..."`. Environments where the interpreter
-  is only reachable as `python3`, or not on `PATH`, need a shim.
+  is only reachable as `python3`, or not on `PATH`, need a shim — any wrapper on
+  `PATH` named `python` works, e.g. `sudo ln -s $(which python3) /usr/local/bin/python`.
 - **Checks are shell commands.** Their portability is your responsibility — a
-  check that shells out to `grep` won't behave identically on every OS.
+  check that shells out to `grep` won't behave identically on every OS. And
+  because a repo's `checks.json` runs shell commands on the Stop event, treat a
+  cloned repo's `checks.json` with the same trust you give its `Makefile` or
+  pre-commit config: it is executable code. FleetProof adds no network surface of
+  its own, and first-run consent-per-spec-hash is on the roadmap.
 - **The gate is only as good as the checks.** FleetProof enforces that an
   independent process runs your checks; it cannot know whether your checks capture
   what "done" really means. Weak checks give false confidence.
