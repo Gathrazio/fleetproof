@@ -39,6 +39,41 @@ def _run_status(run: RunRecord, verdicts: list[dict[str, Any]]) -> str:
     return "verified"
 
 
+# One enriched run: (record, its checker verdicts, its status).
+_Enriched = tuple[RunRecord, list[dict[str, Any]], str]
+
+
+def _session_blocks(enriched: list[_Enriched]) -> list[tuple[str, str | None, list[_Enriched]]]:
+    """Partition enriched runs into render blocks, newest activity first.
+
+    Runs sharing a ``session_id`` collapse into one ``("session", id, [...])``
+    block (chronological inside). Runs without a session id — including every
+    record written before session grouping existed — each render as their own
+    ``("run", None, [item])`` block, exactly as before. Blocks are ordered by
+    their most-recent run so the newest activity leads, matching the flat
+    newest-first ordering legacy reports had.
+    """
+    by_sid: dict[str | None, list[_Enriched]] = {}
+    for item in enriched:
+        sid = item[0].session_id or None
+        by_sid.setdefault(sid, []).append(item)
+
+    blocks: list[tuple[str, str | None, list[_Enriched]]] = []
+    for sid, items in by_sid.items():
+        if sid is None:
+            continue
+        items_sorted = sorted(items, key=lambda it: it[0].started_at or "")
+        blocks.append(("session", sid, items_sorted))
+    for item in by_sid.get(None, []):
+        blocks.append(("run", None, [item]))
+
+    def _recency(block: tuple[str, str | None, list[_Enriched]]) -> str:
+        return max((it[0].started_at or "" for it in block[2]), default="")
+
+    blocks.sort(key=_recency, reverse=True)
+    return blocks
+
+
 def build_report(runs: list[RunRecord] | None = None) -> str:
     """Render the full HTML report for the given runs (default: all runs)."""
     if runs is None:
@@ -54,15 +89,21 @@ def build_report(runs: list[RunRecord] | None = None) -> str:
     n_verified = sum(1 for _, _, s in enriched if s == "verified")
     n_unverified = sum(1 for _, _, s in enriched if s == "unverified")
 
+    blocks = _session_blocks(enriched)
+    n_sessions = sum(1 for kind, _, _ in blocks if kind == "session")
+
     generated = datetime.now(timezone.utc).isoformat(timespec="seconds")
     parts = [_HTML_HEAD.format(title=html_lib.escape("FleetProof — Run Report"))]
     parts.append("<h1>FleetProof — Run Report</h1>")
+    session_meta = f" &nbsp; <b>Sessions:</b> {n_sessions}" if n_sessions else ""
     parts.append(
         f"<p class='meta'><b>Generated:</b> {html_lib.escape(generated)} &nbsp; "
-        f"<b>Runs:</b> {n_total}</p>"
+        f"<b>Runs:</b> {n_total}{session_meta}</p>"
     )
 
     parts.append("<div class='cards'>")
+    if n_sessions:
+        parts.append(_stat_card("Sessions", str(n_sessions), "neutral"))
     parts.append(_stat_card("Runs", str(n_total), "neutral"))
     parts.append(_stat_card("Independently verified", str(n_verified), "ok"))
     parts.append(_stat_card("Claim contradicted", str(n_contradicted), "bad"))
@@ -83,10 +124,46 @@ def build_report(runs: list[RunRecord] | None = None) -> str:
             "<p class='lead ok-text'>No contradicted claims in this window.</p>"
         )
 
-    for run, verdicts, status in enriched:
-        parts.append(_render_run(run, verdicts, status))
+    for kind, sid, items in blocks:
+        if kind == "session":
+            parts.append(_render_session(sid, items))
+        else:
+            parts.append(_render_run(*items[0]))
 
     parts.append(_HTML_FOOT)
+    return "\n".join(parts)
+
+
+def _render_session(session_id: str | None, items: list[_Enriched]) -> str:
+    """Render one session as a container: a header with time range, then its runs."""
+    starts = sorted(it[0].started_at for it in items if it[0].started_at)
+    lo = starts[0][:19] if starts else "-"
+    hi = starts[-1][:19] if starts else "-"
+    n_contra = sum(1 for it in items if it[2] == "contradicted")
+    n_verified = sum(1 for it in items if it[2] == "verified")
+    if n_contra:
+        status = "contradicted"
+    elif n_verified:
+        status = "verified"
+    else:
+        status = "unverified"
+
+    parts = [f"<section class='session {status}'>"]
+    parts.append(
+        f"<h2 class='session-h'>Session <code>{html_lib.escape(str(session_id))}</code> "
+        f"{_badge(status)}</h2>"
+    )
+    parts.append(
+        "<p class='meta'>"
+        f"<b>runs in session:</b> {len(items)} &nbsp; "
+        f"<b>time range:</b> {html_lib.escape(lo)} → {html_lib.escape(hi)}"
+        "</p>"
+    )
+    parts.append("<div class='session-body'>")
+    for run, verdicts, run_status in items:
+        parts.append(_render_run(run, verdicts, run_status))
+    parts.append("</div>")
+    parts.append("</section>")
     return "\n".join(parts)
 
 
@@ -231,6 +308,14 @@ _HTML_HEAD = """<!DOCTYPE html>
   .badge.bad {{ background: #fbe3e3; color: #a11; }}
   .badge.warn {{ background: #fbf1dd; color: #a60; }}
   .badge.neutral {{ background: #eee; color: #555; }}
+  section.session {{ margin-top: 1.8em; padding: 1em 1.2em 1.2em;
+                     border-radius: 8px; border: 1px solid #d3d3d3;
+                     background: #f4f5f7; }}
+  section.session > .session-h {{ margin-top: 0; font-size: 1.15em; }}
+  section.session.contradicted {{ border-left: 6px solid #c33; }}
+  section.session.verified {{ border-left: 6px solid #3a3; }}
+  section.session.unverified {{ border-left: 6px solid #d9a441; }}
+  .session-body section.run {{ margin-top: 1em; }}
   section.run {{ margin-top: 1.6em; padding: 1em 1.2em; border-radius: 6px;
                  border: 1px solid #e2e2e2; background: #fff; }}
   section.run.contradicted {{ border-left: 5px solid #c33; }}

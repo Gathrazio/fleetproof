@@ -178,7 +178,26 @@ def test_load_run_missing_returns_none(tmp_runs):
     assert load_run("nope") is None
 
 
+def test_root_record_captures_session_id_from_env(tmp_runs, monkeypatch):
+    # The session id is carried in via env (set by the hook from stdin) and must
+    # land on the root record so the report can group by it.
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-xyz")
+    with record("t", "a"):
+        pass
+    run = list_run_records()[0]
+    assert run.session_id == "sess-xyz"
+
+
+def test_root_record_session_id_none_without_env(tmp_runs, monkeypatch):
+    monkeypatch.delenv(runlog.SESSION_ID_ENV, raising=False)
+    with record("t", "a"):
+        pass
+    run = list_run_records()[0]
+    assert run.session_id is None
+
+
 def test_env_constants_use_fleetproof_namespace():
     # Guardrail: every env var this package reads is namespaced.
-    for name in (RUN_ID_ENV, runlog.RUNS_DIR_ENV, runlog.PARENT_RUN_ID_ENV, runlog.NO_RECORD_ENV):
+    for name in (RUN_ID_ENV, runlog.RUNS_DIR_ENV, runlog.PARENT_RUN_ID_ENV,
+                 runlog.NO_RECORD_ENV, runlog.SESSION_ID_ENV):
         assert name.startswith("FLEETPROOF_")

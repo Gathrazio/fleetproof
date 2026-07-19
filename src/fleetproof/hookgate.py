@@ -16,12 +16,13 @@ Both read the hook payload as JSON on stdin, per the Claude Code hooks contract.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from typing import Any
 
 from .checker import run_checks
 from .checks import CheckSpecError, load_checks
-from .runlog import record
+from .runlog import SESSION_ID_ENV, record
 
 
 def _read_hook_input() -> dict[str, Any]:
@@ -36,6 +37,21 @@ def _read_hook_input() -> dict[str, Any]:
         return parsed if isinstance(parsed, dict) else {}
     except json.JSONDecodeError:
         return {}
+
+
+def _apply_session_id(payload: dict[str, Any]) -> None:
+    """Thread the Claude Code session id into the run log.
+
+    Every hook invocation receives a JSON payload on stdin whose ``session_id``
+    field identifies the session (see the "hook input" section of
+    https://code.claude.com/docs/en/hooks). Each hook fires as its own OS
+    process with a fresh run id, so without this the report shows one session as
+    several unrelated root runs. Carrying the id via env lets the root record
+    (written in this same process) group them back together.
+    """
+    sid = payload.get("session_id")
+    if isinstance(sid, str) and sid:
+        os.environ[SESSION_ID_ENV] = sid
 
 
 def stop_gate() -> tuple[dict[str, Any] | None, int]:
@@ -89,7 +105,9 @@ def _evidence_context(report) -> str:
 
 
 def stop_gate_main() -> int:
-    _read_hook_input()  # consume stdin per contract; the verdict is checker-driven
+    # Consume stdin per contract; the verdict is checker-driven, but the payload
+    # still carries the session id we group this run's evidence under.
+    _apply_session_id(_read_hook_input())
     decision, code = stop_gate()
     if decision is not None:
         sys.stdout.write(json.dumps(decision))
@@ -99,6 +117,7 @@ def stop_gate_main() -> int:
 def record_tool_main() -> int:
     """PostToolUse recorder: accrete an evidence record. Always non-blocking."""
     payload = _read_hook_input()
+    _apply_session_id(payload)
     tool_name = str(payload.get("tool_name", "unknown"))
     try:
         with record("claude-tool", tool_name, {"tool_name": tool_name}) as handle:

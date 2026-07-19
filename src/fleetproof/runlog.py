@@ -47,6 +47,11 @@ RUN_ID_ENV = "FLEETPROOF_RUN_ID"
 RUNS_DIR_ENV = "FLEETPROOF_RUNS_DIR"  # tests + hook init override
 PARENT_RUN_ID_ENV = "FLEETPROOF_PARENT_RUN_ID"
 NO_RECORD_ENV = "FLEETPROOF_NO_RECORD"
+# Claude Code session identifier, threaded in from the hook stdin payload's
+# ``session_id`` field so every root record created within one Claude Code
+# session shares a key the report can group on. Env-carried like PARENT_RUN_ID
+# because each hook fires as its own OS process.
+SESSION_ID_ENV = "FLEETPROOF_SESSION_ID"
 
 # Directory the tool owns inside the user's repo.
 PROJECT_MARKER = ".fleetproof"
@@ -259,9 +264,13 @@ def _ensure_root_record(run_id: str, tool: str) -> None:
         return
     parent_dir.mkdir(parents=True, exist_ok=True)
     parent_run = os.environ.get(PARENT_RUN_ID_ENV)
+    # Additive field: None for runs not created from a hook (and absent entirely
+    # from records written before this field existed) — both read back as None.
+    session_id = os.environ.get(SESSION_ID_ENV) or None
     root = {
         "run_id": run_id,
         "parent_run_id": parent_run,
+        "session_id": session_id,
         "root_tool": tool,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "host": socket.gethostname(),
@@ -404,6 +413,7 @@ class RunRecord:
     root_dir: Path
     root_tool: str | None
     started_at: str | None
+    session_id: str | None = None
     sub_invocations: list[SubInvocation] = field(default_factory=list)
 
     @property
@@ -458,6 +468,7 @@ def _load_run_record(run_dir: Path) -> RunRecord | None:
         root_dir=run_dir,
         root_tool=root_data.get("root_tool"),
         started_at=root_data.get("started_at"),
+        session_id=root_data.get("session_id"),
         sub_invocations=subs,
     )
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from fleetproof import runlog
 from fleetproof.checker import run_checks
 from fleetproof.checks import Check
 from fleetproof.report import build_report, write_report
@@ -52,6 +53,46 @@ def test_write_report_creates_file(tmp_runs, tmp_path):
     written = write_report(out, [])
     assert written.exists()
     assert written.read_text(encoding="utf-8").startswith("<!DOCTYPE html>")
+
+
+def test_report_groups_runs_by_session(tmp_runs, monkeypatch):
+    # Two runs share one session id; a third (legacy-style) has none. The report
+    # must collapse the first two into a single session block and leave the third
+    # rendering standalone, exactly as pre-fix records do.
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-1")
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000001-aaaaaa")
+    with record("claude-tool", "Edit"):
+        pass
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000002-bbbbbb")
+    with record("claude-tool", "Write"):
+        pass
+
+    # Third run: no session id (mimics a record written before this field).
+    monkeypatch.delenv(runlog.SESSION_ID_ENV, raising=False)
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000003-cccccc")
+    with record("some-tool", "do"):
+        pass
+
+    html = build_report()
+
+    # The session appears once as a grouped header, not once per run inside it.
+    assert html.count("Session <code>sess-1</code>") == 1
+    assert "runs in session:</b> 2" in html
+    assert "<b>Sessions:</b> 1" in html
+    # The two session runs and the lone legacy run are all still present.
+    for rid in ("aaaaaa", "bbbbbb", "cccccc"):
+        assert rid in html
+
+
+def test_report_without_sessions_omits_session_chrome(tmp_runs):
+    # Pure legacy records (no session id) must render as before: no "Sessions"
+    # count, no session container — just per-run sections.
+    with record("some-tool", "do"):
+        pass
+    html = build_report()
+    assert "Sessions:" not in html
+    assert "class='session" not in html
+    assert "unverified" in html
 
 
 def test_report_escapes_content(tmp_runs, tmp_path):

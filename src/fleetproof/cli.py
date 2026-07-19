@@ -86,6 +86,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
                     "run_id": r.run_id,
                     "root_tool": r.root_tool,
                     "started_at": r.started_at,
+                    "session_id": r.session_id,
                     "sub_count": len(r.sub_invocations),
                     "failed_count": r.failed_count,
                 }
@@ -96,11 +97,19 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if not rows:
         print("No runs found.")
         return 0
-    print(f"{'run_id':<24} {'root_tool':<16} {'started':<20} {'subs':>5} {'failed':>7}")
+    print(f"{'run_id':<24} {'root_tool':<16} {'started':<20} {'subs':>5} {'failed':>7} {'session':<14}")
     for r in rows:
         print(f"{r.run_id:<24} {(r.root_tool or '-'):<16} "
-              f"{(r.started_at or '-')[:19]:<20} {len(r.sub_invocations):>5} {r.failed_count:>7}")
+              f"{(r.started_at or '-')[:19]:<20} {len(r.sub_invocations):>5} {r.failed_count:>7} "
+              f"{_short_session(r.session_id):<14}")
     return 0
+
+
+def _short_session(session_id: str | None) -> str:
+    """A compact session id for the list column; '-' when a run has none."""
+    if not session_id:
+        return "-"
+    return session_id if len(session_id) <= 14 else session_id[:11] + "..."
 
 
 def _cmd_show(args: argparse.Namespace) -> int:
@@ -113,6 +122,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "run_id": r.run_id,
             "root_tool": r.root_tool,
             "started_at": r.started_at,
+            "session_id": r.session_id,
             "sub_invocations": [
                 {
                     "tool": s.tool,
@@ -127,7 +137,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
             ],
         }, indent=2))
         return 0
-    print(f"{r.run_id}  root_tool={r.root_tool or '-'}  started={(r.started_at or '-')[:19]}")
+    print(f"{r.run_id}  root_tool={r.root_tool or '-'}  started={(r.started_at or '-')[:19]}"
+          f"  session={r.session_id or '-'}")
     for s in r.sub_invocations:
         if s.exit_code is None:
             badge = "?"

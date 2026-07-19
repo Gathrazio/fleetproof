@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import io
 import json
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
 from fleetproof import runlog
-from fleetproof.hookgate import stop_gate
+from fleetproof.hookgate import record_tool_main, stop_gate
 
 
 def _setup_project(tmp_path: Path, checks: list[dict], monkeypatch) -> None:
@@ -24,6 +26,9 @@ def _setup_project(tmp_path: Path, checks: list[dict], monkeypatch) -> None:
 def _reset_runs():
     yield
     runlog.set_runs_dir(None)
+    # _apply_session_id writes os.environ directly (mirroring the real hook
+    # process), so clear it between tests rather than relying on monkeypatch.
+    os.environ.pop(runlog.SESSION_ID_ENV, None)
 
 
 def test_stop_gate_blocks_on_failing_blocking_check(tmp_path, monkeypatch):
@@ -66,3 +71,48 @@ def test_stop_gate_fails_open_without_spec(tmp_path, monkeypatch):
     decision, code = stop_gate()
     assert decision is None
     assert code == 0
+
+
+def test_record_tool_captures_session_id_from_stdin(tmp_path, monkeypatch):
+    # The PostToolUse recorder must lift session_id off the hook stdin payload
+    # and stamp it onto the root record, so the report can group the session.
+    marker = tmp_path / ".fleetproof"
+    marker.mkdir()
+    monkeypatch.chdir(tmp_path)
+    runlog.set_runs_dir(marker / "runs")
+    monkeypatch.delenv(runlog.RUN_ID_ENV, raising=False)
+    monkeypatch.delenv(runlog.SESSION_ID_ENV, raising=False)
+
+    payload = {
+        "session_id": "sess-abc-123",
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Edit",
+        "tool_input": {"file_path": "x.py"},
+        "tool_response": {"ok": True},
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    assert record_tool_main() == 0
+
+    runs = runlog.list_run_records()
+    assert len(runs) == 1
+    assert runs[0].session_id == "sess-abc-123"
+    assert runs[0].root_tool == "claude-tool"
+
+
+def test_record_tool_without_session_id_leaves_it_absent(tmp_path, monkeypatch):
+    # A payload with no session_id (older Claude Code, or a malformed hook) must
+    # still record — just ungrouped. Backward-compatible with pre-fix behavior.
+    marker = tmp_path / ".fleetproof"
+    marker.mkdir()
+    monkeypatch.chdir(tmp_path)
+    runlog.set_runs_dir(marker / "runs")
+    monkeypatch.delenv(runlog.RUN_ID_ENV, raising=False)
+    monkeypatch.delenv(runlog.SESSION_ID_ENV, raising=False)
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"tool_name": "Bash"})))
+
+    assert record_tool_main() == 0
+    runs = runlog.list_run_records()
+    assert len(runs) == 1
+    assert runs[0].session_id is None
