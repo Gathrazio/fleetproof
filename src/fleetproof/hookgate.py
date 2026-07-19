@@ -30,6 +30,10 @@ def _read_hook_input() -> dict[str, Any]:
         data = sys.stdin.read()
     except Exception:
         return {}
+    # Tolerate a UTF-8 BOM (some shells prepend one when piping) — silently
+    # losing the payload would silently lose session grouping and drift
+    # detection, which is exactly the quiet degradation this tool exists to avoid.
+    data = data.lstrip("\ufeff")
     if not data.strip():
         return {}
     try:

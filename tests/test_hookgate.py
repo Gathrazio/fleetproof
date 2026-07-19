@@ -183,3 +183,14 @@ def test_no_false_drift_across_different_sessions(tmp_path, monkeypatch):
     _write_checks(tmp_path, [dict(_PASS, description="different-but-own-baseline")])
     decision, code = stop_gate()
     assert decision is None  # pass, no drift => silent
+
+
+def test_read_hook_input_tolerates_utf8_bom(monkeypatch):
+    # Some shells prepend a BOM when piping; losing the payload would silently
+    # lose session grouping and drift detection.
+    import io
+    import sys as _sys
+    from fleetproof.hookgate import _read_hook_input
+
+    monkeypatch.setattr(_sys, "stdin", io.StringIO("\ufeff{\"session_id\": \"s-1\"}\n"))
+    assert _read_hook_input() == {"session_id": "s-1"}
