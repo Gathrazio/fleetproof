@@ -10,15 +10,34 @@ import os
 import sys
 
 
+def _import_hookgate():
+    """Import fleetproof.hookgate, falling back to the copy the plugin ships."""
+    try:
+        from fleetproof import hookgate
+        return hookgate
+    except ImportError:
+        pass
+    plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT") or os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))
+    )
+    src = os.path.join(plugin_root, "src")
+    if os.path.isdir(src) and src not in sys.path:
+        sys.path.insert(0, src)
+    try:
+        from fleetproof import hookgate
+        return hookgate
+    except ImportError:
+        return None
+
+
 def _main() -> int:
     # This hook is the one place recording must be on.
     os.environ["FLEETPROOF_NO_RECORD"] = "0"
-    try:
-        from fleetproof.hookgate import record_tool_main
-    except ImportError:
+    hookgate = _import_hookgate()
+    if hookgate is None:
         return 0
     try:
-        return record_tool_main()
+        return hookgate.record_tool_main()
     except Exception:
         return 0
 
