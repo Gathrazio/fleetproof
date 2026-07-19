@@ -114,6 +114,44 @@ An agent is welcome to propose or edit checks. The guarantee FleetProof makes is
 narrower and firmer than "the agent verified its work": it is that *something
 other than the agent* ran the checks and recorded the result.
 
+## Writing richer checks
+
+The grading vocabulary is deliberately small — exit codes, a regex, a file
+existing — but `run` is an arbitrary command, so the *predicate* can be any
+program. The pattern: encode "done" as a script that exits non-zero when it
+isn't, and let FleetProof gate on the exit code.
+
+```json
+{
+  "checks": [
+    { "id": "dataset-valid",
+      "run": "python scripts/validate_dataset.py out/rows.csv --min-rows 1000",
+      "expect": "exit0", "block": true,
+      "description": "Output CSV exists, parses, has >=1000 rows, no nulls in key columns." },
+    { "id": "citations-resolve",
+      "run": "python scripts/check_links.py report/draft.md",
+      "expect": "exit0", "block": true },
+    { "id": "full-suite-advisory",
+      "run": "python -m pytest tests/slow -q",
+      "expect": "exit0", "block": false,
+      "description": "Slow suite is advisory: recorded, never gates the stop." }
+  ]
+}
+```
+
+Anything a program can decide, a check can gate: schema conformance, row
+counts, API health, diffs, wordcounts, link resolution. FleetProof's claim is
+never that the predicate language is rich — it's that *whatever predicate you
+choose runs outside the agent's process*.
+
+Guidance that keeps the gate honest: keep **blocking** checks fast and
+deterministic (flaky checks flap the gate; slow ones tax every stop) and demote
+heavy suites to `block: false`. For fleets doing **varied tasks in one repo**,
+the working convention is to have the agent author task-specific checks at task
+start — authoring is a feature — and let the spec-drift flag make any later
+revision loud. Per-task check scoping as a first-class mechanism is on the
+roadmap.
+
 ## Scope and limitations (v0.1)
 
 This is an early release. Honest boundaries:
