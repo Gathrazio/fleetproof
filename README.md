@@ -10,10 +10,18 @@ it**. An agent may author the checks; it never executes and grades its own work.
 ## Why this exists
 
 The failure mode this targets is the false "done": an agent reports a task
-complete when it isn't. Measured rates of this specific failure sit around
-**44–52% of agent failures** in recent evaluation work; introducing an
-**independent** checker in the loop drops the rate of *undetected* false
-completions to roughly **3%** (arXiv:2606.09863).
+complete when it isn't. A recent characterization study
+([arXiv:2606.09863](https://arxiv.org/abs/2606.09863)) measured it directly:
+**45–48% of failures** in single-control tau2-bench domains are exactly this —
+the agent confidently claims success. Among **self-assessing** coding-agent
+trajectories on AppWorld, it's **75.8%**. And in the study's one *dual-control*
+setting — where a second, independent control point contradicts the agent's
+claims — false success collapses to **3%**.
+
+FleetProof is built on that comparison: it gives any repo a second, independent
+control point. (To be precise: the 3% is a measured property of that
+benchmark setting, not a measured result of installing this tool — the study
+motivates the design; it didn't test it.)
 
 The word doing the work there is *independent*. A verifier that is the same agent
 (or a sub-agent prompted by it) inherits the same blind spots and the same
