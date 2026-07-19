@@ -5,9 +5,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import json
+
 from fleetproof import runlog
 from fleetproof.checker import run_checks
-from fleetproof.checks import Check
+from fleetproof.checks import Check, load_checks
 from fleetproof.report import build_report, write_report
 from fleetproof.runlog import list_run_records, record
 
@@ -93,6 +95,31 @@ def test_report_without_sessions_omits_session_chrome(tmp_runs):
     assert "Sessions:" not in html
     assert "class='session" not in html
     assert "unverified" in html
+
+
+def test_report_marks_spec_drift(tmp_runs, tmp_path, monkeypatch):
+    # Two same-session verdicts with different spec hashes: the report must render
+    # a spec-drift marker on the second (drifted) verdict, and show the short hash.
+    spec = tmp_path / "checks.json"
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-report-drift")
+
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000001-aaaaaa")
+    spec.write_text(json.dumps({"checks": [
+        {"id": "ok", "run": f'"{sys.executable}" -c "raise SystemExit(0)"',
+         "expect": "exit0", "description": "original"}]}), encoding="utf-8")
+    run_checks(load_checks(spec), cwd=tmp_path, record_to_log=True, spec_path=spec)
+
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000002-bbbbbb")
+    spec.write_text(json.dumps({"checks": [
+        {"id": "ok", "run": f'"{sys.executable}" -c "raise SystemExit(0)"',
+         "expect": "exit0", "description": "weakened"}]}), encoding="utf-8")
+    run_checks(load_checks(spec), cwd=tmp_path, record_to_log=True, spec_path=spec)
+
+    html = build_report()
+    assert "spec drift" in html
+    assert "drift-note" in html
+    # The per-verdict short spec hash is shown.
+    assert "spec " in html
 
 
 def test_report_escapes_content(tmp_runs, tmp_path):

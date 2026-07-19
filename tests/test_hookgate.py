@@ -116,3 +116,70 @@ def test_record_tool_without_session_id_leaves_it_absent(tmp_path, monkeypatch):
     runs = runlog.list_run_records()
     assert len(runs) == 1
     assert runs[0].session_id is None
+
+
+def _write_checks(tmp_path: Path, checks: list[dict]) -> None:
+    (tmp_path / ".fleetproof" / "checks.json").write_text(
+        json.dumps({"checks": checks}), encoding="utf-8"
+    )
+
+
+_PASS = {"id": "ok", "run": f'"{sys.executable}" -c "raise SystemExit(0)"', "expect": "exit0"}
+_FAIL = {"id": "bad", "run": f'"{sys.executable}" -c "raise SystemExit(1)"', "expect": "exit0"}
+
+
+def test_pass_with_spec_drift_still_passes_but_is_annotated(tmp_path, monkeypatch):
+    from fleetproof.checks import SPEC_DRIFT_NOTE
+    _setup_project(tmp_path, [dict(_PASS, description="original")], monkeypatch)
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-drift")
+
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000001-aaaaaa")
+    first, code = stop_gate()
+    assert code == 0
+    assert first is None  # first verdict is the baseline: passes silently
+
+    # The agent edits its own checks.json mid-session (still passing, but changed).
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000002-bbbbbb")
+    _write_checks(tmp_path, [dict(_PASS, description="weakened")])
+    second, code = stop_gate()
+    assert code == 0
+    # A pass with drift must NOT block...
+    assert second is not None
+    assert second.get("decision") != "block"
+    # ...but must carry the unmissable drift annotation.
+    ctx = second["hookSpecificOutput"]["additionalContext"]
+    assert SPEC_DRIFT_NOTE in ctx
+
+
+def test_block_reason_carries_drift_note(tmp_path, monkeypatch):
+    from fleetproof.checks import SPEC_DRIFT_NOTE
+    _setup_project(tmp_path, [dict(_PASS, description="original")], monkeypatch)
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-drift-2")
+
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000001-cccccc")
+    stop_gate()  # baseline
+
+    # Agent swaps the spec to a failing blocking check after the baseline was set.
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000002-dddddd")
+    _write_checks(tmp_path, [_FAIL])
+    decision, code = stop_gate()
+    assert decision is not None
+    assert decision["decision"] == "block"
+    assert SPEC_DRIFT_NOTE in decision["reason"]
+    assert SPEC_DRIFT_NOTE in decision["hookSpecificOutput"]["additionalContext"]
+
+
+def test_no_false_drift_across_different_sessions(tmp_path, monkeypatch):
+    _setup_project(tmp_path, [dict(_PASS, description="original")], monkeypatch)
+
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-A")
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000001-eeeeee")
+    stop_gate()
+
+    # A different session with a different spec is not drift — each session has
+    # its own baseline.
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-B")
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000002-ffffff")
+    _write_checks(tmp_path, [dict(_PASS, description="different-but-own-baseline")])
+    decision, code = stop_gate()
+    assert decision is None  # pass, no drift => silent

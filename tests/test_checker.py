@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
 
-from fleetproof.checker import run_check, run_checks
-from fleetproof.checks import Check
+from fleetproof.checker import run_check, run_checks, session_spec_baseline, spec_drifted
+from fleetproof.checks import Check, load_checks, spec_hash
 from fleetproof.runlog import list_run_records
 
 
@@ -102,3 +103,53 @@ def test_run_checks_records_verdict_to_log(tmp_runs, tmp_project):
     assert payload["checks"][0]["id"] == "ok"
     # The recorder captured the checker's own pid — evidence it recorded from a real process.
     assert "recorded_from_pid" in payload
+
+
+def _write_spec(path: Path, description: str = "") -> None:
+    path.write_text(json.dumps({"checks": [
+        {"id": "ok", "run": f'"{sys.executable}" -c "raise SystemExit(0)"',
+         "expect": "exit0", "description": description},
+    ]}), encoding="utf-8")
+
+
+def test_run_checks_records_spec_hash(tmp_runs, tmp_path):
+    # The verdict must carry the SHA-256 of the spec bytes that governed it, both
+    # on the in-memory report and in the recorded output.json.
+    spec = tmp_path / "checks.json"
+    _write_spec(spec)
+    report = run_checks(load_checks(spec), cwd=tmp_path, record_to_log=True, spec_path=spec)
+    assert report.spec_sha256 == spec_hash(spec)
+    payload = list_run_records()[0].sub_invocations[0].load_output()
+    assert payload["spec_sha256"] == spec_hash(spec)
+
+
+def test_spec_baseline_and_drift_within_session(tmp_runs, tmp_path, monkeypatch):
+    # Two verdicts in one session, spec edited between them: the baseline is the
+    # first verdict's hash, and the second is flagged as drifted against it.
+    from fleetproof import runlog
+    spec = tmp_path / "checks.json"
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-1")
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000001-aaaaaa")
+    _write_spec(spec, description="original")
+    first = run_checks(load_checks(spec), cwd=tmp_path, record_to_log=True, spec_path=spec)
+
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000002-bbbbbb")
+    _write_spec(spec, description="weakened")
+    second = run_checks(load_checks(spec), cwd=tmp_path, record_to_log=True, spec_path=spec)
+
+    assert first.spec_sha256 != second.spec_sha256
+    assert session_spec_baseline("sess-1") == first.spec_sha256
+    drifted, baseline = spec_drifted(second.spec_sha256, "sess-1")
+    assert drifted is True
+    assert baseline == first.spec_sha256
+    # The first verdict is the baseline, so it is not itself drift.
+    assert spec_drifted(first.spec_sha256, "sess-1")[0] is False
+
+
+def test_no_drift_without_session_context(tmp_runs, tmp_path):
+    # No session id => no baseline to drift from => never flagged.
+    spec = tmp_path / "checks.json"
+    _write_spec(spec)
+    report = run_checks(load_checks(spec), cwd=tmp_path, record_to_log=True, spec_path=spec)
+    assert session_spec_baseline(None) is None
+    assert spec_drifted(report.spec_sha256, None) == (False, None)
