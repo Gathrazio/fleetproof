@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .checks import short_spec_hash
 from .runlog import RunRecord, list_run_records
 
 
@@ -28,6 +29,21 @@ def _find_check_verdicts(run: RunRecord) -> list[dict[str, Any]]:
             if isinstance(payload, dict) and "checks" in payload:
                 verdicts.append(payload)
     return verdicts
+
+
+def _session_baseline_hash(items: list[_Enriched]) -> str | None:
+    """The earliest verdict's spec hash across a session's runs.
+
+    ``items`` arrives oldest-first (see :func:`_session_blocks`), so the first
+    verdict carrying a hash is the session baseline every later verdict is diffed
+    against in the report — the same rule the live gate uses.
+    """
+    for _run, verdicts, _status in items:
+        for v in verdicts:
+            sha = v.get("spec_sha256")
+            if sha:
+                return sha
+    return None
 
 
 def _run_status(run: RunRecord, verdicts: list[dict[str, Any]]) -> str:
@@ -159,9 +175,10 @@ def _render_session(session_id: str | None, items: list[_Enriched]) -> str:
         f"<b>time range:</b> {html_lib.escape(lo)} → {html_lib.escape(hi)}"
         "</p>"
     )
+    baseline = _session_baseline_hash(items)
     parts.append("<div class='session-body'>")
     for run, verdicts, run_status in items:
-        parts.append(_render_run(run, verdicts, run_status))
+        parts.append(_render_run(run, verdicts, run_status, baseline))
     parts.append("</div>")
     parts.append("</section>")
     return "\n".join(parts)
@@ -179,7 +196,12 @@ def _badge(status: str) -> str:
     return f"<span class='badge {tone}'>{html_lib.escape(status)}</span>"
 
 
-def _render_run(run: RunRecord, verdicts: list[dict[str, Any]], status: str) -> str:
+def _render_run(
+    run: RunRecord,
+    verdicts: list[dict[str, Any]],
+    status: str,
+    baseline_hash: str | None = None,
+) -> str:
     parts = [f"<section class='run {status}'>"]
     parts.append(
         f"<h2>{html_lib.escape(run.run_id)} {_badge(status)}</h2>"
@@ -199,7 +221,7 @@ def _render_run(run: RunRecord, verdicts: list[dict[str, Any]], status: str) -> 
             "The fleet's claim here has not been verified out-of-band.</p>"
         )
     for v in verdicts:
-        parts.append(_render_verdict(v))
+        parts.append(_render_verdict(v, baseline_hash))
 
     if run.sub_invocations:
         parts.append(_render_sub_table(run))
@@ -208,15 +230,28 @@ def _render_run(run: RunRecord, verdicts: list[dict[str, Any]], status: str) -> 
     return "\n".join(parts)
 
 
-def _render_verdict(v: dict[str, Any]) -> str:
+def _render_verdict(v: dict[str, Any], baseline_hash: str | None = None) -> str:
     summary = v.get("summary", {})
     verdict = v.get("verdict", "?")
     tone = "bad" if verdict == "fail" else "ok"
+    sha = v.get("spec_sha256")
+    drifted = bool(baseline_hash and sha and sha != baseline_hash)
+    drift_badge = " <span class='badge drift'>spec drift</span>" if drifted else ""
     parts = [
         f"<h3>Checker verdict: <span class='badge {tone}'>{html_lib.escape(verdict)}</span> "
         f"<span class='count'>({summary.get('passed', 0)}/{summary.get('total', 0)} passed, "
-        f"{summary.get('blocking_failed', 0)} blocking)</span></h3>"
+        f"{summary.get('blocking_failed', 0)} blocking)</span> "
+        f"<span class='spec'>spec {html_lib.escape(short_spec_hash(sha))}</span>"
+        f"{drift_badge}</h3>"
     ]
+    if drifted:
+        parts.append(
+            "<p class='drift-note'>.fleetproof/checks.json was modified during this "
+            "session (spec drift): this verdict was graded against "
+            f"<code>{html_lib.escape(short_spec_hash(sha))}</code>, but the session "
+            f"baseline is <code>{html_lib.escape(short_spec_hash(baseline_hash))}</code>. "
+            "Review the diff before trusting this verdict.</p>"
+        )
     parts.append("<table class='checks'><thead><tr>")
     parts.append("<th>check</th><th>expected</th><th>result</th><th>detail</th><th>blocking</th>")
     parts.append("</tr></thead><tbody>")
@@ -308,6 +343,12 @@ _HTML_HEAD = """<!DOCTYPE html>
   .badge.bad {{ background: #fbe3e3; color: #a11; }}
   .badge.warn {{ background: #fbf1dd; color: #a60; }}
   .badge.neutral {{ background: #eee; color: #555; }}
+  .badge.drift {{ background: #efe0fb; color: #6b21a8; }}
+  .spec {{ font-family: ui-monospace, "SF Mono", Consolas, monospace;
+           font-size: 0.8em; color: #777; font-weight: normal; }}
+  .drift-note {{ margin: 0.3em 0 0.6em; padding: 0.5em 0.8em;
+                 border-left: 4px solid #8b3fd1; background: #f6edfc;
+                 color: #6b21a8; font-size: 0.9em; }}
   section.session {{ margin-top: 1.8em; padding: 1em 1.2em 1.2em;
                      border-radius: 8px; border: 1px solid #d3d3d3;
                      background: #f4f5f7; }}

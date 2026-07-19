@@ -20,8 +20,8 @@ import os
 import sys
 from typing import Any
 
-from .checker import run_checks
-from .checks import CheckSpecError, load_checks
+from .checker import run_checks, spec_drifted
+from .checks import SPEC_DRIFT_NOTE, CheckSpecError, load_checks, short_spec_hash
 from .runlog import SESSION_ID_ENV, record
 
 
@@ -72,7 +72,23 @@ def stop_gate() -> tuple[dict[str, Any] | None, int]:
         return None, 0
 
     report = run_checks(checks)
+
+    # Spec-drift check: did the checks.json that just graded this verdict differ
+    # from the one the session's first verdict was graded against? An agent is
+    # allowed to author checks.json, so a failing agent could quietly weaken it to
+    # slip this gate. We don't block on drift alone (v0.1 policy) — we make it loud.
+    session_id = os.environ.get(SESSION_ID_ENV)
+    drifted, baseline = spec_drifted(report.spec_sha256, session_id)
+
     if report.verdict == "pass":
+        if drifted:
+            # A pass with drift still passes, but must not pass *silently*.
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "Stop",
+                    "additionalContext": _drift_context(report.spec_sha256, baseline),
+                },
+            }, 0
         return None, 0
 
     failing = report.blocking_failures
@@ -83,22 +99,36 @@ def stop_gate() -> tuple[dict[str, Any] | None, int]:
         + ". The agent reported done; the independent checker disagrees. "
         "Fix the failures and let the checker re-run before stopping."
     )
+    if drifted:
+        reason += " " + SPEC_DRIFT_NOTE
     decision = {
         "decision": "block",
         "reason": reason,
         "hookSpecificOutput": {
             "hookEventName": "Stop",
-            "additionalContext": _evidence_context(report),
+            "additionalContext": _evidence_context(report, drifted, baseline),
         },
     }
     return decision, 0
 
 
-def _evidence_context(report) -> str:
+def _drift_context(current_hash: str | None, baseline_hash: str | None) -> str:
+    """The unmissable drift annotation, with both hashes for a reviewer to diff."""
+    return (
+        f"{SPEC_DRIFT_NOTE}\n"
+        f"- current spec hash:  {short_spec_hash(current_hash)}\n"
+        f"- session baseline:   {short_spec_hash(baseline_hash)}"
+    )
+
+
+def _evidence_context(report, drifted: bool = False, baseline_hash: str | None = None) -> str:
     parts = []
+    if drifted:
+        parts.append(_drift_context(report.spec_sha256, baseline_hash))
     for r in report.results:
         status = "pass" if r.passed else ("FAIL" if r.blocking else "warn")
         parts.append(f"- [{status}] {r.id}: {r.detail}")
+    parts.append(f"Spec hash: {short_spec_hash(report.spec_sha256)}")
     if report.run_id:
         parts.append(f"Evidence recorded under run {report.run_id} in .fleetproof/runs/.")
     return "\n".join(parts)

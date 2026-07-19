@@ -27,16 +27,25 @@ from pathlib import Path
 os.environ.setdefault("FLEETPROOF_NO_RECORD", "1")
 
 from . import __version__
-from .checker import format_report_text, run_checks
+from .checker import format_report_text, run_checks, spec_drifted
 from .checks import (
     CheckSpecError,
+    SPEC_DRIFT_NOTE,
     STARTER_SPEC,
     default_checks_path,
     load_checks,
+    short_spec_hash,
 )
 from .hookgate import record_tool_main, stop_gate_main
 from .report import write_report
-from .runlog import PROJECT_MARKER, list_run_records, load_run, project_root, runs_dir
+from .runlog import (
+    PROJECT_MARKER,
+    SESSION_ID_ENV,
+    list_run_records,
+    load_run,
+    project_root,
+    runs_dir,
+)
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
@@ -52,18 +61,31 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_check(args: argparse.Namespace) -> int:
+    spec_path = Path(args.spec) if args.spec else None
     try:
-        checks = load_checks(Path(args.spec) if args.spec else None)
+        checks = load_checks(spec_path)
     except CheckSpecError as e:
         _emit_error("check_spec_error", str(e), args.format)
         return 2
-    report = run_checks(checks, record_to_log=not args.no_record)
+    report = run_checks(checks, record_to_log=not args.no_record, spec_path=spec_path)
+
+    # Best-effort drift note: a bare CLI run usually has no session context (so
+    # baseline is unresolvable and nothing is flagged), but when it runs inside a
+    # Claude Code session the env carries the id and we can flag drift here too.
+    session_id = os.environ.get(SESSION_ID_ENV)
+    drifted, baseline = spec_drifted(report.spec_sha256, session_id)
+
     if args.format == "json":
         payload = report.to_dict()
         payload["run_id"] = report.run_id
+        payload["spec_drift"] = drifted
+        payload["session_baseline_sha256"] = baseline
         print(json.dumps(payload, indent=2))
     else:
         print(format_report_text(report))
+        if drifted:
+            print(SPEC_DRIFT_NOTE)
+            print(f"  session baseline: {short_spec_hash(baseline)}")
     return 1 if report.verdict == "fail" else 0
 
 

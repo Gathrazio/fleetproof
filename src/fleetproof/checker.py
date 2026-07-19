@@ -22,8 +22,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .checks import Check, load_checks
-from .runlog import record, runs_dir
+from .checks import Check, default_checks_path, load_checks, short_spec_hash, spec_hash
+from .runlog import list_run_records, record, runs_dir
 
 # Per-check wall-clock ceiling. A check that hangs is a failed check, not a hung fleet.
 DEFAULT_TIMEOUT_S = 600
@@ -49,6 +49,7 @@ class CheckResult:
 class CheckReport:
     results: list[CheckResult] = field(default_factory=list)
     run_id: str | None = None
+    spec_sha256: str | None = None
 
     @property
     def total(self) -> int:
@@ -74,6 +75,10 @@ class CheckReport:
     def to_dict(self) -> dict[str, Any]:
         return {
             "verdict": self.verdict,
+            # SHA-256 of the checks.json that governed this verdict. Additive:
+            # records written before this field existed simply omit it, and every
+            # reader treats a missing value as None (no hash on record).
+            "spec_sha256": self.spec_sha256,
             "summary": {
                 "total": self.total,
                 "passed": self.passed,
@@ -174,17 +179,23 @@ def run_checks(
     cwd: Path | None = None,
     timeout: int = DEFAULT_TIMEOUT_S,
     record_to_log: bool = True,
+    spec_path: Path | None = None,
 ) -> CheckReport:
     """Run every check and (by default) append the verdict to the run log.
 
     ``checks`` defaults to the loaded ``.fleetproof/checks.json``. ``cwd`` defaults
     to the current working directory — the directory the fleet actually worked in.
+    ``spec_path`` is the check-spec file whose bytes get hashed onto the verdict;
+    when omitted it is resolved from ``cwd`` the same way the checker itself finds
+    the spec, so the recorded hash always describes the spec that governed the run.
     """
     if checks is None:
-        checks = load_checks()
+        checks = load_checks(spec_path)
     work_dir = Path(cwd) if cwd is not None else Path.cwd()
+    resolved_spec = Path(spec_path) if spec_path is not None else default_checks_path(work_dir)
+    sha = spec_hash(resolved_spec)
 
-    report = CheckReport()
+    report = CheckReport(spec_sha256=sha)
     if not record_to_log:
         for check in checks:
             report.results.append(run_check(check, work_dir, timeout))
@@ -198,6 +209,49 @@ def run_checks(
         payload["recorded_from_pid"] = _self_pid()
         handle.set_output(payload)
     return report
+
+
+def session_spec_baseline(session_id: str | None) -> str | None:
+    """The spec hash of the EARLIEST recorded checker verdict in ``session_id``.
+
+    This is the baseline every later verdict in the same session is compared
+    against: if a verdict's own spec hash differs from this, the checks.json was
+    edited mid-session (spec drift). Legacy verdicts with no hash on record are
+    skipped, so the baseline is the earliest verdict that actually carries one.
+    Returns None when there is no session context or no hashed verdict yet — in
+    which case there is nothing to drift *from*, so callers treat it as no drift.
+    """
+    if not session_id:
+        return None
+    hashed: list[tuple[str, str]] = []
+    for run in list_run_records():
+        if (run.session_id or None) != session_id:
+            continue
+        for sub in run.sub_invocations:
+            if sub.tool != "fleetproof" or sub.subcmd != "check":
+                continue
+            payload = sub.load_output()
+            if not isinstance(payload, dict):
+                continue
+            sha = payload.get("spec_sha256")
+            if sha:
+                order_key = sub.started_at or run.started_at or ""
+                hashed.append((order_key, sha))
+    if not hashed:
+        return None
+    hashed.sort(key=lambda item: item[0])
+    return hashed[0][1]
+
+
+def spec_drifted(current_hash: str | None, session_id: str | None) -> tuple[bool, str | None]:
+    """Return ``(drifted, baseline_hash)`` for a verdict's hash within a session.
+
+    ``drifted`` is True only when a session baseline exists and the current hash
+    differs from it — a v0.1 pass-with-drift still passes, this just flags it.
+    """
+    baseline = session_spec_baseline(session_id)
+    drifted = bool(baseline and current_hash and baseline != current_hash)
+    return drifted, baseline
 
 
 def _self_pid() -> int:
@@ -216,6 +270,7 @@ def format_report_text(report: CheckReport) -> str:
         f"{report.verdict.upper()} - {s['passed']}/{s['total']} passed, "
         f"{s['blocking_failed']} blocking failure(s)."
     )
+    lines.append(f"spec: {short_spec_hash(report.spec_sha256)}")
     return "\n".join(lines)
 
 

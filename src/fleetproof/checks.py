@@ -31,6 +31,7 @@ party parser to trust in a tool whose entire job is being trustworthy.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +42,13 @@ from .runlog import PROJECT_MARKER, project_root
 DEFAULT_CHECKS_FILENAME = "checks.json"
 
 _VALID_EXPECT_KEYS = {"exit", "regex", "file_exists"}
+
+# The line a drifted verdict carries everywhere it surfaces (gate output, report,
+# CLI). One canonical string so the three surfaces never disagree about wording.
+SPEC_DRIFT_NOTE = (
+    "NOTE: .fleetproof/checks.json was modified during this session "
+    "(spec drift). Review the diff before trusting this verdict."
+)
 
 
 class CheckSpecError(Exception):
@@ -72,6 +80,29 @@ class Check:
 def default_checks_path(start: Path | None = None) -> Path:
     """Return the default check-spec location for the project rooted at ``start``."""
     return project_root(start) / PROJECT_MARKER / DEFAULT_CHECKS_FILENAME
+
+
+def spec_hash(path: Path | None = None) -> str | None:
+    """SHA-256 (hex) of the check-spec bytes, or ``None`` if it can't be read.
+
+    Hashed over the raw file bytes, not the parsed spec: the point is to notice
+    that *the file the agent authored changed* mid-session, which a byte hash
+    catches even for edits (whitespace, key reordering) that parse identically.
+    Returns None rather than raising so a missing/unreadable spec degrades to
+    "no hash on record" instead of breaking a gate run.
+    """
+    spec_path = Path(path) if path is not None else default_checks_path()
+    try:
+        return hashlib.sha256(spec_path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def short_spec_hash(full: str | None, length: int = 12) -> str:
+    """A git-style short form of a spec hash for display; 'unknown' when absent."""
+    if not full:
+        return "unknown"
+    return full[:length]
 
 
 def load_checks(path: Path | None = None) -> list[Check]:

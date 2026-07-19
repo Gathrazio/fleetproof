@@ -126,6 +126,13 @@ This is an early release. Honest boundaries:
 - **The gate is only as good as the checks.** FleetProof enforces that an
   independent process runs your checks; it cannot know whether your checks capture
   what "done" really means. Weak checks give false confidence.
+- **An agent can weaken its own checks.** Authoring `checks.json` is a feature, so
+  nothing stops an agent from editing it mid-session to slip the gate. FleetProof
+  does not (yet) forbid spec edits; instead it records the SHA-256 of the spec on
+  every verdict and flags mid-session **spec drift** loudly — in the Stop-gate
+  output, the CLI, and the report — when a verdict's spec hash differs from the
+  session's first. Drift does not by itself block a passing verdict in v0.1; spec
+  pinning and consent-on-change are on the roadmap.
 - **Fail-open when unconfigured.** With no `.fleetproof/checks.json`, the Stop hook
   does nothing (and says so on stderr) rather than blocking every task. A missing
   spec is not a passing grade — it is an absent one.
