@@ -29,6 +29,10 @@ design of FleetProof:
 
 No language model sits in the grading path. Grading is comparison.
 
+> Verifying one machine is free, forever. A hosted **team tier** — shared
+> evidence chains, approval queues, compliance export — is coming:
+> [join the waitlist](https://forms.gle/FcuBTYyoV4x2z8Hm8).
+
 ## What's in the box
 
 | Piece | What it does |
@@ -120,6 +124,21 @@ This is an early release. Honest boundaries:
 - **Blocking can repeat.** If a blocking check keeps failing, the Stop hook keeps
   blocking. That is intended (don't stop on a false done), but it means a check
   that can never pass needs operator intervention.
+
+## FleetProof for teams (coming — waitlist open)
+
+The plugin verifies one machine. The hosted tier turns those local verdicts into
+shared, durable **evidence chains**, **team approval queues** for gating agent
+work a human signs off on, and a **compliance export** a non-engineer can
+inspect — relevant as EU AI Act Article 14 human-oversight obligations become
+enforceable (2026-08-02).
+
+**[Join the waitlist →](https://forms.gle/FcuBTYyoV4x2z8Hm8)** — and tell us
+which piece you'd want first.
+
+The free plugin never sends anything anywhere: no telemetry, no network calls in
+the runtime, your run data stays on your disk. The hosted tier is opt-in and
+separate.
 
 ## Development
 
