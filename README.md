@@ -4,19 +4,19 @@ Independent, out-of-band verification for agent fleets — *what did my agents a
 
 FleetProof is a Claude Code plugin plus a small stdlib-only Python package. It
 records what your agents do to a durable run log, and — critically — grades that
-work with a checker that runs in a **separate process from the agent that did
-it**. An agent may author the checks; it never executes and grades its own work.
+work with a checker that runs in a separate process from the agent that did
+it. An agent may author the checks; it never executes and grades its own work.
 
 ## Why this exists
 
 The failure mode this targets is the false "done": an agent reports a task
 complete when it isn't. A recent characterization study
 ([arXiv:2606.09863](https://arxiv.org/abs/2606.09863)) measured it directly:
-**45–48% of failures** in single-control tau2-bench domains are exactly this —
-the agent confidently claims success. Among **self-assessing** coding-agent
-trajectories on AppWorld, it's **75.8%**. And in the study's one *dual-control*
+45–48% of failures in single-control tau2-bench domains are exactly this —
+the agent confidently claims success. Among self-assessing coding-agent
+trajectories on AppWorld, it's 75.8%. And in the study's one *dual-control*
 setting — where a second, independent control point contradicts the agent's
-claims — false success collapses to **3%**.
+claims — false success collapses to 3%.
 
 FleetProof is built on that comparison: it gives any repo a second, independent
 control point. (To be precise: the 3% is a measured property of that
@@ -30,14 +30,14 @@ out of the agent's own process and make it deterministic. That is the entire
 design of FleetProof:
 
 - the agent writes the run records and authors `checks.json`;
-- a **different process** — the plugin's Stop hook, a `type: "command"` hook,
+- a different process — the plugin's Stop hook, a `type: "command"` hook,
   never an LLM — executes those checks and grades them;
 - if a blocking check fails, the hook returns `{"decision": "block", ...}` and
   Claude Code refuses to let the agent stop on the false "done".
 
 No language model sits in the grading path. Grading is comparison.
 
-> Verifying one machine is free, forever. A hosted **team tier** — shared
+> Verifying one machine is free, forever. A hosted team tier — shared
 > evidence chains, approval queues, compliance export — is coming:
 > [join the waitlist](https://forms.gle/FcuBTYyoV4x2z8Hm8).
 
@@ -51,7 +51,7 @@ No language model sits in the grading path. Grading is comparison.
 | PostToolUse hook | Accretes a per-tool evidence trail into the run log. |
 | `fleetproof report` | One self-contained HTML file: per run, claimed-done vs. independently-verified. |
 
-Runtime dependencies: **none** (Python standard library only). A tool whose job is
+Runtime dependencies: none (Python standard library only). A tool whose job is
 being trustworthy should add as little dependency and supply-chain surface as it can.
 
 ## Install (each line is one command in Claude Code)
@@ -89,7 +89,7 @@ must be on your `PATH` (see *Scope and limitations*).
    ```
    `expect` is one of `"exit0"`, `{ "exit": N }`, `{ "regex": "..." }`, or
    `{ "file_exists": "path" }`. `block: true` gates "done"; `block: false` is advisory.
-3. Run any Claude Code agent task as usual. When it claims done, the **Stop hook**
+3. Run any Claude Code agent task as usual. When it claims done, the Stop hook
    runs `fleetproof check` in its own process. If a blocking check fails, Claude is
    blocked from stopping and told exactly which check disagreed.
 4. See what actually happened:
@@ -97,8 +97,8 @@ must be on your `PATH` (see *Scope and limitations*).
    fleetproof list                 # runs, newest first
    fleetproof report               # writes .fleetproof/fleetproof-report.html
    ```
-   The report marks each run **verified**, **contradicted** (claimed done, but a
-   blocking check failed), or **unverified** (no out-of-band verdict on record).
+   The report marks each run *verified*, *contradicted* (claimed done, but a
+   blocking check failed), or *unverified* (no out-of-band verdict on record).
 
 You can also run the checker yourself at any time — `fleetproof check` — or on
 demand via the bundled `/fleetproof:verify-fleet` skill.
@@ -144,9 +144,9 @@ counts, API health, diffs, wordcounts, link resolution. FleetProof's claim is
 never that the predicate language is rich — it's that *whatever predicate you
 choose runs outside the agent's process*.
 
-Guidance that keeps the gate honest: keep **blocking** checks fast and
+Guidance that keeps the gate honest: keep blocking checks fast and
 deterministic (flaky checks flap the gate; slow ones tax every stop) and demote
-heavy suites to `block: false`. For fleets doing **varied tasks in one repo**,
+heavy suites to `block: false`. For fleets doing varied tasks in one repo,
 the working convention is to have the agent author task-specific checks at task
 start — authoring is a feature — and let the spec-drift flag make any later
 revision loud. Per-task check scoping as a first-class mechanism is on the
@@ -172,7 +172,7 @@ This is an early release. Honest boundaries:
 - **An agent can weaken its own checks.** Authoring `checks.json` is a feature, so
   nothing stops an agent from editing it mid-session to slip the gate. FleetProof
   does not (yet) forbid spec edits; instead it records the SHA-256 of the spec on
-  every verdict and flags mid-session **spec drift** loudly — in the Stop-gate
+  every verdict and flags mid-session *spec drift* loudly — in the Stop-gate
   output, the CLI, and the report — when a verdict's spec hash differs from the
   session's first. Drift does not by itself block a passing verdict in v0.1; spec
   pinning and consent-on-change are on the roadmap.
@@ -186,8 +186,8 @@ This is an early release. Honest boundaries:
 ## FleetProof for teams (coming — waitlist open)
 
 The plugin verifies one machine. The hosted tier turns those local verdicts into
-shared, durable **evidence chains**, **team approval queues** for gating agent
-work a human signs off on, and a **compliance export** a non-engineer can
+shared, durable evidence chains, team approval queues for gating agent
+work a human signs off on, and a compliance export a non-engineer can
 inspect — relevant as EU AI Act Article 14 human-oversight obligations become
 enforceable (2026-08-02).
 
