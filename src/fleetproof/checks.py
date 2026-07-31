@@ -14,10 +14,16 @@ Spec shape::
           "run": "python -m pytest -q",
           "expect": "exit0",
           "block": true,
-          "description": "Unit tests must pass."
+          "description": "Unit tests must pass.",
+          "tier": "bridge"
         }
       ]
     }
+
+``tier`` is optional and scopes a check to one rung of the fleet
+(``leaf``/``lane``/``coordinator``/``bridge``); omitting it means the check is
+untiered, which the checker treats as bridge-tier — a v0.1 spec written before
+tiers existed is a spec about the whole session, i.e. about the bridge.
 
 ``expect`` is one of:
     "exit0"                        command must exit 0 (default if omitted)
@@ -43,6 +49,11 @@ DEFAULT_CHECKS_FILENAME = "checks.json"
 
 _VALID_EXPECT_KEYS = {"exit", "regex", "file_exists"}
 
+# The fleet's tier vocabulary. It lives here, in the lowest-level module that
+# needs it, so :mod:`fleetproof.ledger` (which already imports this module for
+# spec hashing) can re-export it instead of the two disagreeing about spelling.
+VALID_TIERS = frozenset({"leaf", "lane", "coordinator", "bridge"})
+
 # The line a drifted verdict carries everywhere it surfaces (gate output, report,
 # CLI). One canonical string so the three surfaces never disagree about wording.
 SPEC_DRIFT_NOTE = (
@@ -63,6 +74,9 @@ class Check:
     expect: dict[str, Any]  # normalized: {"kind": ..., ...}
     block: bool
     description: str = ""
+    # Additive: absent from a v0.1 spec entry, and read back as None there. None
+    # means "untiered", which the checker scopes to the bridge tier.
+    tier: str | None = None
 
     def describe_expectation(self) -> str:
         kind = self.expect["kind"]
@@ -155,6 +169,12 @@ def _parse_check(entry: Any, index: int) -> Check:
     if not isinstance(description, str):
         raise CheckSpecError(f"{where} ({cid}): 'description' must be a string.")
 
+    tier = entry.get("tier")
+    if tier is not None and (not isinstance(tier, str) or tier not in VALID_TIERS):
+        raise CheckSpecError(
+            f"{where} ({cid}): 'tier' must be one of {sorted(VALID_TIERS)} or omitted."
+        )
+
     expect = _normalize_expect(entry.get("expect", "exit0"), cid, where)
 
     # A file_exists check may have no command; every other kind needs one.
@@ -163,7 +183,8 @@ def _parse_check(entry: Any, index: int) -> Check:
             f"{where} ({cid}): a '{expect['kind']}' check requires a 'run' command."
         )
 
-    return Check(id=cid, run=run, expect=expect, block=block, description=description)
+    return Check(id=cid, run=run, expect=expect, block=block, description=description,
+                 tier=tier)
 
 
 def _normalize_expect(expect: Any, cid: str, where: str) -> dict[str, Any]:

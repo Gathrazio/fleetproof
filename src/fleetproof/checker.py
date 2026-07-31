@@ -22,7 +22,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .checks import Check, default_checks_path, load_checks, short_spec_hash, spec_hash
+from .checks import (
+    VALID_TIERS,
+    Check,
+    default_checks_path,
+    load_checks,
+    short_spec_hash,
+    spec_hash,
+)
 from .runlog import list_run_records, record, runs_dir
 
 # Per-check wall-clock ceiling. A check that hangs is a failed check, not a hung fleet.
@@ -50,6 +57,9 @@ class CheckReport:
     results: list[CheckResult] = field(default_factory=list)
     run_id: str | None = None
     spec_sha256: str | None = None
+    # Which tier's checks this verdict covers; None means "every check in the
+    # spec" (the v0.1 behaviour). Additive — older records omit it entirely.
+    tier: str | None = None
 
     @property
     def total(self) -> int:
@@ -79,6 +89,7 @@ class CheckReport:
             # records written before this field existed simply omit it, and every
             # reader treats a missing value as None (no hash on record).
             "spec_sha256": self.spec_sha256,
+            "tier": self.tier,
             "summary": {
                 "total": self.total,
                 "passed": self.passed,
@@ -173,6 +184,26 @@ def run_check(check: Check, cwd: Path, timeout: int = DEFAULT_TIMEOUT_S) -> Chec
     )
 
 
+def select_checks(checks: list[Check], tier: str | None) -> list[Check]:
+    """The subset of ``checks`` that governs ``tier``.
+
+    ``tier=None`` selects everything, exactly as v0.1 did — the Stop hook passes
+    no tier and must keep grading the whole spec. With a tier given, a check is
+    selected when its own ``tier`` matches, plus every *untiered* check when the
+    tier is ``bridge``: a spec written before tiers existed describes the session
+    as a whole, which is the bridge's job. So an untiered check never fires for a
+    leaf, and a leaf-tier check never gates the bridge.
+    """
+    if tier is None:
+        return list(checks)
+    if tier not in VALID_TIERS:
+        raise ValueError(f"Unknown tier {tier!r}; expected one of {sorted(VALID_TIERS)}.")
+    return [
+        c for c in checks
+        if c.tier == tier or (c.tier is None and tier == "bridge")
+    ]
+
+
 def run_checks(
     checks: list[Check] | None = None,
     *,
@@ -180,28 +211,36 @@ def run_checks(
     timeout: int = DEFAULT_TIMEOUT_S,
     record_to_log: bool = True,
     spec_path: Path | None = None,
+    tier: str | None = None,
 ) -> CheckReport:
-    """Run every check and (by default) append the verdict to the run log.
+    """Run every selected check and (by default) append the verdict to the run log.
 
     ``checks`` defaults to the loaded ``.fleetproof/checks.json``. ``cwd`` defaults
     to the current working directory — the directory the fleet actually worked in.
     ``spec_path`` is the check-spec file whose bytes get hashed onto the verdict;
     when omitted it is resolved from ``cwd`` the same way the checker itself finds
     the spec, so the recorded hash always describes the spec that governed the run.
+    ``tier`` narrows which checks run (see :func:`select_checks`); omitting it runs
+    them all, which is what every v0.1 caller gets.
+
+    A tier with no matching checks yields an empty report, whose verdict is "pass"
+    because nothing was declared to fail — the recorded total of 0 is what makes
+    that visible rather than silent.
     """
     if checks is None:
         checks = load_checks(spec_path)
+    checks = select_checks(checks, tier)
     work_dir = Path(cwd) if cwd is not None else Path.cwd()
     resolved_spec = Path(spec_path) if spec_path is not None else default_checks_path(work_dir)
     sha = spec_hash(resolved_spec)
 
-    report = CheckReport(spec_sha256=sha)
+    report = CheckReport(spec_sha256=sha, tier=tier)
     if not record_to_log:
         for check in checks:
             report.results.append(run_check(check, work_dir, timeout))
         return report
 
-    with record("fleetproof", "check", {"check_count": len(checks)}) as handle:
+    with record("fleetproof", "check", {"check_count": len(checks), "tier": tier}) as handle:
         report.run_id = handle.run_id
         for check in checks:
             report.results.append(run_check(check, work_dir, timeout))
@@ -271,6 +310,9 @@ def format_report_text(report: CheckReport) -> str:
         f"{s['blocking_failed']} blocking failure(s)."
     )
     lines.append(f"spec: {short_spec_hash(report.spec_sha256)}")
+    # Only surfaced when scoped, so untiered (v0.1) output is byte-identical.
+    if report.tier:
+        lines.append(f"tier: {report.tier}")
     return "\n".join(lines)
 
 

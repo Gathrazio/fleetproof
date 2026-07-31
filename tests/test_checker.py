@@ -7,13 +7,21 @@ import os
 import sys
 from pathlib import Path
 
-from fleetproof.checker import run_check, run_checks, session_spec_baseline, spec_drifted
+import pytest
+
+from fleetproof.checker import (
+    run_check,
+    run_checks,
+    select_checks,
+    session_spec_baseline,
+    spec_drifted,
+)
 from fleetproof.checks import Check, load_checks, spec_hash
 from fleetproof.runlog import list_run_records
 
 
-def _check(cid, run=None, expect=None, block=True):
-    return Check(id=cid, run=run, expect=expect or {"kind": "exit0"}, block=block)
+def _check(cid, run=None, expect=None, block=True, tier=None):
+    return Check(id=cid, run=run, expect=expect or {"kind": "exit0"}, block=block, tier=tier)
 
 
 def test_exit0_pass_and_fail(tmp_project):
@@ -144,6 +152,79 @@ def test_spec_baseline_and_drift_within_session(tmp_runs, tmp_path, monkeypatch)
     assert baseline == first.spec_sha256
     # The first verdict is the baseline, so it is not itself drift.
     assert spec_drifted(first.spec_sha256, "sess-1")[0] is False
+
+
+# === tier scoping (additive; v0.1 callers pass no tier) ===
+
+def _tiered_set():
+    return [
+        _check("untiered"),
+        _check("leaf-check", tier="leaf"),
+        _check("lane-check", tier="lane"),
+        _check("coordinator-check", tier="coordinator"),
+        _check("bridge-check", tier="bridge"),
+    ]
+
+
+def test_no_tier_selects_everything_v01_behaviour():
+    assert [c.id for c in select_checks(_tiered_set(), None)] == [
+        "untiered", "leaf-check", "lane-check", "coordinator-check", "bridge-check",
+    ]
+
+
+def test_bridge_tier_includes_untiered_checks():
+    # An untiered spec is a bridge-tier spec by definition, so a v0.1 spec keeps
+    # gating the bridge once tiers exist.
+    assert [c.id for c in select_checks(_tiered_set(), "bridge")] == [
+        "untiered", "bridge-check",
+    ]
+
+
+def test_leaf_tier_excludes_untiered_checks():
+    assert [c.id for c in select_checks(_tiered_set(), "leaf")] == ["leaf-check"]
+    assert [c.id for c in select_checks(_tiered_set(), "lane")] == ["lane-check"]
+    assert [c.id for c in select_checks(_tiered_set(), "coordinator")] == [
+        "coordinator-check"]
+
+
+def test_unknown_tier_rejected():
+    with pytest.raises(ValueError):
+        select_checks(_tiered_set(), "middle-management")
+
+
+def test_run_checks_tier_filters_and_records_tier(tmp_runs, tmp_project):
+    ok = f'"{sys.executable}" -c "raise SystemExit(0)"'
+    bad = f'"{sys.executable}" -c "raise SystemExit(1)"'
+    checks = [_check("leaf-ok", run=ok, tier="leaf"), _check("bridge-bad", run=bad)]
+
+    leaf = run_checks(checks, cwd=tmp_project, record_to_log=False, tier="leaf")
+    assert [r.id for r in leaf.results] == ["leaf-ok"]
+    assert leaf.verdict == "pass"
+    assert leaf.tier == "leaf"
+
+    bridge = run_checks(checks, cwd=tmp_project, record_to_log=False, tier="bridge")
+    assert [r.id for r in bridge.results] == ["bridge-bad"]
+    assert bridge.verdict == "fail"
+
+    # Backward compatibility: no tier runs both, exactly as v0.1 did.
+    every = run_checks(checks, cwd=tmp_project, record_to_log=False)
+    assert [r.id for r in every.results] == ["leaf-ok", "bridge-bad"]
+    assert every.tier is None
+
+    recorded = run_checks(checks, cwd=tmp_project, record_to_log=True, tier="leaf")
+    payload = list_run_records()[0].sub_invocations[0].load_output()
+    assert payload["tier"] == "leaf"
+    assert payload["summary"]["total"] == 1
+    assert recorded.tier == "leaf"
+
+
+def test_tier_with_no_matching_checks_is_an_empty_report(tmp_project):
+    # Nothing declared for this tier: an empty report, whose zero total is what
+    # makes "nothing was verified" visible rather than silent.
+    report = run_checks([_check("bridge-only", run="true")], cwd=tmp_project,
+                        record_to_log=False, tier="leaf")
+    assert report.total == 0
+    assert report.verdict == "pass"
 
 
 def test_no_drift_without_session_context(tmp_runs, tmp_path):
