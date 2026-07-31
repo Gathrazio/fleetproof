@@ -11,6 +11,8 @@ surface as it can. Subcommands:
     cleanup   delete run records older than N days
     stop-gate Stop-hook entry: emit a Claude Code block decision on a false "done"
     record    PostToolUse-hook entry: append an evidence record from hook stdin
+    subagent-start SubagentStart-hook entry: put a spawning subagent on the ledger
+    subagent-stop  SubagentStop-hook entry: the per-subagent report-and-verify gate
     dispatch  ledger verbs: new / report / close a dispatch
     fleet     the dispatch board — every dispatch, its state, and whether it reported
 
@@ -42,7 +44,12 @@ from .checks import (
     load_checks,
     short_spec_hash,
 )
-from .hookgate import record_tool_main, stop_gate_main
+from .hookgate import (
+    record_tool_main,
+    stop_gate_main,
+    subagent_start_main,
+    subagent_stop_main,
+)
 from .ledger import (
     LedgerError,
     close_dispatch,
@@ -81,7 +88,12 @@ def _cmd_check(args: argparse.Namespace) -> int:
     except CheckSpecError as e:
         _emit_error("check_spec_error", str(e), args.format)
         return 2
-    report = run_checks(checks, record_to_log=not args.no_record, spec_path=spec_path)
+    try:
+        report = run_checks(checks, record_to_log=not args.no_record,
+                            spec_path=spec_path, tier=args.tier)
+    except ValueError as e:  # unknown tier
+        _emit_error("bad_tier", str(e), args.format)
+        return 2
 
     # Best-effort drift note: a bare CLI run usually has no session context (so
     # baseline is unresolvable and nothing is flagged), but when it runs inside a
@@ -235,6 +247,14 @@ def _cmd_record(args: argparse.Namespace) -> int:
     # PostToolUse recorder must be allowed to write records.
     os.environ["FLEETPROOF_NO_RECORD"] = "0"
     return record_tool_main()
+
+
+def _cmd_subagent_start(args: argparse.Namespace) -> int:
+    return subagent_start_main()
+
+
+def _cmd_subagent_stop(args: argparse.Namespace) -> int:
+    return subagent_stop_main()
 
 
 def _resolve_prompt(args: argparse.Namespace) -> str:
@@ -403,6 +423,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_check = sub.add_parser("check", help="Run the independent checker and record the verdict.")
     p_check.add_argument("--spec", default=None, help="Path to a check spec (default: .fleetproof/checks.json).")
     p_check.add_argument("--no-record", action="store_true", help="Do not write to the run log.")
+    p_check.add_argument("--tier", choices=sorted(VALID_TIERS), default=None,
+                         help="Only run checks for this tier (untiered checks count "
+                              "as bridge). Omit to run every check.")
     _add_format(p_check)
     p_check.set_defaults(func=_cmd_check)
 
@@ -431,6 +454,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_rec = sub.add_parser("record", help="PostToolUse-hook entry: record a tool call from hook stdin.")
     p_rec.set_defaults(func=_cmd_record)
+
+    p_sstart = sub.add_parser(
+        "subagent-start",
+        help="SubagentStart-hook entry: record a spawning subagent as a dispatch.")
+    p_sstart.set_defaults(func=_cmd_subagent_start)
+
+    p_sstop = sub.add_parser(
+        "subagent-stop",
+        help="SubagentStop-hook entry: record the report, grade it, block a false 'done'.")
+    p_sstop.set_defaults(func=_cmd_subagent_stop)
 
     p_dispatch = sub.add_parser("dispatch", help="Dispatch-ledger verbs.")
     dsub = p_dispatch.add_subparsers(dest="dispatch_command", required=True)

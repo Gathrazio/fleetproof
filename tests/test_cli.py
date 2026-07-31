@@ -195,3 +195,67 @@ def test_fleet_empty_and_json_and_session_filter(cli_runs, monkeypatch, capsys):
     assert [d["run_id"] for d in payload["dispatches"]] == [mine]
     assert payload["dispatches"][0]["age"]
     assert theirs != mine
+
+
+# === hook entry subcommands + tier-scoped check ===
+
+def test_subagent_hook_subcommands_are_wired(cli_runs, monkeypatch, capsys):
+    # Same shape as the existing stop-gate/record entries: the CLI is another way
+    # into the hook mains, which is what the plugin shims call.
+    import io
+    import os
+
+    from fleetproof.ledger import list_dispatches
+
+    payload = {"session_id": "sess-cli", "hook_event_name": "SubagentStart",
+               "agent_id": "cli-agent", "agent_type": "tester"}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    assert main(["subagent-start"]) == 0
+    assert len(list_dispatches()) == 1
+
+    payload["hook_event_name"] = "SubagentStop"
+    payload["last_assistant_message"] = ""
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    assert main(["subagent-stop"]) == 0
+    decision = json.loads(capsys.readouterr().out)
+    assert decision["decision"] == "block"
+    # Blocked for want of a report, so the dispatch stays where it was.
+    assert list_dispatches()[0].state == "dispatched"
+    # _apply_session_id writes os.environ directly, mirroring the real hook process.
+    os.environ.pop(runlog.SESSION_ID_ENV, None)
+
+
+def test_check_tier_flag_scopes_the_run(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    runlog.set_runs_dir(tmp_path / "runs")
+    spec = tmp_path / "checks.json"
+    spec.write_text(json.dumps({"checks": [
+        {"id": "leaf-ok", "run": f'"{sys.executable}" -c "raise SystemExit(0)"',
+         "tier": "leaf"},
+        {"id": "bridge-bad", "run": f'"{sys.executable}" -c "raise SystemExit(1)"'},
+    ]}), encoding="utf-8")
+
+    # The leaf tier runs only the leaf check, so the untiered failure cannot gate it.
+    assert main(["check", "--spec", str(spec), "--tier", "leaf", "--format", "json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["tier"] == "leaf"
+    assert [c["id"] for c in out["checks"]] == ["leaf-ok"]
+
+    # An untiered check is a bridge check, so the bridge tier still fails.
+    assert main(["check", "--spec", str(spec), "--tier", "bridge"]) == 1
+    assert "tier: bridge" in capsys.readouterr().out
+
+    # No tier: v0.1 behaviour, every check runs.
+    assert main(["check", "--spec", str(spec), "--format", "json"]) == 1
+    every = json.loads(capsys.readouterr().out)
+    assert every["tier"] is None
+    assert [c["id"] for c in every["checks"]] == ["leaf-ok", "bridge-bad"]
+
+
+def test_check_rejects_unknown_tier(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    spec = tmp_path / "checks.json"
+    spec.write_text(json.dumps({"checks": []}), encoding="utf-8")
+    # argparse choices reject it before the checker ever runs.
+    with pytest.raises(SystemExit):
+        main(["check", "--spec", str(spec), "--tier", "middle-management"])

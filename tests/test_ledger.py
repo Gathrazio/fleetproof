@@ -28,6 +28,7 @@ from fleetproof.ledger import (
     close_dispatch,
     create_dispatch,
     derive_manifest,
+    find_dispatch_by_agent,
     infer_tier,
     list_dispatches,
     load_dispatch,
@@ -236,6 +237,34 @@ def test_second_report_rejected(ledger_runs):
     assert load_dispatch(run_id).load_report()["summary"] == "first"
 
 
+def test_contradicted_dispatch_may_report_again(ledger_runs):
+    # The gate-blocked retry lands on the same dispatch: the harness hands the same
+    # agent its turn back, so re-reporting is reality the ledger has to record.
+    run_id = create_dispatch("work")
+    record_report(run_id, _ok_report("first attempt"))
+    record_verdict(run_id, STATE_CONTRADICTED, detail="tests-pass failed")
+    record_report(run_id, _ok_report("fixed it"))
+    record_verdict(run_id, STATE_VERIFIED)
+    close_dispatch(run_id)
+
+    record = load_dispatch(run_id)
+    assert [t["state"] for t in record.transitions] == [
+        STATE_DISPATCHED, STATE_REPORTED, STATE_CONTRADICTED,
+        STATE_REPORTED, STATE_VERIFIED, STATE_TERMINATED,
+    ]
+    # The newest claim wins on disk; the attempt history lives in the transitions.
+    assert record.load_report()["summary"] == "fixed it"
+
+
+def test_verified_dispatch_may_not_report_again(ledger_runs):
+    # Only a contradiction re-opens a dispatch. A passed one is done.
+    run_id = create_dispatch("work")
+    record_report(run_id, _ok_report())
+    record_verdict(run_id, STATE_VERIFIED)
+    with pytest.raises(LedgerError):
+        record_report(run_id, _ok_report("second thoughts"))
+
+
 def test_contradicted_verdict_recorded(ledger_runs):
     run_id = create_dispatch("work")
     record_report(run_id, _ok_report())
@@ -426,6 +455,85 @@ def test_explicit_manifest_is_normalized_and_preserves_unknown_keys(ledger_runs)
     assert record.manifest["checks"] == []
     assert record.manifest["notes"] == ""
     assert record.manifest["owner"] == "integration"
+
+
+# === harness-agent block + lookup ===
+
+def _agent(agent_id="agent-1", agent_type="tester", capture="start") -> dict:
+    return {"agent_id": agent_id, "agent_type": agent_type, "capture": capture}
+
+
+def test_agent_block_roundtrip(ledger_runs):
+    run_id = create_dispatch("subagent work", tier="lane", agent=_agent())
+    record = load_dispatch(run_id)
+    assert record.agent == _agent()
+    assert record.agent_id == "agent-1"
+    assert record.to_dict()["agent"]["capture"] == "start"
+
+
+def test_agent_absent_reads_back_as_none(ledger_runs):
+    # A Phase A dispatch has no agent block at all; the key is omitted, not null.
+    run_id = create_dispatch("hand-made work")
+    raw = json.loads((ledger_runs / run_id / "dispatch.json").read_text(encoding="utf-8"))
+    assert "agent" not in raw
+    record = load_dispatch(run_id)
+    assert record.agent is None
+    assert record.agent_id is None
+
+
+def test_agent_block_preserves_unknown_keys(ledger_runs):
+    run_id = create_dispatch("work", agent=dict(_agent(), transcript="/tmp/t.jsonl"))
+    assert load_dispatch(run_id).agent["transcript"] == "/tmp/t.jsonl"
+
+
+def test_malformed_agent_block_raises(ledger_runs):
+    for bad in ("not-an-object", {"capture": "sometimes"}, {"agent_id": 7},
+                {"agent_type": []}):
+        with pytest.raises(LedgerError):
+            create_dispatch("work", agent=bad)
+
+
+def test_find_dispatch_by_agent(ledger_runs, monkeypatch):
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-1")
+    mine = create_dispatch("work", tier="lane", agent=_agent("agent-1"))
+    create_dispatch("other work", tier="lane", agent=_agent("agent-2"))
+    found = find_dispatch_by_agent("sess-1", "agent-1")
+    assert found is not None and found.run_id == mine
+    assert find_dispatch_by_agent("sess-1", "agent-3") is None
+    assert find_dispatch_by_agent("sess-1", None) is None
+
+
+def test_find_dispatch_by_agent_skips_terminated_and_other_sessions(ledger_runs, monkeypatch):
+    # An agent id can come back around after its dispatch closed out, so a
+    # terminated record must never be the one a later stop reports onto.
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-1")
+    old = create_dispatch("finished work", tier="lane", agent=_agent("agent-1"))
+    close_dispatch(old)
+    assert find_dispatch_by_agent("sess-1", "agent-1") is None
+
+    fresh = create_dispatch("new work", tier="lane", agent=_agent("agent-1"))
+    assert find_dispatch_by_agent("sess-1", "agent-1").run_id == fresh
+    # Same agent id, different session: not a match.
+    assert find_dispatch_by_agent("sess-other", "agent-1") is None
+
+
+def test_find_dispatch_by_agent_without_a_session_matches_on_agent_alone(ledger_runs, monkeypatch):
+    # A payload with no session_id (older harness, or a malformed hook) leaves the
+    # agent id as the only join key available. Documented fallback, not an accident.
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-1")
+    run_id = create_dispatch("work", tier="lane", agent=_agent("agent-1"))
+    found = find_dispatch_by_agent(None, "agent-1")
+    assert found is not None and found.run_id == run_id
+
+
+def test_find_dispatch_by_agent_returns_newest_match(ledger_runs, monkeypatch):
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-1")
+    first = create_dispatch("older", tier="lane", agent=_agent("agent-1"))
+    second = create_dispatch("newer", tier="lane", agent=_agent("agent-1"))
+    # Two live records for one agent id is already a bug upstream; the lookup at
+    # least has to be deterministic. Newest-first is run-id order (see
+    # list_dispatches), so the greater id wins.
+    assert find_dispatch_by_agent("sess-1", "agent-1").run_id == max(first, second)
 
 
 def test_malformed_explicit_manifest_raises(ledger_runs):

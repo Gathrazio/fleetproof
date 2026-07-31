@@ -27,21 +27,30 @@ keep its state machine pretty.
 
 Lifecycle::
 
-    dispatched -> reported -> verified | contradicted -> terminated
-         |            |            (and each of those) -> terminated
-         +------------+----------------------------------> terminated
+    dispatched -> reported -> verified ------------------> terminated
+         |            ^          contradicted -> terminated
+         |            |               |
+         |            +---------------+   (re-report: the gate blocked, the agent
+         |                                 fixed it, the SAME dispatch reports again)
+         +----------------------------------------------> terminated
 
 The current state of a dispatch is its last transition. ``terminated`` is the
 only terminal state. "Open" means not yet reported.
 
+``contradicted -> reported`` is legal on purpose: when the subagent gate blocks a
+stop, the harness hands the *same* agent back its turn, so the retry is the same
+dispatch by construction. Re-opening a dispatch a human re-scoped is operator
+policy (dispatch it again); re-reporting after a failed gate is ledger law.
+
 Public API:
-    create_dispatch(prompt, *, tier, manifest, parent_run_id, by) -> run_id
+    create_dispatch(prompt, *, tier, manifest, parent_run_id, agent, by) -> run_id
     infer_tier(parent_run_id) -> str
     record_report(run_id, report, by=...)
     record_verdict(run_id, verdict, detail=..., by=...)
     close_dispatch(run_id, by=...)
     load_dispatch(run_id) -> DispatchRecord | None
     list_dispatches(*, session_id, open_only, non_terminal_only) -> list[DispatchRecord]
+    find_dispatch_by_agent(session_id, agent_id) -> DispatchRecord | None
     derive_manifest(prompt) -> dict
 """
 
@@ -88,7 +97,10 @@ _ALLOWED_NEXT: dict[str, frozenset[str]] = {
     STATE_DISPATCHED: frozenset({STATE_REPORTED, STATE_TERMINATED}),
     STATE_REPORTED: frozenset({STATE_VERIFIED, STATE_CONTRADICTED, STATE_TERMINATED}),
     STATE_VERIFIED: frozenset({STATE_TERMINATED}),
-    STATE_CONTRADICTED: frozenset({STATE_TERMINATED}),
+    # Back to reported: the gate blocked this agent's stop, so the retry lands on
+    # the same dispatch. Its report is overwritten; the transition list is the
+    # audit trail of how many tries it took.
+    STATE_CONTRADICTED: frozenset({STATE_REPORTED, STATE_TERMINATED}),
     STATE_TERMINATED: frozenset(),
 }
 
@@ -110,6 +122,15 @@ TIER_SOURCE_DECLARED = "declared"
 # Evidence kinds a reported deliverable may claim, weakest last. "executed" means
 # a command ran and its result is on record; "believed" means nobody checked.
 VALID_EVIDENCE = frozenset({"executed", "observed", "believed"})
+
+# How a harness subagent came to be in the ledger. "start" means we saw it spawn
+# (SubagentStart fired) and the dispatch was on record before it did any work;
+# "stop-only" means the first we heard of it was its own stop, so the record was
+# back-filled. The distinction matters: a stop-only sighting proves the start hook
+# is not firing, which is a hole in the capture surface, not a normal case.
+CAPTURE_START = "start"
+CAPTURE_STOP_ONLY = "stop-only"
+VALID_CAPTURE = frozenset({CAPTURE_START, CAPTURE_STOP_ONLY})
 
 # Ceiling on an ancestor walk, so a malformed or circular parent chain costs a
 # bounded amount of work instead of hanging a hook.
@@ -146,6 +167,10 @@ class DispatchRecord:
     spec_sha256_pinned: str | None = None
     transitions: list[dict[str, Any]] = field(default_factory=list)
     started_at: str | None = None
+    # The harness subagent this dispatch stands for, when one is known. Additive:
+    # a dispatch created by hand (or by v0.2 Phase A) has no agent block, and it
+    # reads back as None.
+    agent: dict[str, Any] | None = None
 
     @property
     def state(self) -> str:
@@ -186,6 +211,14 @@ class DispatchRecord:
         return None
 
     @property
+    def agent_id(self) -> str | None:
+        """The harness agent id this dispatch tracks, or None if not agent-backed."""
+        if not isinstance(self.agent, dict):
+            return None
+        agent_id = self.agent.get("agent_id")
+        return str(agent_id) if agent_id else None
+
+    @property
     def has_report(self) -> bool:
         return (self.run_dir / REPORT_FILENAME).exists()
 
@@ -205,6 +238,7 @@ class DispatchRecord:
             "spec_sha256_pinned": self.spec_sha256_pinned,
             "transitions": self.transitions,
             "started_at": self.started_at,
+            "agent": self.agent,
             "state": self.state,
             "verdict": self.verdict,
             "has_report": self.has_report,
@@ -233,6 +267,7 @@ def load_dispatch(run_id: str) -> DispatchRecord | None:
     root = _read_json(run_dir / ROOT_FILENAME) or {}
     transitions = dispatch.get("transitions")
     manifest = dispatch.get("manifest")
+    agent = dispatch.get("agent")
     return DispatchRecord(
         run_id=run_id,
         run_dir=run_dir,
@@ -245,6 +280,7 @@ def load_dispatch(run_id: str) -> DispatchRecord | None:
         spec_sha256_pinned=dispatch.get("spec_sha256_pinned"),
         transitions=transitions if isinstance(transitions, list) else [],
         started_at=root.get("started_at"),
+        agent=agent if isinstance(agent, dict) else None,
     )
 
 
@@ -280,6 +316,27 @@ def list_dispatches(
             continue
         out.append(record)
     return out
+
+
+def find_dispatch_by_agent(session_id: str | None, agent_id: str | None) -> DispatchRecord | None:
+    """The newest non-terminal dispatch in ``session_id`` tracking ``agent_id``.
+
+    This is how the SubagentStop gate finds the record its SubagentStart sibling
+    created. The harness gives no correlation field between a spawn and a stop
+    beyond the agent id, so that plus the session is the whole key — and it is
+    scoped to non-terminal dispatches because an agent id can be reused after a
+    dispatch is closed out.
+
+    Returns None when there is no agent id (nothing to match on) or no match, and
+    the caller is expected to back-fill a ``stop-only`` dispatch rather than treat
+    the sighting as unrecorded.
+    """
+    if not agent_id:
+        return None
+    for record in list_dispatches(session_id=session_id, non_terminal_only=True):
+        if record.agent_id == agent_id:
+            return record
+    return None
 
 
 # === Tier inference ===
@@ -464,12 +521,33 @@ def _fresh_run_dir() -> tuple[str, Path]:
     raise LedgerError("Could not allocate a unique dispatch run id.")
 
 
+def _coerce_agent(raw: Any) -> dict[str, Any]:
+    """Normalize the optional harness-agent block. Raises LedgerError if unusable."""
+    if not isinstance(raw, dict):
+        raise LedgerError("agent must be an object.")
+    out: dict[str, Any] = {}
+    for key in ("agent_id", "agent_type"):
+        val = raw.get(key)
+        if val is not None and not isinstance(val, str):
+            raise LedgerError(f"agent.{key} must be a string or omitted.")
+        out[key] = val or None
+    capture = raw.get("capture")
+    if capture is not None and capture not in VALID_CAPTURE:
+        raise LedgerError(f"agent.capture must be one of {sorted(VALID_CAPTURE)}.")
+    out["capture"] = capture
+    for key, val in raw.items():
+        if key not in out:
+            out[key] = val
+    return out
+
+
 def create_dispatch(
     prompt: str,
     *,
     tier: str | None = None,
     manifest: dict[str, Any] | None = None,
     parent_run_id: str | None = None,
+    agent: dict[str, Any] | None = None,
     by: str = "cli",
     spec_path: Path | None = None,
 ) -> str:
@@ -483,9 +561,11 @@ def create_dispatch(
 
     ``tier`` omitted means infer it (recorded as ``tier_source="inferred"``);
     passing one records ``"declared"``. ``manifest`` omitted means derive one from
-    the prompt. ``spec_path`` overrides which spec file gets hashed (hooks/tests);
-    by default the project's ``.fleetproof/checks.json`` is used, and an
-    unreadable spec pins ``null`` rather than failing the dispatch.
+    the prompt. ``agent`` records the harness subagent this dispatch stands for
+    (``agent_id``/``agent_type``/``capture``), which is what lets a later
+    SubagentStop find this record again. ``spec_path`` overrides which spec file
+    gets hashed (hooks/tests); by default the project's ``.fleetproof/checks.json``
+    is used, and an unreadable spec pins ``null`` rather than failing the dispatch.
     """
     if not isinstance(prompt, str) or not prompt.strip():
         raise LedgerError("A dispatch needs a prompt; refusing to record an empty one.")
@@ -507,6 +587,8 @@ def create_dispatch(
         except ValueError as e:
             raise LedgerError(f"Unusable manifest: {e}") from e
 
+    resolved_agent = _coerce_agent(agent) if agent is not None else None
+
     run_id, run_dir = _fresh_run_dir()
     session_id = os.environ.get(SESSION_ID_ENV) or None
 
@@ -522,14 +604,19 @@ def create_dispatch(
         "user": os.environ.get("USER") or os.environ.get("USERNAME") or "unknown",
         "pid": os.getpid(),
     })
-    _write_json(run_dir / DISPATCH_FILENAME, {
+    dispatch: dict[str, Any] = {
         "prompt": prompt,
         "tier": resolved_tier,
         "tier_source": tier_source,
         "manifest": resolved_manifest,
         "spec_sha256_pinned": spec_hash(spec_path),
         "transitions": [_transition(STATE_DISPATCHED, by)],
-    })
+    }
+    # Omitted entirely when there is no agent, so a hand-made dispatch record
+    # stays the shape Phase A wrote and readers keep treating absent as None.
+    if resolved_agent is not None:
+        dispatch["agent"] = resolved_agent
+    _write_json(run_dir / DISPATCH_FILENAME, dispatch)
     return run_id
 
 
@@ -610,6 +697,10 @@ def record_report(run_id: str, report: dict[str, Any], by: str = "cli") -> Dispa
 
     The report is written verbatim: it is the agent's own claim, and the whole
     point of keeping it is being able to diff a claim against a verdict later.
+
+    Legal from ``dispatched`` and from ``contradicted`` (the gate-blocked retry).
+    A retry overwrites ``report.json`` with the newer claim; the transition list
+    keeps the history of how many attempts it took.
     """
     record = _require_dispatch(run_id)
     validated = _validate_report(report)
