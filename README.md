@@ -47,12 +47,139 @@ No language model sits in the grading path. Grading is comparison.
 |---|---|
 | `@recorded` / `record()` | Durable per-invocation run records under `.fleetproof/runs/`. |
 | `fleetproof check` | The independent checker: runs each declared check in its own subprocess, records the verdict. |
-| Stop hook | Runs the checker when an agent claims done; blocks on a blocking-check failure. |
+| Stop hook | Runs the checker when an agent claims done; blocks on a blocking-check failure, and on dispatches left half-closed. |
 | PostToolUse hook | Accretes a per-tool evidence trail into the run log. |
+| SubagentStart hook | Puts a spawning subagent on the dispatch ledger before it does any work. |
+| SubagentStop hook | The per-subagent gate: records what the agent claimed, grades it at that agent's tier, blocks a false "done". |
+| `fleetproof fleet` | The dispatch board: every dispatch, its state, its tier, and whether anything graded it. |
 | `fleetproof report` | One self-contained HTML file: per run, claimed-done vs. independently-verified. |
 
 Runtime dependencies: none (Python standard library only). A tool whose job is
 being trustworthy should add as little dependency and supply-chain surface as it can.
+
+## The Dispatch Ledger (v0.2)
+
+v0.1 could answer "did this agent's claim survive an independent check?" It could
+not answer the question a fleet operator actually has: of everything I dispatched,
+what came back, and did any of it check out? A subagent that was launched, wrote
+nothing, and died leaves no trace at all in a log that only records tool calls.
+
+So v0.2 records a dispatch at launch — before any work happens — as its own run:
+
+```
+.fleetproof/runs/<run-id>/
+    _root.json      root_tool="dispatch", parent_run_id -> the dispatching run
+    dispatch.json   the prompt, the tier, the manifest, the transitions
+    report.json     what the dispatched agent claimed (written when it reports)
+```
+
+Nothing grades itself here either. The dispatching process writes `dispatch.json`;
+the report is the dispatched agent's own claim; the `verified` / `contradicted`
+transition is appended by the checker, from a different process.
+
+### The lifecycle
+
+```
+dispatched -> reported -> verified ------------------> terminated
+     |            ^          contradicted -> terminated
+     |            |               |
+     |            +---------------+   (the gate blocked, the agent fixed it, the
+     |                                 SAME dispatch reports again)
+     +----------------------------------------------> terminated
+```
+
+A dispatch's state is its last transition, and `terminated` is the only terminal
+one. Two things in that diagram are deliberate:
+
+- `terminated` is reachable from everywhere, including straight from `dispatched`.
+  An agent killed before it ever reported is a thing that happens; a ledger that
+  refused to record it would be lying to keep its state machine tidy.
+- `contradicted -> reported` is legal. When the gate blocks a subagent's stop, the
+  harness hands that same agent its turn back, so the retry lands on the same
+  dispatch by construction. The transition list is the audit trail of how many
+  tries it took.
+
+### Tiers
+
+A check can declare which rung of the fleet it governs — `leaf`, `lane`,
+`coordinator`, or `bridge`:
+
+```json
+{ "id": "tests-pass", "run": "python -m pytest -q", "expect": "exit0", "tier": "bridge" }
+```
+
+A check with no `tier` is a check about the session as a whole, which is the
+bridge's job, so an untiered v0.1 spec still selects exactly what it always did.
+Each rung is graded on its own tier and nothing else, which is why a failing
+leaf-tier check no longer blocks the bridge from stopping: the bridge has no way
+to fix a leaf's work from its own turn.
+
+A dispatch's tier is either declared or inferred, and the ledger records which one.
+Inference reads the shape of the run tree: no parent means `bridge`, a parent that
+tops its own chain means `lane`, anything deeper means `leaf`. `coordinator` is
+never inferred — it is a role you assign, not a shape that shows up in a run tree.
+On the board a declared tier carries a trailing `!`, so you can tell a decision
+from a guess.
+
+### The two new hooks
+
+SubagentStart is context-only by contract (it cannot block), so its whole job is
+getting the dispatch on record before the subagent does any work.
+
+SubagentStop is the gate. Each step is its own reason to refuse the stop:
+
+1. Report-before-idle. No final message means no report: an agent that went idle
+   saying nothing has not reported, and writing that down as `reported` would
+   launder silence into a claim. Blocked without transitioning.
+2. Pin drift. Every dispatch pins the SHA-256 of the check spec that was in force
+   when the work was ordered. If the spec changed mid-flight, the stop is blocked
+   rather than graded against a spec the agent could have edited itself.
+3. That agent's tier of the spec. A blocking failure records `contradicted` and
+   blocks; a pass records `verified` and closes the dispatch. If the tier selects
+   no checks at all, no verdict is recorded — an absent grade must never read as a
+   passing one.
+
+The Stop hook keeps its v0.1 job and adds a ledger sweep. A dispatch that reported
+and then never terminated blocks the bridge from stopping: something started
+closing it out and stopped halfway, which is exactly how work goes missing. A
+dispatch still in state `dispatched` is a legitimately running background agent, so
+it is reported and not blocked on.
+
+### Working with it
+
+```
+fleetproof dispatch new --prompt "..."        # --prompt-file for a real, long one
+fleetproof dispatch report <run-id> --report report.json
+fleetproof dispatch close <run-id>
+
+fleetproof fleet                              # the board, newest first
+fleetproof fleet --open                       # only what has not terminated
+fleetproof fleet --format json                # full records, for an agent to read
+
+fleetproof check --tier lane                  # grade one rung of the spec
+```
+
+The board never prints a bare dash where a verdict goes. A dispatch nothing graded
+reads `ungraded`, because in a column of verdicts a blank cell reads as "fine".
+`fleetproof report` says the same thing at more length: dispatches render as their
+own rows, indented under the run that ordered them, with the prompt, the claim, the
+transition trail, and which process wrote each transition.
+
+### What the ledger does not do yet
+
+- The spawn prompt is in neither subagent hook payload. A captured dispatch records
+  a placeholder saying so, rather than inventing a prompt it never saw. To get the
+  real prompt on the record, dispatch through `fleetproof dispatch new`.
+- Captured subagents are recorded as `lane` tier. Real nesting depth is not visible
+  from the payload — there is no parent-agent field — so declaring one beats
+  inferring it wrongly. What that costs in practice is a pilot question.
+- An agent killed mid-turn can reach SubagentStop with an empty final message,
+  which report-before-idle blocks. Blocking the stop of an agent that is already
+  gone is not useful; how often it happens is under observation.
+- There is no correlation field between the Task call that spawned an agent and
+  that agent's stop, so `agent_id` plus `session_id` is the entire join key. That
+  is also why the lookup is scoped to non-terminal dispatches: an agent id can be
+  reused once a dispatch is closed out.
 
 ## Install (each line is one command in Claude Code)
 

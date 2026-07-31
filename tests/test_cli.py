@@ -172,13 +172,81 @@ def test_fleet_board_is_plain_ascii(cli_runs, capsys):
     assert main(["fleet"]) == 0
     out = capsys.readouterr().out
     assert open_id in out and dead_id in out
-    assert "dispatched" in out and "terminated" in out
+    # Explicit labels, not raw state names.
+    assert "in-fleet (awaiting report)" in out
+    assert "done (no report)" in out
     # cp1252 consoles: the board must encode without a UnicodeEncodeError.
     out.encode("cp1252")
 
     assert main(["fleet", "--open"]) == 0
     open_out = capsys.readouterr().out
     assert open_id in open_out and dead_id not in open_out
+
+
+def test_fleet_board_never_shows_a_bare_dash_for_a_verdict(cli_runs, capsys):
+    # The one thing this board must not do: let an ungraded dispatch look fine.
+    _dispatch_new(capsys)
+    capsys.readouterr()
+    assert main(["fleet"]) == 0
+    out = capsys.readouterr().out
+    assert "ungraded" in out
+    header, row = out.splitlines()[0], out.splitlines()[1]
+    verdict_col = header.index("verdict")
+    assert row[verdict_col:verdict_col + len("ungraded")] == "ungraded"
+    # And the footer counts it, so the operator sees the total without scanning.
+    assert "1 ungraded." in out
+
+
+def test_fleet_board_labels_state_tier_agent_and_verdict(cli_runs, capsys):
+    from fleetproof.ledger import (
+        close_dispatch,
+        create_dispatch,
+        record_report,
+        record_verdict,
+    )
+
+    # Declared tier + a graded, closed, agent-backed dispatch.
+    graded = create_dispatch(
+        "declared work",
+        tier="lane",
+        agent={"agent_id": "a-1", "agent_type": "tester", "capture": "stop-only"},
+    )
+    record_report(graded, {"summary": "done"})
+    record_verdict(graded, "contradicted", detail="lane-artifact")
+    # An inferred-tier dispatch that reported and was then abandoned half-closed.
+    stalled = create_dispatch("inferred work")
+    record_report(stalled, {"summary": "done"})
+    closed_clean = create_dispatch("finished work", tier="leaf")
+    record_report(closed_clean, {"summary": "done"})
+    record_verdict(closed_clean, "verified")
+    close_dispatch(closed_clean)
+
+    assert main(["fleet"]) == 0
+    out = capsys.readouterr().out
+    # Declared tiers carry the '!' marker; an inferred one does not.
+    assert "lane!" in out and "leaf!" in out
+    assert "bridge " in out  # inferred: no marker (no parent run -> bridge)
+    assert "reported (stalled)" in out
+    assert "done " in out
+    assert "contradicted" in out and "verified" in out
+    # A back-filled agent is flagged: the start hook never fired for it.
+    assert "tester (stop-only)" in out
+    # The legend explains every marker it uses.
+    assert "tier! = declared, not inferred." in out
+    out.encode("cp1252")
+
+
+def test_fleet_json_still_emits_the_full_records(cli_runs, capsys):
+    # The human board changed shape; the machine-readable form must not.
+    run_id = _dispatch_new(capsys)
+    capsys.readouterr()
+    assert main(["fleet", "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    record = payload["dispatches"][0]
+    assert record["run_id"] == run_id
+    for key in ("prompt", "tier", "tier_source", "manifest", "transitions",
+                "spec_sha256_pinned", "state", "verdict", "has_report", "age"):
+        assert key in record
 
 
 def test_fleet_empty_and_json_and_session_filter(cli_runs, monkeypatch, capsys):

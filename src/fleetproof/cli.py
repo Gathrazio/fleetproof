@@ -58,7 +58,16 @@ from .ledger import (
     load_dispatch,
     record_report,
 )
-from .report import write_report
+# The board and the HTML report describe a dispatch with the same words, defined
+# once in report.py. Two surfaces disagreeing about what a state is called is how
+# an operator ends up unsure whether they are looking at the same dispatch twice.
+from .report import (
+    agent_label,
+    state_label,
+    tier_label,
+    verdict_label,
+    write_report,
+)
 from .runlog import (
     PROJECT_MARKER,
     SESSION_ID_ENV,
@@ -372,6 +381,11 @@ def _format_age(started_at: str | None) -> str:
     return f"{seconds // 86400}d{(seconds % 86400) // 3600:02d}h"
 
 
+def _truncate(value: str, width: int) -> str:
+    """Clip a display cell to ``width``, marking that it was clipped."""
+    return value if len(value) <= width else value[:width - 3] + "..."
+
+
 def _cmd_fleet(args: argparse.Namespace) -> int:
     records = list_dispatches(session_id=args.session, non_terminal_only=args.open)
     if args.format == "json":
@@ -384,14 +398,21 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
     if not records:
         print("No dispatches found.")
         return 0
-    print(f"{'run_id':<24} {'state':<13} {'tier':<12} {'age':>7} "
-          f"{'report':<7} {'verdict':<13} {'session':<14}")
+    print(f"{'run_id':<24} {'state':<26} {'tier':<12} {'agent':<18} "
+          f"{'verdict':<13} {'age':>7} {'session':<14}")
     for r in records:
-        print(f"{r.run_id:<24} {r.state:<13} {(r.tier or '-'):<12} "
-              f"{_format_age(r.started_at):>7} {('yes' if r.has_report else 'no'):<7} "
-              f"{(r.verdict or '-'):<13} {_short_session(r.session_id):<14}")
+        print(f"{r.run_id:<24} {state_label(r):<26} {tier_label(r):<12} "
+              f"{_truncate(agent_label(r), 18):<18} {verdict_label(r):<13} "
+              f"{_format_age(r.started_at):>7} {_short_session(r.session_id):<14}")
     open_count = sum(1 for r in records if r.is_open)
-    print(f"{len(records)} dispatch(es), {open_count} not yet reported.")
+    ungraded = sum(1 for r in records if r.verdict is None)
+    print(f"{len(records)} dispatch(es), {open_count} awaiting a report, "
+          f"{ungraded} ungraded.")
+    # The legend is not decoration: '!' and '(stalled)' are load-bearing and an
+    # unexplained marker on an audit surface is worse than no marker.
+    print("tier! = declared, not inferred.  (stalled) = reported or graded but "
+          "never closed.")
+    print("ungraded = no verdict on record; an absent grade is not a passing grade.")
     return 0
 
 

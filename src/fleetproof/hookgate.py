@@ -4,11 +4,11 @@ These functions are what the plugin's ``type: "command"`` hooks invoke. They are
 deterministic and run in a process separate from the agent whose "done" claim
 they are judging — which is the whole product.
 
-- :func:`stop_gate_main` — the Stop hook. Runs the independent checker and, if a
-  blocking check failed, emits ``{"decision": "block", "reason": ...}`` so Claude
-  Code refuses to let the agent stop on a false "done". Also sweeps the dispatch
-  ledger for this session, so a bridge cannot stop while dispatches it started
-  are still hanging half-finished.
+- :func:`stop_gate_main` — the Stop hook. Runs the independent checker at bridge
+  tier and, if a blocking check failed, emits ``{"decision": "block", "reason":
+  ...}`` so Claude Code refuses to let the agent stop on a false "done". Also
+  sweeps the dispatch ledger for this session, so a bridge cannot stop while
+  dispatches it started are still hanging half-finished.
 - :func:`subagent_start_main` — the SubagentStart hook. Context-only by contract
   (it cannot block), so its whole job is getting the dispatch on record *before*
   the subagent does any work.
@@ -53,6 +53,7 @@ from .ledger import (
     STATE_CONTRADICTED,
     STATE_DISPATCHED,
     STATE_VERIFIED,
+    TIER_BRIDGE,
     LedgerError,
     close_dispatch,
     create_dispatch,
@@ -99,10 +100,18 @@ def _apply_session_id(payload: dict[str, Any]) -> None:
 
 
 def _spec_gate() -> tuple[str | None, str | None]:
-    """The v0.1 spec verdict, as ``(block_reason_or_None, context_or_None)``.
+    """The bridge's spec verdict, as ``(block_reason_or_None, context_or_None)``.
 
     Split out of :func:`stop_gate` so the ledger sweep can be merged into the same
     decision without duplicating any of this wording.
+
+    Graded at ``tier="bridge"``, which is not a narrowing for a v0.1 spec:
+    ``select_checks("bridge")`` selects bridge-tier checks *plus every untiered
+    check*, so an entirely untiered spec still selects everything and this gate
+    behaves identically to the untiered v0.1 call. What it fixes is the tiered
+    case — without a tier, the bridge's Stop hook grades itself on leaf- and
+    lane-tier checks that describe some subagent's work, not the session's, and
+    blocks the bridge on a failure that was never the bridge's to answer for.
     """
     try:
         checks = load_checks()
@@ -114,7 +123,7 @@ def _spec_gate() -> tuple[str | None, str | None]:
     if not checks:
         return None, None
 
-    report = run_checks(checks)
+    report = run_checks(checks, tier=TIER_BRIDGE)
 
     # Spec-drift check: did the checks.json that just graded this verdict differ
     # from the one the session's first verdict was graded against? An agent is

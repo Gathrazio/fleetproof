@@ -185,6 +185,67 @@ def test_no_false_drift_across_different_sessions(tmp_path, monkeypatch):
     assert decision is None  # pass, no drift => silent
 
 
+# === the bridge Stop gate is tier-scoped ===
+
+def _graded_check_ids() -> list[str]:
+    """Check ids from the verdict the gate just recorded, in spec order."""
+    for run in runlog.list_run_records():
+        for sub in run.sub_invocations:
+            if sub.tool == "fleetproof" and sub.subcmd == "check":
+                payload = sub.load_output()
+                if isinstance(payload, dict):
+                    return [c["id"] for c in payload.get("checks", [])]
+    return []
+
+
+def test_bridge_gate_on_an_untiered_spec_selects_exactly_what_untiered_did(
+        tmp_path, monkeypatch):
+    # The bridge grades at tier="bridge", which is not a narrowing for a v0.1 spec:
+    # select_checks("bridge") is bridge-tier checks PLUS every untiered check, so an
+    # entirely untiered spec still selects all of them and this gate is unchanged.
+    from fleetproof.checker import select_checks
+    from fleetproof.checks import load_checks
+    _setup_project(tmp_path, [
+        _PASS,
+        dict(_FAIL, id="also-bad"),
+        dict(_PASS, id="advisory", block=False),
+    ], monkeypatch)
+
+    checks = load_checks()
+    assert ([c.id for c in select_checks(checks, "bridge")]
+            == [c.id for c in select_checks(checks, None)])
+
+    decision, code = stop_gate()
+    assert code == 0
+    assert decision["decision"] == "block"
+    assert "also-bad" in decision["reason"]
+    # And every check in the spec really was graded, not some subset of them.
+    assert _graded_check_ids() == ["ok", "also-bad", "advisory"]
+
+
+def test_leaf_tier_check_does_not_gate_the_bridge_stop(tmp_path, monkeypatch):
+    # A leaf-tier check describes some subagent's work, not the session's. Grading
+    # the bridge on it holds the bridge responsible for a claim it never made — and
+    # worse, it is unfixable from the bridge's own turn.
+    _setup_project(tmp_path, [_PASS, dict(_FAIL, id="leaf-bad", tier="leaf")],
+                   monkeypatch)
+    decision, code = stop_gate()
+    assert code == 0
+    assert decision is None
+    assert _graded_check_ids() == ["ok"]
+
+
+def test_bridge_tier_check_still_gates_the_bridge_stop(tmp_path, monkeypatch):
+    # The other half of the scoping: a check the operator declared as the bridge's
+    # own must keep blocking, or tier-scoping would have quietly disarmed the gate.
+    _setup_project(tmp_path, [dict(_FAIL, id="bridge-bad", tier="bridge"),
+                              dict(_PASS, id="leaf-ok", tier="leaf")], monkeypatch)
+    decision, code = stop_gate()
+    assert decision["decision"] == "block"
+    assert "bridge-bad" in decision["reason"]
+    assert _graded_check_ids() == ["bridge-bad"]
+
+
 # === subagent capture (SubagentStart) ===
 
 _LANE_PASS = {"id": "lane-ok", "run": f'"{sys.executable}" -c "raise SystemExit(0)"',
