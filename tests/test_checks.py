@@ -74,3 +74,34 @@ def test_missing_id_raises(tmp_path):
     p = _write(tmp_path, {"checks": [{"run": "x"}]})
     with pytest.raises(CheckSpecError):
         load_checks(p)
+
+
+# === optional tier field (additive; a v0.1 spec has none) ===
+
+def test_tier_absent_reads_back_as_none(tmp_path):
+    p = _write(tmp_path, {"checks": [{"id": "a", "run": "x"}]})
+    assert load_checks(p)[0].tier is None
+
+
+def test_tier_field_parsed(tmp_path):
+    p = _write(tmp_path, {"checks": [
+        {"id": "a", "run": "x", "tier": "leaf"},
+        {"id": "b", "run": "x", "tier": "lane"},
+        {"id": "c", "run": "x", "tier": "coordinator"},
+        {"id": "d", "run": "x", "tier": "bridge"},
+    ]})
+    assert {c.id: c.tier for c in load_checks(p)} == {
+        "a": "leaf", "b": "lane", "c": "coordinator", "d": "bridge",
+    }
+
+
+def test_unknown_tier_raises(tmp_path):
+    p = _write(tmp_path, {"checks": [{"id": "a", "run": "x", "tier": "middle-management"}]})
+    with pytest.raises(CheckSpecError):
+        load_checks(p)
+
+
+def test_non_string_tier_raises(tmp_path):
+    p = _write(tmp_path, {"checks": [{"id": "a", "run": "x", "tier": 3}]})
+    with pytest.raises(CheckSpecError):
+        load_checks(p)

@@ -11,6 +11,13 @@ surface as it can. Subcommands:
     cleanup   delete run records older than N days
     stop-gate Stop-hook entry: emit a Claude Code block decision on a false "done"
     record    PostToolUse-hook entry: append an evidence record from hook stdin
+    subagent-start SubagentStart-hook entry: put a spawning subagent on the ledger
+    subagent-stop  SubagentStop-hook entry: the per-subagent report-and-verify gate
+    dispatch  ledger verbs: new / report / close a dispatch
+    fleet     the dispatch board — every dispatch, its state, and whether it reported
+
+Output is plain ASCII on purpose: these commands get read in cp1252 consoles on
+Windows, where a stray unicode glyph is a UnicodeEncodeError, not a nicer table.
 """
 
 from __future__ import annotations
@@ -32,12 +39,35 @@ from .checks import (
     CheckSpecError,
     SPEC_DRIFT_NOTE,
     STARTER_SPEC,
+    VALID_TIERS,
     default_checks_path,
     load_checks,
     short_spec_hash,
 )
-from .hookgate import record_tool_main, stop_gate_main
-from .report import write_report
+from .hookgate import (
+    record_tool_main,
+    stop_gate_main,
+    subagent_start_main,
+    subagent_stop_main,
+)
+from .ledger import (
+    LedgerError,
+    close_dispatch,
+    create_dispatch,
+    list_dispatches,
+    load_dispatch,
+    record_report,
+)
+# The board and the HTML report describe a dispatch with the same words, defined
+# once in report.py. Two surfaces disagreeing about what a state is called is how
+# an operator ends up unsure whether they are looking at the same dispatch twice.
+from .report import (
+    agent_label,
+    state_label,
+    tier_label,
+    verdict_label,
+    write_report,
+)
 from .runlog import (
     PROJECT_MARKER,
     SESSION_ID_ENV,
@@ -67,7 +97,12 @@ def _cmd_check(args: argparse.Namespace) -> int:
     except CheckSpecError as e:
         _emit_error("check_spec_error", str(e), args.format)
         return 2
-    report = run_checks(checks, record_to_log=not args.no_record, spec_path=spec_path)
+    try:
+        report = run_checks(checks, record_to_log=not args.no_record,
+                            spec_path=spec_path, tier=args.tier)
+    except ValueError as e:  # unknown tier
+        _emit_error("bad_tier", str(e), args.format)
+        return 2
 
     # Best-effort drift note: a bare CLI run usually has no session context (so
     # baseline is unresolvable and nothing is flagged), but when it runs inside a
@@ -223,6 +258,164 @@ def _cmd_record(args: argparse.Namespace) -> int:
     return record_tool_main()
 
 
+def _cmd_subagent_start(args: argparse.Namespace) -> int:
+    return subagent_start_main()
+
+
+def _cmd_subagent_stop(args: argparse.Namespace) -> int:
+    return subagent_stop_main()
+
+
+def _resolve_prompt(args: argparse.Namespace) -> str:
+    """The dispatch prompt from --prompt or --prompt-file (exactly one).
+
+    A prompt file exists because real dispatch prompts are multi-paragraph and
+    shell-quoting one on Windows is how you end up recording a mangled prompt.
+    """
+    if bool(args.prompt) == bool(args.prompt_file):
+        raise ValueError("Pass exactly one of --prompt or --prompt-file.")
+    if args.prompt:
+        return args.prompt
+    try:
+        return Path(args.prompt_file).read_text(encoding="utf-8")
+    except OSError as e:
+        raise ValueError(f"Could not read prompt file {args.prompt_file}: {e}") from e
+
+
+def _load_json_file(path: str, label: str) -> dict:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError as e:
+        raise ValueError(f"Could not read {label} {path}: {e}") from e
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{label} {path} is not valid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError(f"{label} {path} must contain a JSON object.")
+    return data
+
+
+def _cmd_dispatch_new(args: argparse.Namespace) -> int:
+    try:
+        prompt = _resolve_prompt(args)
+    except ValueError as e:
+        _emit_error("bad_prompt", str(e), args.format)
+        return 2
+
+    manifest = None
+    if args.manifest:
+        try:
+            manifest = _load_json_file(args.manifest, "manifest")
+        except ValueError as e:
+            _emit_error("bad_manifest", str(e), args.format)
+            return 2
+        # Accept either a bare manifest object or a wrapper with a "manifest" key,
+        # so the same file shape works whether it came from a prompt or by hand.
+        inner = manifest.get("manifest")
+        if isinstance(inner, dict):
+            manifest = inner
+
+    try:
+        run_id = create_dispatch(prompt, tier=args.tier, manifest=manifest)
+    except LedgerError as e:
+        _emit_error("ledger_error", str(e), args.format)
+        return 1
+
+    record = load_dispatch(run_id)
+    if args.format == "json":
+        print(json.dumps(record.to_dict() if record else {"run_id": run_id}, indent=2))
+    else:
+        print(run_id)
+    return 0
+
+
+def _cmd_dispatch_report(args: argparse.Namespace) -> int:
+    try:
+        payload = _load_json_file(args.report, "report")
+    except ValueError as e:
+        _emit_error("bad_report", str(e), args.format)
+        return 2
+    try:
+        record = record_report(args.run_id, payload)
+    except LedgerError as e:
+        _emit_error("ledger_error", str(e), args.format)
+        return 1
+    if args.format == "json":
+        print(json.dumps(record.to_dict(), indent=2))
+    else:
+        print(f"{record.run_id} -> {record.state}")
+    return 0
+
+
+def _cmd_dispatch_close(args: argparse.Namespace) -> int:
+    try:
+        record = close_dispatch(args.run_id)
+    except LedgerError as e:
+        _emit_error("ledger_error", str(e), args.format)
+        return 1
+    if args.format == "json":
+        print(json.dumps(record.to_dict(), indent=2))
+    else:
+        print(f"{record.run_id} -> {record.state}")
+    return 0
+
+
+def _format_age(started_at: str | None) -> str:
+    """Compact ASCII age of a dispatch: '42s', '17m', '3h05m', '2d04h', or '?'."""
+    if not started_at:
+        return "?"
+    try:
+        started = datetime.fromisoformat(started_at)
+    except ValueError:
+        return "?"
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    seconds = int((datetime.now(timezone.utc) - started).total_seconds())
+    if seconds < 0:
+        return "0s"
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+    return f"{seconds // 86400}d{(seconds % 86400) // 3600:02d}h"
+
+
+def _truncate(value: str, width: int) -> str:
+    """Clip a display cell to ``width``, marking that it was clipped."""
+    return value if len(value) <= width else value[:width - 3] + "..."
+
+
+def _cmd_fleet(args: argparse.Namespace) -> int:
+    records = list_dispatches(session_id=args.session, non_terminal_only=args.open)
+    if args.format == "json":
+        print(json.dumps({
+            "dispatches": [
+                dict(r.to_dict(), age=_format_age(r.started_at)) for r in records
+            ]
+        }, indent=2))
+        return 0
+    if not records:
+        print("No dispatches found.")
+        return 0
+    print(f"{'run_id':<24} {'state':<26} {'tier':<12} {'agent':<18} "
+          f"{'verdict':<13} {'age':>7} {'session':<14}")
+    for r in records:
+        print(f"{r.run_id:<24} {state_label(r):<26} {tier_label(r):<12} "
+              f"{_truncate(agent_label(r), 18):<18} {verdict_label(r):<13} "
+              f"{_format_age(r.started_at):>7} {_short_session(r.session_id):<14}")
+    open_count = sum(1 for r in records if r.is_open)
+    ungraded = sum(1 for r in records if r.verdict is None)
+    print(f"{len(records)} dispatch(es), {open_count} awaiting a report, "
+          f"{ungraded} ungraded.")
+    # The legend is not decoration: '!' and '(stalled)' are load-bearing and an
+    # unexplained marker on an audit surface is worse than no marker.
+    print("tier! = declared, not inferred.  (stalled) = reported or graded but "
+          "never closed.")
+    print("ungraded = no verdict on record; an absent grade is not a passing grade.")
+    return 0
+
+
 def _emit_error(code: str, message: str, fmt: str) -> None:
     if fmt == "json":
         print(json.dumps({"ok": False, "error_code": code, "message": message}), file=sys.stderr)
@@ -251,6 +444,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_check = sub.add_parser("check", help="Run the independent checker and record the verdict.")
     p_check.add_argument("--spec", default=None, help="Path to a check spec (default: .fleetproof/checks.json).")
     p_check.add_argument("--no-record", action="store_true", help="Do not write to the run log.")
+    p_check.add_argument("--tier", choices=sorted(VALID_TIERS), default=None,
+                         help="Only run checks for this tier (untiered checks count "
+                              "as bridge). Omit to run every check.")
     _add_format(p_check)
     p_check.set_defaults(func=_cmd_check)
 
@@ -279,6 +475,48 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_rec = sub.add_parser("record", help="PostToolUse-hook entry: record a tool call from hook stdin.")
     p_rec.set_defaults(func=_cmd_record)
+
+    p_sstart = sub.add_parser(
+        "subagent-start",
+        help="SubagentStart-hook entry: record a spawning subagent as a dispatch.")
+    p_sstart.set_defaults(func=_cmd_subagent_start)
+
+    p_sstop = sub.add_parser(
+        "subagent-stop",
+        help="SubagentStop-hook entry: record the report, grade it, block a false 'done'.")
+    p_sstop.set_defaults(func=_cmd_subagent_stop)
+
+    p_dispatch = sub.add_parser("dispatch", help="Dispatch-ledger verbs.")
+    dsub = p_dispatch.add_subparsers(dest="dispatch_command", required=True)
+
+    p_dnew = dsub.add_parser("new", help="Record a dispatch at launch; prints its run id.")
+    p_dnew.add_argument("--prompt", default=None, help="The dispatch prompt, verbatim.")
+    p_dnew.add_argument("--prompt-file", default=None,
+                        help="Read the prompt from a file (use for multi-line prompts).")
+    p_dnew.add_argument("--tier", choices=sorted(VALID_TIERS), default=None,
+                        help="Declare the tier. Omit to infer it from the run tree.")
+    p_dnew.add_argument("--manifest", default=None,
+                        help="JSON file with the dispatch manifest. Omit to derive from the prompt.")
+    _add_format(p_dnew)
+    p_dnew.set_defaults(func=_cmd_dispatch_new)
+
+    p_drep = dsub.add_parser("report", help="Record what a dispatched agent claimed.")
+    p_drep.add_argument("run_id")
+    p_drep.add_argument("--report", required=True, help="JSON file holding the report.")
+    _add_format(p_drep)
+    p_drep.set_defaults(func=_cmd_dispatch_report)
+
+    p_dclose = dsub.add_parser("close", help="Terminate a dispatch.")
+    p_dclose.add_argument("run_id")
+    _add_format(p_dclose)
+    p_dclose.set_defaults(func=_cmd_dispatch_close)
+
+    p_fleet = sub.add_parser("fleet", help="The dispatch board, newest first.")
+    p_fleet.add_argument("--open", action="store_true",
+                         help="Only dispatches that have not terminated.")
+    p_fleet.add_argument("--session", default=None, help="Filter to one session id.")
+    _add_format(p_fleet)
+    p_fleet.set_defaults(func=_cmd_fleet)
 
     return parser
 

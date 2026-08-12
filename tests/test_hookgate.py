@@ -185,6 +185,443 @@ def test_no_false_drift_across_different_sessions(tmp_path, monkeypatch):
     assert decision is None  # pass, no drift => silent
 
 
+# === the bridge Stop gate is tier-scoped ===
+
+def _graded_check_ids() -> list[str]:
+    """Check ids from the verdict the gate just recorded, in spec order."""
+    for run in runlog.list_run_records():
+        for sub in run.sub_invocations:
+            if sub.tool == "fleetproof" and sub.subcmd == "check":
+                payload = sub.load_output()
+                if isinstance(payload, dict):
+                    return [c["id"] for c in payload.get("checks", [])]
+    return []
+
+
+def test_bridge_gate_on_an_untiered_spec_selects_exactly_what_untiered_did(
+        tmp_path, monkeypatch):
+    # The bridge grades at tier="bridge", which is not a narrowing for a v0.1 spec:
+    # select_checks("bridge") is bridge-tier checks PLUS every untiered check, so an
+    # entirely untiered spec still selects all of them and this gate is unchanged.
+    from fleetproof.checker import select_checks
+    from fleetproof.checks import load_checks
+    _setup_project(tmp_path, [
+        _PASS,
+        dict(_FAIL, id="also-bad"),
+        dict(_PASS, id="advisory", block=False),
+    ], monkeypatch)
+
+    checks = load_checks()
+    assert ([c.id for c in select_checks(checks, "bridge")]
+            == [c.id for c in select_checks(checks, None)])
+
+    decision, code = stop_gate()
+    assert code == 0
+    assert decision["decision"] == "block"
+    assert "also-bad" in decision["reason"]
+    # And every check in the spec really was graded, not some subset of them.
+    assert _graded_check_ids() == ["ok", "also-bad", "advisory"]
+
+
+def test_leaf_tier_check_does_not_gate_the_bridge_stop(tmp_path, monkeypatch):
+    # A leaf-tier check describes some subagent's work, not the session's. Grading
+    # the bridge on it holds the bridge responsible for a claim it never made — and
+    # worse, it is unfixable from the bridge's own turn.
+    _setup_project(tmp_path, [_PASS, dict(_FAIL, id="leaf-bad", tier="leaf")],
+                   monkeypatch)
+    decision, code = stop_gate()
+    assert code == 0
+    assert decision is None
+    assert _graded_check_ids() == ["ok"]
+
+
+def test_bridge_tier_check_still_gates_the_bridge_stop(tmp_path, monkeypatch):
+    # The other half of the scoping: a check the operator declared as the bridge's
+    # own must keep blocking, or tier-scoping would have quietly disarmed the gate.
+    _setup_project(tmp_path, [dict(_FAIL, id="bridge-bad", tier="bridge"),
+                              dict(_PASS, id="leaf-ok", tier="leaf")], monkeypatch)
+    decision, code = stop_gate()
+    assert decision["decision"] == "block"
+    assert "bridge-bad" in decision["reason"]
+    assert _graded_check_ids() == ["bridge-bad"]
+
+
+# === subagent capture (SubagentStart) ===
+
+_LANE_PASS = {"id": "lane-ok", "run": f'"{sys.executable}" -c "raise SystemExit(0)"',
+              "expect": "exit0", "tier": "lane"}
+_LANE_ARTIFACT = {"id": "lane-artifact", "expect": {"file_exists": "artifact.txt"},
+                  "tier": "lane", "block": True}
+_LEAF_ONLY = {"id": "leaf-ok", "run": f'"{sys.executable}" -c "raise SystemExit(0)"',
+              "expect": "exit0", "tier": "leaf"}
+
+
+def _feed(monkeypatch, payload: dict) -> None:
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+
+def _start_payload(agent_id="agent-1", agent_type="tester", session="sess-fleet") -> dict:
+    return {
+        "session_id": session,
+        "transcript_path": "/tmp/t.jsonl",
+        "cwd": ".",
+        "hook_event_name": "SubagentStart",
+        "agent_id": agent_id,
+        "agent_type": agent_type,
+    }
+
+
+def _stop_payload(message="I did the thing.", agent_id="agent-1",
+                  agent_type="tester", session="sess-fleet") -> dict:
+    payload = _start_payload(agent_id, agent_type, session)
+    payload["hook_event_name"] = "SubagentStop"
+    payload["last_assistant_message"] = message
+    return payload
+
+
+def test_subagent_start_creates_lane_dispatch_with_agent_block(tmp_path, monkeypatch):
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import list_dispatches
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    _feed(monkeypatch, _start_payload())
+
+    assert subagent_start_main() == 0
+
+    dispatches = list_dispatches()
+    assert len(dispatches) == 1
+    d = dispatches[0]
+    assert d.tier == "lane"
+    assert d.tier_source == "declared"
+    assert d.agent == {"agent_id": "agent-1", "agent_type": "tester", "capture": "start"}
+    assert d.session_id == "sess-fleet"
+    assert d.state == "dispatched"
+    assert d.transitions[0]["by"] == "hook"
+    # The prompt is not in the payload, and the record says so instead of guessing.
+    assert "[uncaptured]" in d.prompt and "tester" in d.prompt
+
+
+def test_subagent_start_emits_nothing_on_success(tmp_path, monkeypatch, capsys):
+    from fleetproof.hookgate import subagent_start_main
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    _feed(monkeypatch, _start_payload())
+    assert subagent_start_main() == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+
+
+def test_subagent_start_survives_a_garbage_payload(tmp_path, monkeypatch):
+    # Context-only hook: it can neither block nor be allowed to crash the spawn.
+    from fleetproof.hookgate import subagent_start_main
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("not json at all"))
+    assert subagent_start_main() == 0
+
+
+# === subagent gate (SubagentStop) ===
+
+def test_stop_without_prior_start_creates_stop_only_dispatch(tmp_path, monkeypatch):
+    # A subagent we never saw spawn still enters the ledger — marked stop-only, so
+    # a missing start hook is visible as a capture hole rather than as nothing.
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    _feed(monkeypatch, _stop_payload())
+
+    assert subagent_stop_main() == 0
+
+    dispatches = list_dispatches()
+    assert len(dispatches) == 1
+    d = dispatches[0]
+    assert d.agent["capture"] == "stop-only"
+    assert d.state == "terminated"
+    assert d.verdict == "verified"
+    assert d.load_report()["summary"] == "I did the thing."
+    assert d.load_report()["source"] == "last_assistant_message"
+
+
+def test_stop_reuses_the_dispatch_its_start_created(tmp_path, monkeypatch):
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
+    _feed(monkeypatch, _stop_payload())
+    subagent_stop_main()
+
+    dispatches = list_dispatches()
+    assert len(dispatches) == 1  # one agent, one record
+    assert dispatches[0].agent["capture"] == "start"
+    assert [t["state"] for t in dispatches[0].transitions] == [
+        "dispatched", "reported", "verified", "terminated",
+    ]
+
+
+def test_empty_last_assistant_message_blocks_without_transitioning(tmp_path, monkeypatch, capsys):
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
+
+    _feed(monkeypatch, _stop_payload(message="   "))
+    assert subagent_stop_main() == 0
+    decision = json.loads(capsys.readouterr().out)
+    assert decision["decision"] == "block"
+    assert "report-before-idle" in decision["reason"]
+    assert decision["hookSpecificOutput"]["hookEventName"] == "SubagentStop"
+
+    # Silence must not be laundered into a report.
+    d = list_dispatches()[0]
+    assert d.state == "dispatched"
+    assert d.has_report is False
+
+
+def test_retry_loop_contradicted_then_reported_then_verified(tmp_path, monkeypatch, capsys):
+    # The whole point of allowing contradicted -> reported: the gate blocks, the
+    # same agent gets its turn back, fixes the work, and reports again.
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _setup_project(tmp_path, [_LANE_ARTIFACT], monkeypatch)
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
+
+    # First stop: the artifact it claims to have produced does not exist.
+    _feed(monkeypatch, _stop_payload(message="Shipped the artifact."))
+    assert subagent_stop_main() == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["decision"] == "block"
+    assert "lane-artifact" in first["reason"]
+    d = list_dispatches()[0]
+    assert d.state == "contradicted"
+    assert d.is_terminal is False  # still retryable
+
+    # The agent actually does the work, then stops again.
+    (tmp_path / "artifact.txt").write_text("real", encoding="utf-8")
+    _feed(monkeypatch, _stop_payload(message="Really shipped it this time."))
+    assert subagent_stop_main() == 0
+    assert capsys.readouterr().out == ""  # allowed to stop
+
+    d = list_dispatches()[0]
+    assert [t["state"] for t in d.transitions] == [
+        "dispatched", "reported", "contradicted", "reported", "verified", "terminated",
+    ]
+    assert d.verdict == "verified"
+    assert d.load_report()["summary"] == "Really shipped it this time."
+    # The contradiction names which check failed, and the verdict is the checker's.
+    contradiction = d.transitions[2]
+    assert contradiction["detail"] == "lane-artifact"
+    assert contradiction["by"] == "checker-via-hook"
+
+
+def test_empty_tier_selection_terminates_without_a_verdict(tmp_path, monkeypatch, capsys):
+    # An absent grade is not a passing grade: nothing declared for this tier means
+    # no verdict at all, and the board shows the dispatch as never verified.
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _setup_project(tmp_path, [_LEAF_ONLY], monkeypatch)
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
+
+    _feed(monkeypatch, _stop_payload())
+    assert subagent_stop_main() == 0
+    assert capsys.readouterr().out == ""
+
+    d = list_dispatches()[0]
+    assert d.state == "terminated"
+    assert d.verdict is None
+    assert [t["state"] for t in d.transitions] == ["dispatched", "reported", "terminated"]
+    # And no checker verdict was recorded for it either.
+    checker_runs = [
+        s for r in runlog.list_run_records() for s in r.sub_invocations
+        if s.tool == "fleetproof" and s.subcmd == "check"
+    ]
+    assert checker_runs == []
+
+
+def test_no_spec_terminates_without_a_verdict(tmp_path, monkeypatch):
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    marker = tmp_path / ".fleetproof"
+    marker.mkdir()
+    monkeypatch.chdir(tmp_path)
+    runlog.set_runs_dir(marker / "runs")
+
+    _feed(monkeypatch, _stop_payload())
+    assert subagent_stop_main() == 0
+    d = list_dispatches()[0]
+    assert d.state == "terminated"
+    assert d.verdict is None
+
+
+def test_pin_drift_blocks_the_subagent_stop(tmp_path, monkeypatch, capsys):
+    # The spec the work was dispatched against is the contract. If it changed
+    # mid-flight, we refuse to grade against the new one.
+    from fleetproof.checks import SPEC_DRIFT_NOTE
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
+    pinned = list_dispatches()[0].spec_sha256_pinned
+    assert pinned is not None
+
+    _write_checks(tmp_path, [dict(_LANE_PASS, description="weakened after dispatch")])
+    _feed(monkeypatch, _stop_payload())
+    assert subagent_stop_main() == 0
+    decision = json.loads(capsys.readouterr().out)
+    assert decision["decision"] == "block"
+    assert "check spec changed after this work was dispatched" in decision["reason"]
+    assert SPEC_DRIFT_NOTE in decision["reason"]
+
+    d = list_dispatches()[0]
+    assert d.state == "reported"  # the claim is on record; the grade is not
+    assert d.verdict is None
+    assert d.is_terminal is False
+
+
+def test_subagent_gate_fails_open_but_loudly_when_it_breaks(tmp_path, monkeypatch, capsys):
+    # A bug in the gate must not wedge the fleet, but must not look like a pass.
+    from fleetproof import hookgate
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+
+    def _boom(payload):
+        raise RuntimeError("gate exploded")
+
+    monkeypatch.setattr(hookgate, "subagent_stop", _boom)
+    _feed(monkeypatch, _stop_payload())
+    assert hookgate.subagent_stop_main() == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "failed open" in captured.err
+
+
+# === bridge Stop hook: ledger sweep ===
+
+def _make_dispatch(tier="lane", report=False):
+    from fleetproof.ledger import create_dispatch, record_report
+    run_id = create_dispatch("bridge-made work", tier=tier)
+    if report:
+        record_report(run_id, {"summary": "claimed done"})
+    return run_id
+
+
+def test_stop_gate_blocks_on_a_stalled_dispatch(tmp_path, monkeypatch):
+    _setup_project(tmp_path, [_PASS], monkeypatch)
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-sweep")
+    stalled = _make_dispatch(report=True)
+
+    decision, code = stop_gate()
+    assert code == 0
+    assert decision["decision"] == "block"
+    assert stalled in decision["reason"]
+    assert "reported but never terminated" in decision["reason"]
+    assert "[stalled]" in decision["hookSpecificOutput"]["additionalContext"]
+
+
+def test_stop_gate_does_not_block_on_a_running_dispatch(tmp_path, monkeypatch):
+    # A background agent still working is not a fault — report it, do not gate it.
+    _setup_project(tmp_path, [_PASS], monkeypatch)
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-sweep-2")
+    running = _make_dispatch()
+
+    decision, code = stop_gate()
+    assert code == 0
+    assert decision is not None
+    assert "decision" not in decision
+    ctx = decision["hookSpecificOutput"]["additionalContext"]
+    assert f"[still in fleet] {running}" in ctx
+
+
+def test_stop_gate_ignores_terminated_and_other_sessions(tmp_path, monkeypatch):
+    from fleetproof.ledger import close_dispatch
+    _setup_project(tmp_path, [_PASS], monkeypatch)
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-mine")
+    done = _make_dispatch(report=True)
+    close_dispatch(done)
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-theirs")
+    _make_dispatch(report=True)
+
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-mine")
+    decision, code = stop_gate()
+    assert decision is None  # my session is clean; theirs is not my business
+
+
+def test_stop_gate_output_unchanged_when_session_has_no_dispatches(tmp_path, monkeypatch):
+    # v0.1 behaviour must be byte-identical when there is nothing to sweep.
+    _setup_project(tmp_path, [_FAIL], monkeypatch)
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-no-dispatches")
+    decision, code = stop_gate()
+    assert set(decision) == {"decision", "reason", "hookSpecificOutput"}
+    assert "dispatch" not in decision["reason"]
+    assert "[stalled]" not in decision["hookSpecificOutput"]["additionalContext"]
+    assert "[still in fleet]" not in decision["hookSpecificOutput"]["additionalContext"]
+
+
+def test_stop_gate_blocks_on_both_grounds_at_once(tmp_path, monkeypatch):
+    _setup_project(tmp_path, [_FAIL], monkeypatch)
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-both")
+    stalled = _make_dispatch(report=True)
+    decision, code = stop_gate()
+    assert decision["decision"] == "block"
+    assert "blocking check(s) failed" in decision["reason"]
+    assert stalled in decision["reason"]
+
+
+# === plugin wiring ===
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def test_hooks_json_wires_both_subagent_shims():
+    data = json.loads((_repo_root() / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    hooks = data["hooks"]
+    for event, script in (("SubagentStart", "subagent_start.py"),
+                          ("SubagentStop", "subagent_stop.py")):
+        entries = hooks[event]
+        assert len(entries) == 1
+        # Matchers on these events filter by agent_type; we want every subagent.
+        assert "matcher" not in entries[0]
+        command = entries[0]["hooks"][0]["command"]
+        assert script in command
+        assert entries[0]["hooks"][0]["type"] == "command"
+        assert (_repo_root() / "scripts" / script).exists()
+
+
+def test_subagent_shims_run_via_the_plugin_root_fallback(tmp_path):
+    # Run the real shim as its own OS process with site-packages disabled (-S), so
+    # the installed fleetproof is invisible and only the CLAUDE_PLUGIN_ROOT/src
+    # fallback can satisfy the import. This is the separate-process property and
+    # the no-pip-install promise, tested together.
+    import subprocess
+    env = dict(os.environ)
+    env["CLAUDE_PLUGIN_ROOT"] = str(_repo_root())
+    env["FLEETPROOF_RUNS_DIR"] = str(tmp_path / "runs")
+    env.pop("PYTHONPATH", None)
+    env.pop(runlog.SESSION_ID_ENV, None)
+
+    start = subprocess.run(
+        [sys.executable, "-S", str(_repo_root() / "scripts" / "subagent_start.py")],
+        input=json.dumps(_start_payload(agent_id="shim-agent")),
+        capture_output=True, text=True, cwd=str(tmp_path), env=env,
+    )
+    assert start.returncode == 0
+    assert start.stdout == ""
+    run_dirs = [p for p in (tmp_path / "runs").iterdir() if (p / "dispatch.json").exists()]
+    assert len(run_dirs) == 1
+
+    stop = subprocess.run(
+        [sys.executable, "-S", str(_repo_root() / "scripts" / "subagent_stop.py")],
+        input=json.dumps(_stop_payload(message="", agent_id="shim-agent")),
+        capture_output=True, text=True, cwd=str(tmp_path), env=env,
+    )
+    assert stop.returncode == 0
+    decision = json.loads(stop.stdout)
+    assert decision["decision"] == "block"
+    assert "report-before-idle" in decision["reason"]
+
+
 def test_read_hook_input_tolerates_utf8_bom(monkeypatch):
     # Some shells prepend a BOM when piping; losing the payload would silently
     # lose session grouping and drift detection.
