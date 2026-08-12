@@ -522,6 +522,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # A cp1252 console must degrade output, not crash it: a fleet board that dies
+    # on one non-ASCII agent_type is a board the operator stops trusting.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, OSError):
+            pass
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)

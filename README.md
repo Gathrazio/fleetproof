@@ -108,11 +108,16 @@ A check can declare which rung of the fleet it governs — `leaf`, `lane`,
 { "id": "tests-pass", "run": "python -m pytest -q", "expect": "exit0", "tier": "bridge" }
 ```
 
-A check with no `tier` is a check about the session as a whole, which is the
-bridge's job, so an untiered v0.1 spec still selects exactly what it always did.
-Each rung is graded on its own tier and nothing else, which is why a failing
-leaf-tier check no longer blocks the bridge from stopping: the bridge has no way
-to fix a leaf's work from its own turn.
+A check with no `tier` fires at **every** rung. That is deliberate: an untiered
+v0.1 spec keeps gating everything it ever gated, at every gate — the earlier
+policy of scoping untiered checks to the bridge alone left the default subagent
+gate grading nothing at all while the bridge's green made the system look alive.
+Narrowing a check to one rung is an explicit act: write the tier. A *tiered*
+check is graded on its own rung and nothing else, which is why a failing
+leaf-tier check does not block the bridge from stopping: the bridge has no way
+to fix a leaf's work from its own turn. And if every blocking check in the spec
+is tiered below the bridge, the Stop gate blocks rather than grading nothing —
+an absent grade is never a passing grade.
 
 A dispatch's tier is either declared or inferred, and the ledger records which one.
 Inference reads the shape of the run tree: no parent means `bridge`, a parent that
@@ -303,9 +308,18 @@ This is an early release. Honest boundaries:
   output, the CLI, and the report — when a verdict's spec hash differs from the
   session's first. Drift does not by itself block a passing verdict in v0.1; spec
   pinning and consent-on-change are on the roadmap.
-- **Fail-open when unconfigured.** With no `.fleetproof/checks.json`, the Stop hook
-  does nothing (and says so on stderr) rather than blocking every task. A missing
-  spec is not a passing grade — it is an absent one.
+- **The local ledger is forgeable by design.** An agent with write access to the
+  repo can, in principle, forge or tamper with records in its own `.fleetproof/`
+  — verdicts, transitions, reports. The gates make honest mistakes loud and
+  cheap to catch; they are not a security boundary against an adversary that
+  owns the working tree. A second control point outside the agent's reach (the
+  hosted tier) is the structural answer, and that is why it exists on the
+  roadmap.
+- **Fail-open only when nothing was promised.** With no `.fleetproof/checks.json`
+  and no history of one, the Stop hook does nothing (and says so on stderr)
+  rather than blocking every task. But once a spec has graded work this session
+  — or a dispatch has pinned one — a missing, emptied, or unreadable spec
+  *blocks*: a promised gate cannot be switched off by deleting its spec.
 - **Blocking can repeat.** If a blocking check keeps failing, the Stop hook keeps
   blocking. That is intended (don't stop on a false done), but it means a check
   that can never pass needs operator intervention.

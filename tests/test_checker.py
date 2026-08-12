@@ -180,11 +180,16 @@ def test_bridge_tier_includes_untiered_checks():
     ]
 
 
-def test_leaf_tier_excludes_untiered_checks():
-    assert [c.id for c in select_checks(_tiered_set(), "leaf")] == ["leaf-check"]
-    assert [c.id for c in select_checks(_tiered_set(), "lane")] == ["lane-check"]
+def test_untiered_checks_fire_at_every_tier():
+    # The C1 fix: scoping untiered checks to the bridge alone made the default
+    # subagent gate select nothing. Untiered now fires everywhere; a *tiered*
+    # check still fires only at its own rung.
+    assert [c.id for c in select_checks(_tiered_set(), "leaf")] == [
+        "untiered", "leaf-check"]
+    assert [c.id for c in select_checks(_tiered_set(), "lane")] == [
+        "untiered", "lane-check"]
     assert [c.id for c in select_checks(_tiered_set(), "coordinator")] == [
-        "coordinator-check"]
+        "untiered", "coordinator-check"]
 
 
 def test_unknown_tier_rejected():
@@ -197,9 +202,11 @@ def test_run_checks_tier_filters_and_records_tier(tmp_runs, tmp_project):
     bad = f'"{sys.executable}" -c "raise SystemExit(1)"'
     checks = [_check("leaf-ok", run=ok, tier="leaf"), _check("bridge-bad", run=bad)]
 
+    # bridge-bad is untiered, so it fires at leaf too (the C1 fix) — the leaf
+    # verdict fails on it alongside the leaf's own passing check.
     leaf = run_checks(checks, cwd=tmp_project, record_to_log=False, tier="leaf")
-    assert [r.id for r in leaf.results] == ["leaf-ok"]
-    assert leaf.verdict == "pass"
+    assert [r.id for r in leaf.results] == ["leaf-ok", "bridge-bad"]
+    assert leaf.verdict == "fail"
     assert leaf.tier == "leaf"
 
     bridge = run_checks(checks, cwd=tmp_project, record_to_log=False, tier="bridge")
@@ -214,15 +221,16 @@ def test_run_checks_tier_filters_and_records_tier(tmp_runs, tmp_project):
     recorded = run_checks(checks, cwd=tmp_project, record_to_log=True, tier="leaf")
     payload = list_run_records()[0].sub_invocations[0].load_output()
     assert payload["tier"] == "leaf"
-    assert payload["summary"]["total"] == 1
+    assert payload["summary"]["total"] == 2
     assert recorded.tier == "leaf"
 
 
 def test_tier_with_no_matching_checks_is_an_empty_report(tmp_project):
     # Nothing declared for this tier: an empty report, whose zero total is what
-    # makes "nothing was verified" visible rather than silent.
-    report = run_checks([_check("bridge-only", run="true")], cwd=tmp_project,
-                        record_to_log=False, tier="leaf")
+    # makes "nothing was verified" visible rather than silent. (Requires an
+    # explicitly tiered check — untiered would fire everywhere post-C1.)
+    report = run_checks([_check("bridge-only", run="true", tier="bridge")],
+                        cwd=tmp_project, record_to_log=False, tier="leaf")
     assert report.total == 0
     assert report.verdict == "pass"
 

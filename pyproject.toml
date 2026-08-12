@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fleetproof"
-version = "0.2.0"
+version = "0.2.1"
 description = "Independent, out-of-band verification for agent fleets."
 readme = "README.md"
 requires-python = ">=3.10"

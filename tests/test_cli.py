@@ -303,13 +303,14 @@ def test_check_tier_flag_scopes_the_run(tmp_path, monkeypatch, capsys):
         {"id": "bridge-bad", "run": f'"{sys.executable}" -c "raise SystemExit(1)"'},
     ]}), encoding="utf-8")
 
-    # The leaf tier runs only the leaf check, so the untiered failure cannot gate it.
-    assert main(["check", "--spec", str(spec), "--tier", "leaf", "--format", "json"]) == 0
+    # Untiered fires at every tier (the C1 fix), so the leaf run includes the
+    # untiered failure and fails with it.
+    assert main(["check", "--spec", str(spec), "--tier", "leaf", "--format", "json"]) == 1
     out = json.loads(capsys.readouterr().out)
     assert out["tier"] == "leaf"
-    assert [c["id"] for c in out["checks"]] == ["leaf-ok"]
+    assert [c["id"] for c in out["checks"]] == ["leaf-ok", "bridge-bad"]
 
-    # An untiered check is a bridge check, so the bridge tier still fails.
+    # An untiered check gates the bridge too, so the bridge tier still fails.
     assert main(["check", "--spec", str(spec), "--tier", "bridge"]) == 1
     assert "tier: bridge" in capsys.readouterr().out
 

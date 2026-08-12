@@ -119,6 +119,11 @@ def _run_command(command: str, cwd: Path, timeout: int) -> tuple[int | None, str
             cwd=str(cwd),
             capture_output=True,
             text=True,
+            # Explicit encoding: without it, undecodable output (one emoji on a
+            # cp1252 console) raised inside .communicate(), wiping the evidence
+            # tail while the check still passed — and false-failing regex checks.
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
         return proc.returncode, proc.stdout or "", proc.stderr or ""
@@ -149,14 +154,40 @@ def _grade(check: Check, returncode: int | None, stdout: str, stderr: str, cwd: 
         if returncode is None:
             return False, "command did not complete; cannot match output"
         pattern = check.expect["pattern"]
+        # Exit code gates the match (finding H1): a failing command whose *error
+        # text* happens to contain the pattern — e.g. a tool echoing
+        # "ALL_TESTS_PASSED is not a flag" — must not read as a pass.
+        if returncode != 0:
+            return False, f"exit {returncode} (expected 0); output not consulted for /{pattern}/"
         combined = f"{stdout}\n{stderr}"
         ok = re.search(pattern, combined) is not None
         return ok, ("matched" if ok else "no match") + f" for /{pattern}/"
 
     if kind == "file_exists":
-        target = (cwd / check.expect["path"]).resolve()
-        ok = target.exists()
-        return ok, ("present" if ok else "missing") + f": {check.expect['path']}"
+        raw_path = check.expect["path"]
+        # The command (when there is one) must have completed and succeeded
+        # (finding C2): an artifact left over from an earlier run must not pass a
+        # check whose command could not even launch.
+        if check.run is not None:
+            if returncode is None:
+                return False, f"command did not complete; not consulting {raw_path}"
+            if returncode != 0:
+                return False, f"exit {returncode} (expected 0); not consulting {raw_path}"
+        declared = Path(raw_path)
+        if declared.is_absolute():
+            return False, f"absolute path not allowed: {raw_path}"
+        target = (cwd / declared).resolve()
+        try:
+            target.relative_to(cwd.resolve())
+        except ValueError:
+            return False, f"path escapes the run directory: {raw_path}"
+        if not target.exists():
+            return False, f"missing: {raw_path}"
+        if target.is_dir():
+            return False, f"is a directory, expected a file: {raw_path}"
+        if target.stat().st_size == 0:
+            return False, f"empty file: {raw_path}"
+        return True, f"present: {raw_path}"
 
     return False, f"unknown expectation kind: {kind}"
 
@@ -189,19 +220,19 @@ def select_checks(checks: list[Check], tier: str | None) -> list[Check]:
 
     ``tier=None`` selects everything, exactly as v0.1 did — the Stop hook passes
     no tier and must keep grading the whole spec. With a tier given, a check is
-    selected when its own ``tier`` matches, plus every *untiered* check when the
-    tier is ``bridge``: a spec written before tiers existed describes the session
-    as a whole, which is the bridge's job. So an untiered check never fires for a
-    leaf, and a leaf-tier check never gates the bridge.
+    selected when its own ``tier`` matches, plus every *untiered* check at every
+    tier. Untiered-fires-everywhere is the C1 fix (adversarial pass): scoping
+    untiered checks to the bridge alone made the default subagent gate select
+    nothing — a gate that looked alive (the bridge fired) while grading no
+    subagent at all. A *tiered* check still fires only at its own rung: a
+    leaf-tier check never gates the bridge, and narrowing a check to one rung
+    remains an explicit act.
     """
     if tier is None:
         return list(checks)
     if tier not in VALID_TIERS:
         raise ValueError(f"Unknown tier {tier!r}; expected one of {sorted(VALID_TIERS)}.")
-    return [
-        c for c in checks
-        if c.tier == tier or (c.tier is None and tier == "bridge")
-    ]
+    return [c for c in checks if c.tier == tier or c.tier is None]
 
 
 def run_checks(

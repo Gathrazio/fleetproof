@@ -22,8 +22,11 @@ Spec shape::
 
 ``tier`` is optional and scopes a check to one rung of the fleet
 (``leaf``/``lane``/``coordinator``/``bridge``); omitting it means the check is
-untiered, which the checker treats as bridge-tier — a v0.1 spec written before
-tiers existed is a spec about the whole session, i.e. about the bridge.
+untiered, and an untiered check fires at *every* tier. That is deliberate: a
+v0.1 spec written before tiers existed must keep gating everything it ever
+gated, at every gate — scoping untiered checks to the bridge alone left the
+default subagent gate grading nothing at all (adversarial pass, finding C1).
+Narrowing a check to one rung is an explicit act: write the tier.
 
 ``expect`` is one of:
     "exit0"                        command must exit 0 (default if omitted)
@@ -113,8 +116,12 @@ def spec_hash(path: Path | None = None) -> str | None:
 
 
 def short_spec_hash(full: str | None, length: int = 12) -> str:
-    """A git-style short form of a spec hash for display; 'unknown' when absent."""
-    if not full:
+    """A git-style short form of a spec hash for display; 'unknown' when absent.
+
+    Tolerates a non-string (a poisoned run record can put anything here — finding
+    H3); a gate must never crash on the data it is auditing.
+    """
+    if not full or not isinstance(full, str):
         return "unknown"
     return full[:length]
 
@@ -127,9 +134,17 @@ def load_checks(path: Path | None = None) -> list[Check]:
             f"No check spec found at {spec_path}. Run `fleetproof init` to create one."
         )
     try:
-        raw = json.loads(spec_path.read_text(encoding="utf-8"))
+        # utf-8-sig: Windows editors routinely save UTF-8 with a BOM, and a
+        # BOM-prefixed spec must not silently disable the gate (finding C3).
+        raw = json.loads(spec_path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as e:
         raise CheckSpecError(f"Check spec {spec_path} is not valid JSON: {e}") from e
+    except UnicodeDecodeError as e:
+        raise CheckSpecError(
+            f"Check spec {spec_path} is not UTF-8 (save it as UTF-8): {e}"
+        ) from e
+    except OSError as e:
+        raise CheckSpecError(f"Check spec {spec_path} could not be read: {e}") from e
 
     if not isinstance(raw, dict) or "checks" not in raw:
         raise CheckSpecError("Check spec must be an object with a top-level 'checks' array.")
@@ -160,6 +175,14 @@ def _parse_check(entry: Any, index: int) -> Check:
     run = entry.get("run")
     if run is not None and not isinstance(run, str):
         raise CheckSpecError(f"{where} ({cid}): 'run' must be a string or omitted.")
+    if run is not None and ("\n" in run or "\r" in run):
+        # cmd.exe executes only the first line and silently discards the rest,
+        # inheriting line 1's exit code (finding H5) — a check that half-runs is
+        # worse than one that refuses to parse.
+        raise CheckSpecError(
+            f"{where} ({cid}): 'run' must be a single line — on Windows only the "
+            "first line would execute. Chain with '&&' or call a script instead."
+        )
 
     block = entry.get("block", True)
     if not isinstance(block, bool):

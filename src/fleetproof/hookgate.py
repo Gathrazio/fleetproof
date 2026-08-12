@@ -39,7 +39,9 @@ import os
 import sys
 from typing import Any
 
-from .checker import run_checks, select_checks, spec_drifted
+from pathlib import Path
+
+from .checker import run_checks, select_checks, session_spec_baseline, spec_drifted
 from .checks import (
     SPEC_DRIFT_NOTE,
     CheckSpecError,
@@ -63,7 +65,7 @@ from .ledger import (
     record_report,
     record_verdict,
 )
-from .runlog import SESSION_ID_ENV, record
+from .runlog import SESSION_ID_ENV, record, runs_dir
 
 
 def _read_hook_input() -> dict[str, Any]:
@@ -113,14 +115,36 @@ def _spec_gate() -> tuple[str | None, str | None]:
     lane-tier checks that describe some subagent's work, not the session's, and
     blocks the bridge on a failure that was never the bridge's to answer for.
     """
+    session_id = os.environ.get(SESSION_ID_ENV)
     try:
         checks = load_checks()
-    except CheckSpecError:
-        # No spec (or a broken one) means nothing to enforce. Fail open, but visibly:
-        # a verification tool must never pretend it verified when it did not.
+    except CheckSpecError as e:
+        # Fail open only when nothing was ever promised (an unconfigured repo).
+        # A session baseline proves a spec existed and graded work earlier this
+        # session — a promise — so a now-unreadable spec blocks instead of
+        # silently switching the gate off (finding C3: deleting, emptying, or
+        # corrupting checks.json must not read as "verified").
+        baseline = session_spec_baseline(session_id)
+        if baseline:
+            return (
+                "FleetProof: a check spec graded this session earlier (baseline "
+                f"{short_spec_hash(baseline)}) but is now missing or unreadable "
+                f"({e}). Restore .fleetproof/checks.json before stopping — a "
+                "promised gate cannot be switched off by removing its spec.",
+                None,
+            )
         return None, None
 
     if not checks:
+        baseline = session_spec_baseline(session_id)
+        if baseline:
+            return (
+                "FleetProof: .fleetproof/checks.json now declares zero checks, "
+                "but a spec graded this session earlier (baseline "
+                f"{short_spec_hash(baseline)}). An emptied spec mid-session is "
+                "how a gate gets neutered; restore the checks before stopping.",
+                None,
+            )
         return None, None
 
     report = run_checks(checks, tier=TIER_BRIDGE)
@@ -129,12 +153,31 @@ def _spec_gate() -> tuple[str | None, str | None]:
     # from the one the session's first verdict was graded against? An agent is
     # allowed to author checks.json, so a failing agent could quietly weaken it to
     # slip this gate. We don't block on drift alone (v0.1 policy) — we make it loud.
-    session_id = os.environ.get(SESSION_ID_ENV)
     drifted, baseline = spec_drifted(report.spec_sha256, session_id)
 
+    if report.total == 0 and any(c.block for c in checks):
+        # The spec has blocking checks, yet none governs the bridge tier — every
+        # check was tiered to a lower rung (finding C4: one word per check
+        # disables the gate). An absent grade is not a passing grade.
+        reason = (
+            "FleetProof: no check in .fleetproof/checks.json governs the bridge "
+            "tier — every blocking check is tiered to a lower rung, so this "
+            "session's own work would go ungraded. Add a bridge-tier or untiered "
+            "check (or correct the tiers) before stopping."
+        )
+        if drifted:
+            reason += " " + SPEC_DRIFT_NOTE
+        return reason, (_drift_context(report.spec_sha256, baseline) if drifted else None)
+
     if report.verdict == "pass":
-        # A pass with drift still passes, but must not pass *silently*.
-        return None, (_drift_context(report.spec_sha256, baseline) if drifted else None)
+        # A pass with drift still passes, but must not pass *silently*. Said once
+        # per (session, baseline→current) pair, though: the first stop after a
+        # spec edit announces it for review; repeating the same note on every
+        # later stop turns a review prompt into a nag the harness re-engages the
+        # agent over (observed live: nine forced continuations in one session).
+        if drifted and _drift_unnoted(session_id, baseline, report.spec_sha256):
+            return None, _drift_context(report.spec_sha256, baseline)
+        return None, None
 
     reason = _failure_reason(report)
     if drifted:
@@ -245,6 +288,35 @@ def _drift_context(current_hash: str | None, baseline_hash: str | None) -> str:
     )
 
 
+def _drift_marker_path() -> Path:
+    return runs_dir().parent / "drift-noted.json"
+
+
+def _drift_unnoted(session_id: str | None, baseline: str | None, current: str | None) -> bool:
+    """True the first time this exact drift is seen for this session — and records it.
+
+    Best-effort marker file under ``.fleetproof/``. Any read/write failure reads
+    as "unnoted", which errs loud (the note repeats) rather than quiet (a drift
+    that was never announced) — a gate must not lose loudness to its own I/O.
+    """
+    key = f"{session_id or 'no-session'}:{baseline or '?'}=>{current or '?'}"
+    path = _drift_marker_path()
+    try:
+        noted = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(noted, list):
+            noted = []
+    except Exception:
+        noted = []
+    if key in noted:
+        return False
+    noted.append(key)
+    try:
+        path.write_text(json.dumps(noted, indent=1), encoding="utf-8")
+    except Exception:
+        pass
+    return True
+
+
 def _evidence_context(report, drifted: bool = False, baseline_hash: str | None = None) -> str:
     parts = []
     if drifted:
@@ -261,11 +333,27 @@ def _evidence_context(report, drifted: bool = False, baseline_hash: str | None =
 def stop_gate_main() -> int:
     # Consume stdin per contract; the verdict is checker-driven, but the payload
     # still carries the session id we group this run's evidence under.
-    _apply_session_id(_read_hook_input())
+    payload = _read_hook_input()
+    _apply_session_id(payload)
     decision, code = stop_gate()
+    if decision is not None and _suppress_on_retry(payload, decision):
+        return code
     if decision is not None:
         sys.stdout.write(json.dumps(decision))
     return code
+
+
+def _suppress_on_retry(payload: dict[str, Any], decision: dict[str, Any]) -> bool:
+    """Whether to swallow a *context-only* decision on a stop-hook continuation.
+
+    ``stop_hook_active`` (hooks contract) is true when this stop is already the
+    continuation a prior Stop-hook decision forced. Emitting context-only output
+    again re-engages the agent again — the loop only ends at the harness's block
+    cap (observed live: nine forced continuations). A real ``block`` decision is
+    never suppressed: re-grading the retry is the gate's entire job, and a false
+    "done" must not become passable by simply stopping twice.
+    """
+    return bool(payload.get("stop_hook_active")) and "decision" not in decision
 
 
 # === Subagent capture + gate ===
@@ -419,9 +507,21 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
 
     try:
         checks = load_checks()
-    except CheckSpecError:
-        # No spec to grade against. Fail open on the stop, but do not manufacture
-        # a verdict out of the absence of checks.
+    except CheckSpecError as e:
+        if dispatch.spec_sha256_pinned:
+            # A pin proves a spec existed when this work was ordered. Fail closed
+            # (finding C3): grading "nothing to check" against a promise is how a
+            # gate gets switched off by deleting its spec.
+            return _subagent_block(
+                "FleetProof: this dispatch pinned check spec "
+                f"{short_spec_hash(dispatch.spec_sha256_pinned)}, but the spec is "
+                f"now missing or unreadable ({e}). Restore .fleetproof/checks.json "
+                "(byte-exact) before stopping.",
+                f"- dispatch {dispatch.run_id} pinned spec "
+                f"{short_spec_hash(dispatch.spec_sha256_pinned)}",
+            ), 0
+        # No spec and no pin: an unconfigured repo. Fail open on the stop, but do
+        # not manufacture a verdict out of the absence of checks.
         checks = []
     selected = select_checks(checks, dispatch.tier) if checks else []
     if not selected:
@@ -459,6 +559,8 @@ def subagent_stop_main() -> int:
         # than no gate.
         sys.stderr.write(f"[fleetproof] subagent-stop gate failed open: {e}\n")
         return 0
+    if decision is not None and _suppress_on_retry(payload, decision):
+        return code
     if decision is not None:
         sys.stdout.write(json.dumps(decision))
     return code
