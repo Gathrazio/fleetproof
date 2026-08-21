@@ -62,6 +62,7 @@ from .ledger import (
     DispatchRecord,
     load_dispatch,
 )
+from .runlog import runs_dir
 
 TELEMETRY_FILENAME = "telemetry.json"
 
@@ -671,6 +672,64 @@ def _irreversibility(existing: dict[str, Any]) -> str:
 def _write_telemetry(record: DispatchRecord, telemetry: dict[str, Any]) -> None:
     telemetry_path(record).write_text(
         json.dumps(telemetry, indent=2) + "\n", encoding="utf-8")
+    _append_chain(record.run_id, telemetry)
+
+
+# === Append-time integrity chain ===
+#
+# Every telemetry write appends a link to a rolling hash chain, so the corpus
+# is chained at *append* time — an export-time chain would only prove the
+# export file itself was not altered after generation, saying nothing about
+# the months the records sat as editable JSON. The residual is stated plainly
+# where it matters (the methodology note): the chain lives in the same
+# writable tree as the records until its head is anchored outside it, which
+# is what `fleetproof telemetry anchor` exists for.
+
+CHAIN_FILENAME = "telemetry-chain.jsonl"
+_CHAIN_GENESIS = "0" * 64
+
+
+def chain_path() -> Path:
+    return runs_dir().parent / CHAIN_FILENAME
+
+
+def _content_hash(payload: dict[str, Any]) -> str:
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def chain_head() -> tuple[str, int]:
+    """``(head_hash, entry_count)`` of the chain; genesis when empty/unreadable."""
+    head = _CHAIN_GENESIS
+    count = 0
+    try:
+        lines = chain_path().read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return head, 0
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict) and isinstance(entry.get("head"), str):
+            head = entry["head"]
+            count += 1
+    return head, count
+
+
+def _append_chain(run_id: str, telemetry: dict[str, Any]) -> None:
+    """Best-effort chain append. A chain failure must not fail the write it
+    describes — the anchor command and export surface a short chain loudly."""
+    try:
+        prev, _ = chain_head()
+        content = _content_hash(telemetry)
+        head = hashlib.sha256(f"{prev}:{content}".encode("utf-8")).hexdigest()
+        entry = {"run_id": run_id, "telemetry_sha256": content,
+                 "prev": prev, "head": head}
+        with chain_path().open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
 
 
 # === The one operator prompt per failure: a raw quantity ===
