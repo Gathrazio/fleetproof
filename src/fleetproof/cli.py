@@ -15,6 +15,8 @@ surface as it can. Subcommands:
     subagent-stop  SubagentStop-hook entry: the per-subagent report-and-verify gate
     dispatch  ledger verbs: new / report / close a dispatch
     fleet     the dispatch board — every dispatch, its state, and whether it reported
+    telemetry summary (local-only aggregates) / export (allowlisted bundle) /
+              anchor (chain head) / loss (the one raw-loss question per failure)
 
 Output is plain ASCII on purpose: these commands get read in cp1252 consoles on
 Windows, where a stray unicode glyph is a UnicodeEncodeError, not a nicer table.
@@ -27,7 +29,7 @@ import json
 import os
 import shutil
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 # The CLI must not record its own invocations.
@@ -51,6 +53,8 @@ from .hookgate import (
     subagent_stop_main,
 )
 from .ledger import (
+    REASON_OPERATOR_CLOSE,
+    VALID_TERMINATE_REASONS,
     LedgerError,
     close_dispatch,
     create_dispatch,
@@ -76,6 +80,7 @@ from .runlog import (
     project_root,
     runs_dir,
 )
+from .telemetry import TelemetryError, build_telemetry, record_failure_loss
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
@@ -348,10 +353,19 @@ def _cmd_dispatch_report(args: argparse.Namespace) -> int:
 
 def _cmd_dispatch_close(args: argparse.Namespace) -> int:
     try:
-        record = close_dispatch(args.run_id)
+        record = close_dispatch(args.run_id, reason=args.reason)
     except LedgerError as e:
         _emit_error("ledger_error", str(e), args.format)
         return 1
+    # The close finalizes the lifecycle, so the telemetry record derives here.
+    # Best-effort: a telemetry failure must not turn a successful close into a
+    # failed command — the summary surfaces the missing record as an integrity
+    # defect instead.
+    try:
+        build_telemetry(record.run_id)
+    except Exception as e:
+        print(f"[fleetproof] telemetry build failed for {record.run_id}: {e}",
+              file=sys.stderr)
     if args.format == "json":
         print(json.dumps(record.to_dict(), indent=2))
     else:
@@ -413,6 +427,105 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
     print("tier! = declared, not inferred.  (stalled) = reported or graded but "
           "never closed.")
     print("ungraded = no verdict on record; an absent grade is not a passing grade.")
+    return 0
+
+
+def _parse_date(value: str | None, label: str) -> "date | None":
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError as e:
+        raise ValueError(f"--{label} must be YYYY-MM-DD: {e}") from e
+
+
+def _cmd_telemetry_summary(args: argparse.Namespace) -> int:
+    from .telemetry_export import summarize
+    summary = summarize()
+    if args.format == "json":
+        print(json.dumps(summary, indent=2))
+        return 0
+    print("Telemetry summary (LOCAL-ONLY: clear-text names and exact times;")
+    print("anything shareable goes through `fleetproof telemetry export`).")
+    for name, block in summary["windows"].items():
+        counts = block["counts"]
+        shown = {k: v for k, v in counts.items() if v}
+        print(f"\n[{name}] {block['total_dispatches']} dispatch(es), "
+              f"{block['classifiable_dispatches']} classifiable")
+        print(f"  outcomes: {shown if shown else 'none'}")
+        for metric in ("delivery_failure_rate", "false_claim_rate",
+                       "near_miss_rate", "verifier_flake_rate",
+                       "ungraded_rate", "unverifiable_rate",
+                       "telemetry_missing_rate", "stop_only_fraction"):
+            m = block[metric]
+            rate = f"{m['rate']:.3f}" if m["rate"] is not None else "n/a"
+            print(f"  {metric}: {m['numerator']}/{m['denominator']} = {rate}")
+        sev = block["severity_distribution"]
+        print(f"  severity: {({k: v for k, v in sev.items() if v}) or 'no failures'}")
+        override = block["override_rate_by_source"]
+        for source in ("hook", "operator"):
+            m = override[source]
+            rate = f"{m['rate']:.3f}" if m["rate"] is not None else "n/a"
+            print(f"  override_rate[{source}]: {m['numerator']}/{m['denominator']} = {rate}")
+    timeline = summary["spec_hash_timeline"]
+    if timeline:
+        print("\nspec-hash timeline:")
+        for entry in timeline:
+            print(f"  {entry['first_seen']}  {short_spec_hash(entry['spec_sha256'])}")
+    return 0
+
+
+def _cmd_telemetry_export(args: argparse.Namespace) -> int:
+    from .telemetry_export import export_telemetry
+    try:
+        since = _parse_date(args.since, "since")
+        until = _parse_date(args.until, "until")
+    except ValueError as e:
+        _emit_error("bad_date", str(e), args.format)
+        return 2
+    try:
+        out = export_telemetry(
+            args.recipient,
+            out_dir=Path(args.output) if args.output else None,
+            since=since, until=until)
+    except TelemetryError as e:
+        _emit_error("telemetry_error", str(e), args.format)
+        return 1
+    if args.format == "json":
+        print(json.dumps({"ok": True, "export_dir": str(out)}))
+    else:
+        print(f"Wrote export bundle to {out}")
+        print("Label: identified, minimized (single-party exports are "
+              "identified by construction).")
+    return 0
+
+
+def _cmd_telemetry_anchor(args: argparse.Namespace) -> int:
+    from .telemetry_export import anchor_chain
+    anchor = anchor_chain()
+    if args.format == "json":
+        print(json.dumps(anchor, indent=2))
+    else:
+        print(f"chain head: {anchor['chain_head']}")
+        print(f"entries:    {anchor['chain_entries']}")
+        print(anchor["note"])
+    return 0
+
+
+def _cmd_telemetry_loss(args: argparse.Namespace) -> int:
+    try:
+        telemetry = record_failure_loss(
+            args.run_id, args.value, args.unit,
+            default_accepted=args.default_accepted or None)
+    except TelemetryError as e:
+        _emit_error("telemetry_error", str(e), args.format)
+        return 1
+    if args.format == "json":
+        print(json.dumps(telemetry, indent=2))
+    else:
+        print(f"{args.run_id}: severity {telemetry['failure.severity_band']} "
+              f"(floor {telemetry['failure.severity_floor']}), "
+              f"loss {telemetry['failure.estimated_loss']}")
     return 0
 
 
@@ -508,8 +621,53 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_dclose = dsub.add_parser("close", help="Terminate a dispatch.")
     p_dclose.add_argument("run_id")
+    # Defaulted, not required: the CLI is the operator's close path, so the
+    # honest machine-set reason for it is operator-close. Scripted sweepers and
+    # session-teardown callers override it to say what they actually are.
+    p_dclose.add_argument(
+        "--reason", choices=sorted(VALID_TERMINATE_REASONS),
+        default=REASON_OPERATOR_CLOSE,
+        help="Why this dispatch is being terminated (default: operator-close).")
     _add_format(p_dclose)
     p_dclose.set_defaults(func=_cmd_dispatch_close)
+
+    p_tel = sub.add_parser("telemetry", help="Verification-telemetry surfaces.")
+    tsub = p_tel.add_subparsers(dest="telemetry_command", required=True)
+
+    p_tsum = tsub.add_parser(
+        "summary",
+        help="Local-only outcome/severity/integrity summary with trailing windows.")
+    _add_format(p_tsum)
+    p_tsum.set_defaults(func=_cmd_telemetry_summary)
+
+    p_texp = tsub.add_parser(
+        "export",
+        help="Write the allowlisted, date-bucketed export bundle for one recipient.")
+    p_texp.add_argument("--recipient", required=True,
+                        help="Counterparty label; selects (or mints) the export salt.")
+    p_texp.add_argument("-o", "--output", default=None, help="Output directory.")
+    p_texp.add_argument("--since", default=None, help="Window start, YYYY-MM-DD.")
+    p_texp.add_argument("--until", default=None, help="Window end, YYYY-MM-DD.")
+    _add_format(p_texp)
+    p_texp.set_defaults(func=_cmd_telemetry_export)
+
+    p_tanc = tsub.add_parser(
+        "anchor",
+        help="Record the telemetry chain head as an anchorable value.")
+    _add_format(p_tanc)
+    p_tanc.set_defaults(func=_cmd_telemetry_anchor)
+
+    p_tloss = tsub.add_parser(
+        "loss",
+        help="Record the one raw loss quantity for a failed run (hours or usd).")
+    p_tloss.add_argument("run_id")
+    p_tloss.add_argument("--value", type=float, required=True,
+                         help="The raw quantity; the band is derived, never chosen.")
+    p_tloss.add_argument("--unit", choices=["hours", "usd"], required=True)
+    p_tloss.add_argument("--default-accepted", action="store_true",
+                         help="The suggested default was accepted unchanged.")
+    _add_format(p_tloss)
+    p_tloss.set_defaults(func=_cmd_telemetry_loss)
 
     p_fleet = sub.add_parser("fleet", help="The dispatch board, newest first.")
     p_fleet.add_argument("--open", action="store_true",

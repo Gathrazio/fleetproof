@@ -41,7 +41,13 @@ from typing import Any
 
 from pathlib import Path
 
-from .checker import run_checks, select_checks, session_spec_baseline, spec_drifted
+from .checker import (
+    CheckReport,
+    run_checks,
+    select_checks,
+    session_spec_baseline,
+    spec_drifted,
+)
 from .checks import (
     SPEC_DRIFT_NOTE,
     CheckSpecError,
@@ -66,6 +72,7 @@ from .ledger import (
     record_verdict,
 )
 from .runlog import SESSION_ID_ENV, record, runs_dir
+from .telemetry import build_telemetry
 
 
 def _read_hook_input() -> dict[str, Any]:
@@ -433,11 +440,32 @@ def _pin_drift_reason(pinned: str | None, current: str | None) -> str:
 
 
 def _try_close(run_id: str) -> None:
-    """Terminate a dispatch, tolerating an already-closed one."""
+    """Terminate a dispatch, tolerating an already-closed one.
+
+    No terminate reason is passed: the reason vocabulary exists to split apart
+    the ways a dispatch dies *from ``dispatched``*, and this close only ever
+    runs after a report is on record (post-verdict, or post-grading with an
+    empty selection) — a state where the reason plays no part in how the
+    outcome reads back.
+    """
     try:
         close_dispatch(run_id, by="hook")
     except LedgerError as e:
         sys.stderr.write(f"[fleetproof] could not close dispatch {run_id}: {e}\n")
+
+
+def _try_build_telemetry(run_id: str, check_report=None, checks=None) -> None:
+    """Best-effort telemetry build, on the checker's side of the boundary.
+
+    A telemetry failure must not wedge the gate. The cost of swallowing one is
+    an era-stamped run without telemetry.json — which the summary surfaces as
+    a ``telemetry_missing`` integrity defect, the visible form a capture
+    failure is supposed to take.
+    """
+    try:
+        build_telemetry(run_id, check_report=check_report, checks=checks)
+    except Exception as e:
+        sys.stderr.write(f"[fleetproof] telemetry build failed for {run_id}: {e}\n")
 
 
 def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
@@ -526,6 +554,14 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     selected = select_checks(checks, dispatch.tier) if checks else []
     if not selected:
         _try_close(dispatch.run_id)
+        # The grading *happened* and selected nothing — recorded as an empty
+        # CheckReport so the telemetry layer can tell "checked nothing on
+        # purpose" (unverifiable) apart from "grading never ran" (ungraded).
+        _try_build_telemetry(
+            dispatch.run_id,
+            check_report=CheckReport(spec_sha256=spec_hash(), tier=dispatch.tier),
+            checks=[],
+        )
         return None, 0
 
     report = run_checks(selected, record_to_log=True, tier=dispatch.tier)
@@ -536,6 +572,7 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
             detail="; ".join(r.id for r in report.blocking_failures),
             by=VERDICT_BY,
         )
+        _try_build_telemetry(dispatch.run_id, check_report=report, checks=selected)
         return _subagent_block(_failure_reason(report), _evidence_context(report)), 0
 
     record_verdict(
@@ -545,6 +582,9 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
         by=VERDICT_BY,
     )
     _try_close(dispatch.run_id)
+    # Built after the close, so the outcome class derives from a finished
+    # lifecycle rather than a snapshot mid-transition.
+    _try_build_telemetry(dispatch.run_id, check_report=report, checks=selected)
     return None, 0
 
 

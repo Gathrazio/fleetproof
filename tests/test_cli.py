@@ -328,3 +328,21 @@ def test_check_rejects_unknown_tier(tmp_path, monkeypatch):
     # argparse choices reject it before the checker ever runs.
     with pytest.raises(SystemExit):
         main(["check", "--spec", str(spec), "--tier", "middle-management"])
+
+
+def test_dispatch_close_reason_flag(cli_runs, capsys):
+    # The CLI is the operator's close path: no flag means operator-close, and a
+    # scripted sweeper can say what it actually is.
+    from fleetproof.ledger import load_dispatch
+
+    assert main(["dispatch", "new", "--prompt", "default close"]) == 0
+    default_id = capsys.readouterr().out.strip()
+    assert main(["dispatch", "close", default_id]) == 0
+    capsys.readouterr()
+    assert load_dispatch(default_id).terminate_reason == "operator-close"
+
+    assert main(["dispatch", "new", "--prompt", "swept close"]) == 0
+    swept_id = capsys.readouterr().out.strip()
+    assert main(["dispatch", "close", swept_id, "--reason", "sweep-idle"]) == 0
+    capsys.readouterr()
+    assert load_dispatch(swept_id).terminate_reason == "sweep-idle"
