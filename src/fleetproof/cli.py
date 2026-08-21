@@ -78,6 +78,7 @@ from .runlog import (
     project_root,
     runs_dir,
 )
+from .telemetry import build_telemetry
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
@@ -354,6 +355,15 @@ def _cmd_dispatch_close(args: argparse.Namespace) -> int:
     except LedgerError as e:
         _emit_error("ledger_error", str(e), args.format)
         return 1
+    # The close finalizes the lifecycle, so the telemetry record derives here.
+    # Best-effort: a telemetry failure must not turn a successful close into a
+    # failed command — the summary surfaces the missing record as an integrity
+    # defect instead.
+    try:
+        build_telemetry(record.run_id)
+    except Exception as e:
+        print(f"[fleetproof] telemetry build failed for {record.run_id}: {e}",
+              file=sys.stderr)
     if args.format == "json":
         print(json.dumps(record.to_dict(), indent=2))
     else:
