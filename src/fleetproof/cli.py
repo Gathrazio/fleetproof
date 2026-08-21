@@ -51,6 +51,8 @@ from .hookgate import (
     subagent_stop_main,
 )
 from .ledger import (
+    REASON_OPERATOR_CLOSE,
+    VALID_TERMINATE_REASONS,
     LedgerError,
     close_dispatch,
     create_dispatch,
@@ -348,7 +350,7 @@ def _cmd_dispatch_report(args: argparse.Namespace) -> int:
 
 def _cmd_dispatch_close(args: argparse.Namespace) -> int:
     try:
-        record = close_dispatch(args.run_id)
+        record = close_dispatch(args.run_id, reason=args.reason)
     except LedgerError as e:
         _emit_error("ledger_error", str(e), args.format)
         return 1
@@ -508,6 +510,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_dclose = dsub.add_parser("close", help="Terminate a dispatch.")
     p_dclose.add_argument("run_id")
+    # Defaulted, not required: the CLI is the operator's close path, so the
+    # honest machine-set reason for it is operator-close. Scripted sweepers and
+    # session-teardown callers override it to say what they actually are.
+    p_dclose.add_argument(
+        "--reason", choices=sorted(VALID_TERMINATE_REASONS),
+        default=REASON_OPERATOR_CLOSE,
+        help="Why this dispatch is being terminated (default: operator-close).")
     _add_format(p_dclose)
     p_dclose.set_defaults(func=_cmd_dispatch_close)
 

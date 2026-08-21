@@ -47,7 +47,7 @@ Public API:
     infer_tier(parent_run_id) -> str
     record_report(run_id, report, by=...)
     record_verdict(run_id, verdict, detail=..., by=...)
-    close_dispatch(run_id, by=...)
+    close_dispatch(run_id, by=..., reason=...)
     load_dispatch(run_id) -> DispatchRecord | None
     list_dispatches(*, session_id, open_only, non_terminal_only) -> list[DispatchRecord]
     find_dispatch_by_agent(session_id, agent_id) -> DispatchRecord | None
@@ -56,6 +56,7 @@ Public API:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -66,6 +67,7 @@ from pathlib import Path
 from typing import Any
 
 from .checks import VALID_TIERS, spec_hash
+from .config import telemetry_era_stamp
 from .runlog import (
     PARENT_RUN_ID_ENV,
     RUN_ID_ENV,
@@ -106,6 +108,21 @@ _ALLOWED_NEXT: dict[str, frozenset[str]] = {
 
 TERMINAL_STATES = frozenset({STATE_TERMINATED})
 VERDICT_STATES = frozenset({STATE_VERIFIED, STATE_CONTRADICTED})
+
+# Machine-set reasons a dispatch can be terminated for. The closed vocabulary
+# exists because "terminated from dispatched" is two very different stories —
+# an idle agent swept off the board versus an operator closing shop — and the
+# split cannot be derived after the fact from a transition that says nothing.
+# An absent reason stays legal (older callers, older records); readers treat it
+# as "unclassified", never guess one of these.
+REASON_SWEEP_IDLE = "sweep-idle"
+REASON_OPERATOR_CLOSE = "operator-close"
+REASON_SESSION_END = "session-end"
+VALID_TERMINATE_REASONS = frozenset({
+    REASON_SWEEP_IDLE,
+    REASON_OPERATOR_CLOSE,
+    REASON_SESSION_END,
+})
 
 # Tier vocabulary is defined in :mod:`fleetproof.checks` (the lower-level module,
 # which a check spec's optional "tier" field also validates against) and
@@ -171,6 +188,13 @@ class DispatchRecord:
     # a dispatch created by hand (or by v0.2 Phase A) has no agent block, and it
     # reads back as None.
     agent: dict[str, Any] | None = None
+    # The telemetry-era cutover this dispatch was created under, stamped at
+    # creation from deployment config. Additive: absent on every record created
+    # before the cutover (or before this field existed), reading back as None —
+    # which is what "pre-telemetry" means. Era membership lives here, on the
+    # dispatch record, precisely so it can never be inferred from whether some
+    # later, deletable file happens to exist.
+    telemetry_era: str | None = None
 
     @property
     def state(self) -> str:
@@ -211,6 +235,19 @@ class DispatchRecord:
         return None
 
     @property
+    def terminate_reason(self) -> str | None:
+        """The machine-set reason on the terminate transition, or None.
+
+        None covers both older records (written before reasons existed) and any
+        terminate appended without one; both read as "unclassified" downstream.
+        """
+        for entry in reversed(self.transitions):
+            if entry.get("state") == STATE_TERMINATED:
+                reason = entry.get("reason")
+                return str(reason) if reason else None
+        return None
+
+    @property
     def agent_id(self) -> str | None:
         """The harness agent id this dispatch tracks, or None if not agent-backed."""
         if not isinstance(self.agent, dict):
@@ -239,6 +276,7 @@ class DispatchRecord:
             "transitions": self.transitions,
             "started_at": self.started_at,
             "agent": self.agent,
+            "telemetry_era": self.telemetry_era,
             "state": self.state,
             "verdict": self.verdict,
             "has_report": self.has_report,
@@ -281,6 +319,7 @@ def load_dispatch(run_id: str) -> DispatchRecord | None:
         transitions=transitions if isinstance(transitions, list) else [],
         started_at=root.get("started_at"),
         agent=agent if isinstance(agent, dict) else None,
+        telemetry_era=dispatch.get("telemetry_era") or None,
     )
 
 
@@ -448,6 +487,25 @@ def _coerce_manifest(raw: Any) -> dict[str, Any]:
     if not isinstance(notes, str):
         raise ValueError("manifest.notes must be a string")
     out["notes"] = notes
+    # Optional deliverable->check mapping: which declared checks stand as
+    # evidence for which deliverable. Validated when present so coverage math
+    # downstream never has to defend against a malformed shape, but never
+    # added when absent — an older manifest keeps its exact shape, and absent
+    # reads as empty.
+    if "check_map" in raw and raw["check_map"] is not None:
+        check_map = raw["check_map"]
+        if not isinstance(check_map, dict):
+            raise ValueError("manifest.check_map must be an object")
+        for deliverable, check_ids in check_map.items():
+            if not isinstance(deliverable, str):
+                raise ValueError("manifest.check_map keys must be strings")
+            if not isinstance(check_ids, list) or not all(
+                isinstance(cid, str) for cid in check_ids
+            ):
+                raise ValueError(
+                    f"manifest.check_map[{deliverable!r}] must be an array of check ids"
+                )
+        out["check_map"] = {k: list(v) for k, v in check_map.items()}
     for key, val in raw.items():
         if key not in out:
             out[key] = val
@@ -492,10 +550,17 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _transition(state: str, by: str, detail: str = "") -> dict[str, Any]:
+def _transition(
+    state: str, by: str, detail: str = "", extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     entry: dict[str, Any] = {"state": state, "at": _now_iso(), "by": by or "cli"}
     if detail:
         entry["detail"] = detail
+    # Extra keys (a terminate reason, a report hash) ride on the transition they
+    # describe, so the audit trail carries them per attempt instead of a single
+    # latest-wins field on the record.
+    if extra:
+        entry.update(extra)
     return entry
 
 
@@ -612,6 +677,13 @@ def create_dispatch(
         "spec_sha256_pinned": spec_hash(spec_path),
         "transitions": [_transition(STATE_DISPATCHED, by)],
     }
+    # Telemetry-era membership is stamped at creation from deployment config —
+    # a property of the dispatch record itself, never inferred later from the
+    # presence of a telemetry file (file absence is deletable; this stamp is
+    # not). Omitted entirely pre-cutover, so older-shaped records stay older-shaped.
+    era = telemetry_era_stamp()
+    if era is not None:
+        dispatch["telemetry_era"] = era
     # Omitted entirely when there is no agent, so a hand-made dispatch record
     # stays the shape Phase A wrote and readers keep treating absent as None.
     if resolved_agent is not None:
@@ -629,7 +701,13 @@ def _require_dispatch(run_id: str) -> DispatchRecord:
     return record
 
 
-def _append_transition(run_id: str, state: str, by: str, detail: str = "") -> DispatchRecord:
+def _append_transition(
+    run_id: str,
+    state: str,
+    by: str,
+    detail: str = "",
+    extra: dict[str, Any] | None = None,
+) -> DispatchRecord:
     """Append a transition after checking it is legal from the current state."""
     record = _require_dispatch(run_id)
     current = record.state
@@ -643,7 +721,7 @@ def _append_transition(run_id: str, state: str, by: str, detail: str = "") -> Di
     transitions = raw.get("transitions")
     if not isinstance(transitions, list):
         transitions = []
-    transitions.append(_transition(state, by, detail))
+    transitions.append(_transition(state, by, detail, extra))
     raw["transitions"] = transitions
     _write_json(record.run_dir / DISPATCH_FILENAME, raw)
     record.transitions = transitions
@@ -692,6 +770,18 @@ def _validate_report(report: Any) -> dict[str, Any]:
     return report
 
 
+def report_content_hash(report: dict[str, Any]) -> str:
+    """SHA-256 (hex) over a report's canonical JSON serialization.
+
+    Canonical (sorted keys, fixed separators) so the same claim hashes the same
+    regardless of key order. This is the work-product identity a retry gets
+    compared against: an unchanged hash across a contradicted->reported->verified
+    chain says the *contradiction* changed its mind, not the work.
+    """
+    canonical = json.dumps(report, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def record_report(run_id: str, report: dict[str, Any], by: str = "cli") -> DispatchRecord:
     """Store what the dispatched agent claimed, then mark it ``reported``.
 
@@ -700,7 +790,9 @@ def record_report(run_id: str, report: dict[str, Any], by: str = "cli") -> Dispa
 
     Legal from ``dispatched`` and from ``contradicted`` (the gate-blocked retry).
     A retry overwrites ``report.json`` with the newer claim; the transition list
-    keeps the history of how many attempts it took.
+    keeps the history of how many attempts it took — including, per attempt, the
+    hash of what was claimed, since report.json itself only ever holds the
+    latest claim.
     """
     record = _require_dispatch(run_id)
     validated = _validate_report(report)
@@ -714,7 +806,10 @@ def record_report(run_id: str, report: dict[str, Any], by: str = "cli") -> Dispa
             f"dispatch {run_id}; legal next states: {sorted(allowed) or 'none (terminal)'}."
         )
     _write_json(record.run_dir / REPORT_FILENAME, validated)
-    return _append_transition(run_id, STATE_REPORTED, by)
+    return _append_transition(
+        run_id, STATE_REPORTED, by,
+        extra={"report_sha256": report_content_hash(validated)},
+    )
 
 
 def record_verdict(
@@ -735,6 +830,25 @@ def record_verdict(
     return _append_transition(run_id, verdict, by, detail)
 
 
-def close_dispatch(run_id: str, by: str = "cli") -> DispatchRecord:
-    """Terminate a dispatch. Legal from any non-terminal state."""
-    return _append_transition(run_id, STATE_TERMINATED, by)
+def close_dispatch(
+    run_id: str, by: str = "cli", reason: str | None = None,
+) -> DispatchRecord:
+    """Terminate a dispatch. Legal from any non-terminal state.
+
+    ``reason`` is one of :data:`VALID_TERMINATE_REASONS` and says *why* work
+    was terminated — which, for a dispatch that never reported, is the only
+    thing that separates an idle agent swept off the board from an operator
+    closing shop. Omitting it stays legal (older callers) and reads downstream
+    as "unclassified"; passing an out-of-vocabulary reason is an error, because
+    a free-text reason would be underivable in exactly the way the vocabulary
+    exists to prevent.
+    """
+    extra: dict[str, Any] | None = None
+    if reason is not None:
+        if reason not in VALID_TERMINATE_REASONS:
+            raise LedgerError(
+                f"Unknown terminate reason {reason!r}; expected one of "
+                f"{sorted(VALID_TERMINATE_REASONS)} or omit it."
+            )
+        extra = {"reason": reason}
+    return _append_transition(run_id, STATE_TERMINATED, by, extra=extra)

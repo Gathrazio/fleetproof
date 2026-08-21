@@ -433,7 +433,14 @@ def _pin_drift_reason(pinned: str | None, current: str | None) -> str:
 
 
 def _try_close(run_id: str) -> None:
-    """Terminate a dispatch, tolerating an already-closed one."""
+    """Terminate a dispatch, tolerating an already-closed one.
+
+    No terminate reason is passed: the reason vocabulary exists to split apart
+    the ways a dispatch dies *from ``dispatched``*, and this close only ever
+    runs after a report is on record (post-verdict, or post-grading with an
+    empty selection) — a state where the reason plays no part in how the
+    outcome reads back.
+    """
     try:
         close_dispatch(run_id, by="hook")
     except LedgerError as e:

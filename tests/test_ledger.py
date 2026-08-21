@@ -34,6 +34,7 @@ from fleetproof.ledger import (
     load_dispatch,
     record_report,
     record_verdict,
+    report_content_hash,
 )
 
 
@@ -541,3 +542,131 @@ def test_malformed_explicit_manifest_raises(ledger_runs):
         create_dispatch("work", manifest={"checks": "tests-pass"})
     with pytest.raises(LedgerError):
         create_dispatch("work", manifest=["not", "an", "object"])
+
+
+# === terminate reasons (telemetry preconditions) ===
+
+def test_close_records_machine_reason_on_the_terminate_transition(ledger_runs):
+    run_id = create_dispatch("idle work", tier="lane")
+    record = close_dispatch(run_id, reason="sweep-idle")
+    assert record.state == STATE_TERMINATED
+    assert record.transitions[-1]["reason"] == "sweep-idle"
+    assert load_dispatch(run_id).terminate_reason == "sweep-idle"
+
+
+def test_close_without_reason_stays_legal_and_reads_unclassified(ledger_runs):
+    # Older callers pass no reason; the record must stay writable and the
+    # absence must read back as None, never as a guessed reason.
+    run_id = create_dispatch("legacy close", tier="lane")
+    record = close_dispatch(run_id)
+    assert record.state == STATE_TERMINATED
+    assert "reason" not in record.transitions[-1]
+    assert load_dispatch(run_id).terminate_reason is None
+
+
+def test_close_rejects_out_of_vocabulary_reason(ledger_runs):
+    # A free-text reason would be underivable in exactly the way the closed
+    # vocabulary exists to prevent.
+    run_id = create_dispatch("work", tier="lane")
+    with pytest.raises(LedgerError):
+        close_dispatch(run_id, reason="felt-like-it")
+    assert load_dispatch(run_id).state == STATE_DISPATCHED
+
+
+def test_terminate_reason_is_none_while_not_terminated(ledger_runs):
+    run_id = create_dispatch("work", tier="lane")
+    assert load_dispatch(run_id).terminate_reason is None
+
+
+# === work-product hash across retries ===
+
+def test_report_transition_carries_content_hash(ledger_runs):
+    run_id = create_dispatch("hash me", tier="lane")
+    record = record_report(run_id, _ok_report())
+    entry = record.transitions[-1]
+    assert entry["state"] == STATE_REPORTED
+    assert entry["report_sha256"] == report_content_hash(_ok_report())
+
+
+def test_retry_hashes_split_changed_from_unchanged_work(ledger_runs):
+    # The near-miss/flake split downstream rests on this: report.json only ever
+    # holds the latest claim, so the per-attempt hash must live on the
+    # transitions or an unchanged retry is indistinguishable from a fixed one.
+    unchanged = create_dispatch("retry, same work", tier="lane")
+    record_report(unchanged, _ok_report())
+    record_verdict(unchanged, STATE_CONTRADICTED)
+    record_report(unchanged, _ok_report())
+    hashes = [t["report_sha256"] for t in load_dispatch(unchanged).transitions
+              if t["state"] == STATE_REPORTED]
+    assert len(hashes) == 2 and hashes[0] == hashes[1]
+
+    changed = create_dispatch("retry, fixed work", tier="lane")
+    record_report(changed, _ok_report("first attempt"))
+    record_verdict(changed, STATE_CONTRADICTED)
+    record_report(changed, _ok_report("second attempt, actually fixed"))
+    hashes = [t["report_sha256"] for t in load_dispatch(changed).transitions
+              if t["state"] == STATE_REPORTED]
+    assert len(hashes) == 2 and hashes[0] != hashes[1]
+
+
+def test_report_content_hash_is_key_order_independent(ledger_runs):
+    a = {"summary": "s", "deliverables": []}
+    b = {"deliverables": [], "summary": "s"}
+    assert report_content_hash(a) == report_content_hash(b)
+
+
+# === telemetry-era cutover stamp ===
+
+def _write_config(ledger_runs, payload):
+    (ledger_runs.parent / "config.json").write_text(
+        json.dumps(payload), encoding="utf-8")
+
+
+def test_dispatch_created_after_cutover_carries_era_stamp(ledger_runs):
+    _write_config(ledger_runs, {"telemetry_era": "2026-01-01"})
+    record = load_dispatch(create_dispatch("in-era work", tier="lane"))
+    assert record.telemetry_era == "2026-01-01"
+    raw = json.loads((record.run_dir / "dispatch.json").read_text(encoding="utf-8"))
+    assert raw["telemetry_era"] == "2026-01-01"
+
+
+def test_dispatch_without_config_stays_pre_telemetry_shaped(ledger_runs):
+    record = load_dispatch(create_dispatch("pre-era work", tier="lane"))
+    assert record.telemetry_era is None
+    raw = json.loads((record.run_dir / "dispatch.json").read_text(encoding="utf-8"))
+    assert "telemetry_era" not in raw
+
+
+def test_future_dated_cutover_does_not_stamp(ledger_runs):
+    _write_config(ledger_runs, {"telemetry_era": "2999-01-01"})
+    assert load_dispatch(create_dispatch("work", tier="lane")).telemetry_era is None
+
+
+def test_malformed_cutover_reads_as_unconfigured(ledger_runs):
+    _write_config(ledger_runs, {"telemetry_era": "someday"})
+    assert load_dispatch(create_dispatch("work", tier="lane")).telemetry_era is None
+
+
+# === manifest deliverable<->check mapping ===
+
+def test_manifest_check_map_roundtrips(ledger_runs):
+    manifest = {
+        "deliverables": ["report.html"],
+        "checks": ["html-exists"],
+        "check_map": {"report.html": ["html-exists"]},
+    }
+    record = load_dispatch(create_dispatch("mapped work", manifest=manifest))
+    assert record.manifest["check_map"] == {"report.html": ["html-exists"]}
+
+
+def test_manifest_without_check_map_keeps_its_shape(ledger_runs):
+    # Additive: absent must stay absent on disk, and readers treat it as empty.
+    record = load_dispatch(create_dispatch("unmapped work",
+                                           manifest={"deliverables": ["x"]}))
+    assert "check_map" not in record.manifest
+
+
+def test_malformed_check_map_rejected(ledger_runs):
+    for bad in ("not-an-object", {"d": "not-a-list"}, {"d": [1, 2]}):
+        with pytest.raises(LedgerError):
+            create_dispatch("work", manifest={"check_map": bad})
