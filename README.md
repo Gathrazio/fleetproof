@@ -53,6 +53,7 @@ No language model sits in the grading path. Grading is comparison.
 | SubagentStop hook | The per-subagent gate: records what the agent claimed, grades it at that agent's tier, blocks a false "done". |
 | `fleetproof fleet` | The dispatch board: every dispatch, its state, its tier, and whether anything graded it. |
 | `fleetproof report` | One self-contained HTML file: per run, claimed-done vs. independently-verified. |
+| `fleetproof telemetry` | v0.3: per-dispatch outcome records, a local reliability summary, and a strict-allowlist export. |
 
 Runtime dependencies: none (Python standard library only). A tool whose job is
 being trustworthy should add as little dependency and supply-chain surface as it can.
@@ -185,6 +186,67 @@ transition trail, and which process wrote each transition.
   that agent's stop, so `agent_id` plus `session_id` is the entire join key. That
   is also why the lookup is scoped to non-terminal dispatches: an agent id can be
   reused once a dispatch is closed out.
+
+## Verification telemetry (v0.3)
+
+The ledger records what happened to each dispatch. v0.3 turns those records into
+reliability data an operator can actually read — and, when they choose to, share.
+
+Enable it per repo with `.fleetproof/config.json`:
+
+```json
+{ "telemetry_era": "2026-08-21" }
+```
+
+From that date, every dispatch gains a `telemetry.json`, written on the checker/hook
+side at verdict or close time — never by the agent being measured. Runs from before
+the date read back as pre-telemetry and are never back-filled or guessed.
+
+Each finished dispatch derives one of nine **outcome classes** from its transition
+history — bookkeeping, not judgment:
+
+- `verified` — the claim survived the checks.
+- `near_miss` — a gate-blocked retry whose work product *changed* before passing:
+  a real failure, caught before acceptance.
+- `verifier_flake` — the retry passed with the work product *unchanged*: the
+  contradiction was wrong, not the work. Counted separately so flaky checks can't
+  inflate the near-miss number.
+- `contradicted` — the claim did not survive.
+- `ungraded` — checks existed but no verdict ever landed. This is a control
+  failure and every summary says so; it is never folded into a benign class.
+- `unverifiable` — reported, but nothing in the claim was checkable. Never counts
+  as success.
+- `silent_idle` / `terminated_unreported` / `terminated_unclassified` — died
+  without reporting, split by the recorded terminate reason.
+
+The commands:
+
+```
+fleetproof telemetry summary                  # local-only reliability read
+fleetproof telemetry loss <run-id>            # one question per failure: hours or dollars
+fleetproof telemetry export --recipient X     # allowlist extract for sharing
+fleetproof telemetry anchor                   # record the current chain head
+```
+
+`summary` prints outcome and severity distributions with their numerators and
+denominators spelled out, override rates, and the corpus's own integrity rates
+(stop-only captures, missing telemetry files) — a dataset that can't measure its
+own holes isn't worth reading.
+
+`export` is built the opposite way from most exports: a strict per-field
+**allowlist** — closed enums, counts, bands, versions, and salted identifiers.
+Free text, prompts, paths, and every name you chose yourself never leave the
+machine; timestamps coarsen to dates. Each export carries a completeness manifest
+(runs per day per class, gaps visible) and a methodology note that says plainly
+what `verified` means here: conformance to *your own declared checks* at a
+measured coverage — not a judgment of work quality.
+
+The honest trust model, stated rather than implied: local records are
+operator-attested. The checker writes verdicts from a separate process, and v0.3
+chains a rolling hash over the records as they're written (`anchor` gives you a
+head you can sign or store elsewhere) — but a local ledger on a shared filesystem
+is not tamper-proof against everything that can write to it, and FleetProof will
+not pretend otherwise.
 
 ## Install (each line is one command in Claude Code)
 
