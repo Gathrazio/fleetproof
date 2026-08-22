@@ -26,8 +26,10 @@ everything here is designed to fail open around the gaps):
 - SubagentStart carries ``{session_id, transcript_path, cwd, hook_event_name,
   agent_id, agent_type}`` and cannot block.
 - SubagentStop adds ``last_assistant_message`` and can block, same contract as Stop.
-- The spawn *prompt* is in neither payload. So a captured dispatch records a
-  placeholder prompt and says so, rather than inventing the prompt it did not see.
+- The spawn *prompt* is in neither payload. A captured dispatch records a
+  placeholder prompt and says so, rather than inventing the prompt it did not
+  see — unless the dispatcher declared it up front via an intent sidecar
+  (``.fleetproof/intents/<agent_type>.json``), which the start capture consumes.
 - There is no correlation field between the Task-tool call that spawned an agent
   and that agent's stop, so ``agent_id`` + ``session_id`` is the only join key.
 """
@@ -50,6 +52,7 @@ from .checker import (
 )
 from .checks import (
     SPEC_DRIFT_NOTE,
+    Check,
     CheckSpecError,
     load_checks,
     short_spec_hash,
@@ -64,6 +67,7 @@ from .ledger import (
     TIER_BRIDGE,
     LedgerError,
     close_dispatch,
+    consume_intent,
     create_dispatch,
     find_dispatch_by_agent,
     list_dispatches,
@@ -367,7 +371,8 @@ def _suppress_on_retry(payload: dict[str, Any], decision: dict[str, Any]) -> boo
 
 # The harness does not put the spawn prompt in either subagent payload, so a
 # captured dispatch says exactly that instead of pretending to quote a prompt it
-# never saw. Phase C's pilot measures how much this costs us.
+# never saw. The intent sidecar is the dispatcher's way around the gap; this
+# placeholder is what every dispatch without one records.
 UNCAPTURED_PROMPT = "[uncaptured] subagent {agent_type} spawn — prompt not in harness payload"
 
 # Policy v0.2: any subagent captured inside a session is lane tier. Real nesting
@@ -392,11 +397,30 @@ def _placeholder_prompt(agent_type: str | None) -> str:
 
 
 def capture_subagent_start(payload: dict[str, Any]) -> str:
-    """Put a spawning subagent on the ledger before it does any work."""
+    """Put a spawning subagent on the ledger before it does any work.
+
+    When the dispatcher left an intent sidecar for this agent type
+    (``.fleetproof/intents/<agent_type>.json``, written via ``fleetproof
+    dispatch intent``), the dispatch is created with the intent's real prompt,
+    manifest, and tier — the harness still does not carry the spawn prompt, so
+    the sidecar is the only route it has onto the record. The intent is
+    consumed on match: one intent, one spawn, and a second spawn of the same
+    agent type gets exactly the placeholder capture a repo without sidecars
+    always got. Degradations (malformed intent, malformed manifest, bad tier)
+    are surfaced on stderr and in the manifest notes, never fatal — this runs
+    inside a hook that must not break the spawn.
+    """
     agent_id, agent_type = _agent_fields(payload)
+    intent, notes = consume_intent(agent_type)
+    for note in notes:
+        sys.stderr.write(f"[fleetproof] {note}\n")
+    prompt = intent["prompt"] if intent else _placeholder_prompt(agent_type)
+    manifest = intent["manifest"] if intent else None
+    tier = (intent["tier"] if intent else None) or CAPTURED_SUBAGENT_TIER
     return create_dispatch(
-        _placeholder_prompt(agent_type),
-        tier=CAPTURED_SUBAGENT_TIER,
+        prompt,
+        tier=tier,
+        manifest=manifest,
         agent={"agent_id": agent_id, "agent_type": agent_type, "capture": CAPTURE_START},
         by="hook",
     )
@@ -468,6 +492,49 @@ def _try_build_telemetry(run_id: str, check_report=None, checks=None) -> None:
         sys.stderr.write(f"[fleetproof] telemetry build failed for {run_id}: {e}\n")
 
 
+def _manifest_checks(dispatch) -> list[Check]:
+    """Runnable blocking checks declared on the dispatch's own manifest.
+
+    A manifest check is an ``{"id", "cmd"}`` entry: always blocking, always
+    expect-exit0. The richer expectation kinds stay a ``checks.json`` feature —
+    the manifest is a per-dispatch contract, and its checks exist so a
+    manifest-bearing dispatch can grade without pre-registering into the
+    spec-hash-pinned repo file.
+
+    An entry that is not that shape is skipped with a stderr note rather than
+    run half-parsed. A skipped check is never a passing check: its id never
+    reaches the executed set, so the deliverable it vouched for reads as
+    uncovered — the error lands on the self-critical side of the metric.
+    """
+    entries = (dispatch.manifest or {}).get("checks")
+    if not isinstance(entries, list):
+        return []
+    out: list[Check] = []
+    seen: set[str] = set()
+    for i, entry in enumerate(entries):
+        where = f"manifest check [{i}] on dispatch {dispatch.run_id}"
+        if not isinstance(entry, dict):
+            sys.stderr.write(f"[fleetproof] {where} is not an object; skipped\n")
+            continue
+        cid, cmd = entry.get("id"), entry.get("cmd")
+        if not isinstance(cid, str) or not cid or not isinstance(cmd, str) or not cmd.strip():
+            sys.stderr.write(
+                f"[fleetproof] {where} needs a string 'id' and 'cmd'; skipped\n")
+            continue
+        if "\n" in cmd or "\r" in cmd:
+            # Same rule the spec loader enforces (finding H5): cmd.exe executes
+            # only the first line, and a check that half-runs is worse than one
+            # that never runs.
+            sys.stderr.write(f"[fleetproof] {where}: 'cmd' must be a single line; skipped\n")
+            continue
+        if cid in seen:
+            continue
+        seen.add(cid)
+        out.append(Check(id=cid, run=cmd, expect={"kind": "exit0"}, block=True,
+                         description="dispatch-manifest check"))
+    return out
+
+
 def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     """The per-subagent gate. Returns ``(decision_or_None, exit_code)``.
 
@@ -481,13 +548,17 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     3. If the spec changed since this dispatch was pinned, block. At lane tier and
        deeper the pinned spec is the contract; grading against a spec the agent
        could have edited mid-flight is not verification.
-    4. Grade the agent's own tier of the spec. Blocking failure -> ``contradicted``
-       and block (the agent gets its turn back, and the retry re-reports onto this
-       same dispatch). Otherwise -> ``verified`` and terminate.
+    4. Grade the agent's own tier of the spec, unioned with the checks declared
+       on this dispatch's own manifest (blocking, expect-exit0). Blocking
+       failure -> ``contradicted`` and block (the agent gets its turn back, and
+       the retry re-reports onto this same dispatch). Otherwise -> ``verified``
+       and terminate.
 
-    When the agent's tier selects no checks, no verdict is recorded at all: the
-    dispatch is terminated still-ungraded, because an absent grade must never read
-    as a passing grade.
+    When nothing is runnable — the tier selects no repo checks *and* the
+    manifest declares none — no verdict is recorded at all: the dispatch is
+    terminated still-ungraded, because an absent grade must never read as a
+    passing grade. A manifest-bearing dispatch can therefore always grade,
+    which is the L21 fix: its checks no longer need to live in ``checks.json``.
     """
     session_id = os.environ.get(SESSION_ID_ENV)
     agent_id, agent_type = _agent_fields(payload)
@@ -552,7 +623,14 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
         # not manufacture a verdict out of the absence of checks.
         checks = []
     selected = select_checks(checks, dispatch.tier) if checks else []
-    if not selected:
+    # Union with the dispatch's own manifest checks, repo spec first. A manifest
+    # check whose id collides with a selected repo check is dropped: the repo
+    # spec is the more attested source, and two commands under one id would make
+    # the executed-id set (which coverage joins on) ambiguous.
+    selected_ids = {c.id for c in selected}
+    runnable = selected + [c for c in _manifest_checks(dispatch)
+                           if c.id not in selected_ids]
+    if not runnable:
         _try_close(dispatch.run_id)
         # The grading *happened* and selected nothing — recorded as an empty
         # CheckReport so the telemetry layer can tell "checked nothing on
@@ -564,7 +642,7 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
         )
         return None, 0
 
-    report = run_checks(selected, record_to_log=True, tier=dispatch.tier)
+    report = run_checks(runnable, record_to_log=True, tier=dispatch.tier)
     if report.blocking_failures:
         record_verdict(
             dispatch.run_id,
@@ -572,7 +650,7 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
             detail="; ".join(r.id for r in report.blocking_failures),
             by=VERDICT_BY,
         )
-        _try_build_telemetry(dispatch.run_id, check_report=report, checks=selected)
+        _try_build_telemetry(dispatch.run_id, check_report=report, checks=runnable)
         return _subagent_block(_failure_reason(report), _evidence_context(report)), 0
 
     record_verdict(
@@ -584,7 +662,7 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     _try_close(dispatch.run_id)
     # Built after the close, so the outcome class derives from a finished
     # lifecycle rather than a snapshot mid-transition.
-    _try_build_telemetry(dispatch.run_id, check_report=report, checks=selected)
+    _try_build_telemetry(dispatch.run_id, check_report=report, checks=runnable)
     return None, 0
 
 

@@ -140,10 +140,12 @@ SubagentStop is the gate. Each step is its own reason to refuse the stop:
 2. Pin drift. Every dispatch pins the SHA-256 of the check spec that was in force
    when the work was ordered. If the spec changed mid-flight, the stop is blocked
    rather than graded against a spec the agent could have edited itself.
-3. That agent's tier of the spec. A blocking failure records `contradicted` and
-   blocks; a pass records `verified` and closes the dispatch. If the tier selects
-   no checks at all, no verdict is recorded — an absent grade must never read as a
-   passing one.
+3. That agent's tier of the spec, unioned with any checks declared on the
+   dispatch's own manifest (`{"id", "cmd"}` entries — blocking, expect-exit0).
+   A blocking failure records `contradicted` and blocks; a pass records
+   `verified` and closes the dispatch. If nothing is runnable — the tier selects
+   no repo checks and the manifest declares none — no verdict is recorded: an
+   absent grade must never read as a passing one.
 
 The Stop hook keeps its v0.1 job and adds a ledger sweep. A dispatch that reported
 and then never terminated blocks the bridge from stopping: something started
@@ -157,6 +159,10 @@ it is reported and not blocked on.
 fleetproof dispatch new --prompt "..."        # --prompt-file for a real, long one
 fleetproof dispatch report <run-id> --report report.json
 fleetproof dispatch close <run-id>
+
+fleetproof dispatch intent --agent recon --prompt-file p.md \
+    [--manifest m.json] [--tier lane]         # declare the NEXT spawn of an agent
+                                              # type; the start capture consumes it
 
 fleetproof fleet                              # the board, newest first
 fleetproof fleet --open                       # only what has not terminated
@@ -173,12 +179,16 @@ transition trail, and which process wrote each transition.
 
 ### What the ledger does not do yet
 
-- The spawn prompt is in neither subagent hook payload. A captured dispatch records
-  a placeholder saying so, rather than inventing a prompt it never saw. To get the
-  real prompt on the record, dispatch through `fleetproof dispatch new`.
-- Captured subagents are recorded as `lane` tier. Real nesting depth is not visible
-  from the payload — there is no parent-agent field — so declaring one beats
-  inferring it wrongly. What that costs in practice is a pilot question.
+- The spawn prompt is in neither subagent hook payload, so an undeclared spawn
+  still records a placeholder saying so, rather than inventing a prompt it never
+  saw. To get the real prompt (and manifest, and tier) onto a captured dispatch,
+  write an intent sidecar first: `fleetproof dispatch intent --agent <type>
+  --prompt-file <file>` writes `.fleetproof/intents/<agent_type>.json`, and the
+  next SubagentStart of that agent type consumes it — one intent, one spawn.
+- Captured subagents without a declared intent tier are recorded as `lane` tier.
+  Real nesting depth is not visible from the payload — there is no parent-agent
+  field — so declaring one beats inferring it wrongly. What that costs in
+  practice is a pilot question.
 - An agent killed mid-turn can reach SubagentStop with an empty final message,
   which report-before-idle blocks. Blocking the stop of an agent that is already
   gone is not useful; how often it happens is under observation.
@@ -246,7 +256,11 @@ operator-attested. The checker writes verdicts from a separate process, and v0.3
 chains a rolling hash over the records as they're written (`anchor` gives you a
 head you can sign or store elsewhere) — but a local ledger on a shared filesystem
 is not tamper-proof against everything that can write to it, and FleetProof will
-not pretend otherwise.
+not pretend otherwise. The dispatch-intent sidecar (0.3.1) sits in the same
+trust class as `checks.json` itself: operator-attested, exactly as forgeable as
+the rest of `.fleetproof/`, no worse — anything that can write the repo can
+write an intent, and the manifest checks it carries run as shell commands at
+the stop gate the same way repo checks do.
 
 ## Install (each line is one command in Claude Code)
 

@@ -13,7 +13,8 @@ surface as it can. Subcommands:
     record    PostToolUse-hook entry: append an evidence record from hook stdin
     subagent-start SubagentStart-hook entry: put a spawning subagent on the ledger
     subagent-stop  SubagentStop-hook entry: the per-subagent report-and-verify gate
-    dispatch  ledger verbs: new / report / close a dispatch
+    dispatch  ledger verbs: new / report / close a dispatch; intent writes the
+              sidecar the SubagentStart capture consumes
     fleet     the dispatch board — every dispatch, its state, and whether it reported
     telemetry summary (local-only aggregates) / export (allowlisted bundle) /
               anchor (chain head) / loss (the one raw-loss question per failure)
@@ -61,6 +62,7 @@ from .ledger import (
     list_dispatches,
     load_dispatch,
     record_report,
+    write_intent,
 )
 # The board and the HTML report describe a dispatch with the same words, defined
 # once in report.py. Two surfaces disagreeing about what a state is called is how
@@ -330,6 +332,49 @@ def _cmd_dispatch_new(args: argparse.Namespace) -> int:
         print(json.dumps(record.to_dict() if record else {"run_id": run_id}, indent=2))
     else:
         print(run_id)
+    return 0
+
+
+def _cmd_dispatch_intent(args: argparse.Namespace) -> int:
+    """Write the dispatch-intent sidecar the next SubagentStart capture consumes.
+
+    Exists so dispatchers never hand-write the JSON: the prompt comes from a
+    file (same rationale as ``dispatch new --prompt-file`` — shell-quoting a
+    real prompt on Windows is how prompts get mangled), the manifest is
+    validated here where an error still has someone to land on, and the printed
+    path is the audit surface: the file that will vanish when the spawn
+    consumes it.
+    """
+    try:
+        prompt = Path(args.prompt_file).read_text(encoding="utf-8")
+    except OSError as e:
+        _emit_error("bad_prompt",
+                    f"Could not read prompt file {args.prompt_file}: {e}", args.format)
+        return 2
+
+    manifest = None
+    if args.manifest:
+        try:
+            manifest = _load_json_file(args.manifest, "manifest")
+        except ValueError as e:
+            _emit_error("bad_manifest", str(e), args.format)
+            return 2
+        # Same tolerance as dispatch new: a bare manifest object or a wrapper
+        # with a "manifest" key both work.
+        inner = manifest.get("manifest")
+        if isinstance(inner, dict):
+            manifest = inner
+
+    try:
+        path = write_intent(args.agent, prompt, manifest=manifest, tier=args.tier)
+    except LedgerError as e:
+        _emit_error("ledger_error", str(e), args.format)
+        return 1
+    if args.format == "json":
+        print(json.dumps({"ok": True, "agent_type": args.agent,
+                          "intent_path": str(path)}))
+    else:
+        print(str(path))
     return 0
 
 
@@ -612,6 +657,22 @@ def build_parser() -> argparse.ArgumentParser:
                         help="JSON file with the dispatch manifest. Omit to derive from the prompt.")
     _add_format(p_dnew)
     p_dnew.set_defaults(func=_cmd_dispatch_new)
+
+    p_dint = dsub.add_parser(
+        "intent",
+        help="Write the dispatch-intent sidecar for the next spawn of one agent type.")
+    p_dint.add_argument("--agent", required=True,
+                        help="The agent_type the harness will report for the spawn.")
+    p_dint.add_argument("--prompt-file", required=True,
+                        help="File holding the dispatch prompt, verbatim.")
+    p_dint.add_argument("--manifest", default=None,
+                        help="JSON file with the dispatch manifest "
+                             "(bare object or a {'manifest': ...} wrapper).")
+    p_dint.add_argument("--tier", choices=sorted(VALID_TIERS), default=None,
+                        help="Declare the tier. Omit to record the captured-subagent "
+                             "default (lane).")
+    _add_format(p_dint)
+    p_dint.set_defaults(func=_cmd_dispatch_intent)
 
     p_drep = dsub.add_parser("report", help="Record what a dispatched agent claimed.")
     p_drep.add_argument("run_id")

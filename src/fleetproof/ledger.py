@@ -52,6 +52,8 @@ Public API:
     list_dispatches(*, session_id, open_only, non_terminal_only) -> list[DispatchRecord]
     find_dispatch_by_agent(session_id, agent_id) -> DispatchRecord | None
     derive_manifest(prompt) -> dict
+    write_intent(agent_type, prompt, *, manifest, tier) -> Path
+    consume_intent(agent_type) -> (fields_or_None, notes)
 """
 
 from __future__ import annotations
@@ -162,6 +164,23 @@ EMPTY_MANIFEST_KEYS = ("deliverables", "allowed_paths", "checks")
 
 DERIVED_V1_NO_MANIFEST = "derived-v1: no structured manifest in prompt"
 DERIVED_V1_MALFORMED = "derived-v1: embedded manifest was malformed and ignored"
+
+# Where dispatch-intent sidecars live, next to the runs directory. An intent is
+# the dispatcher's declaration of what it is about to spawn — the harness does
+# not put the spawn prompt in the SubagentStart payload, so the sidecar is the
+# only way a real prompt (and manifest, and tier) reaches the captured dispatch.
+INTENTS_DIRNAME = "intents"
+
+INTENT_MANIFEST_MALFORMED = (
+    "intent-sidecar: declared manifest was malformed and ignored; "
+    "derived from the intent prompt instead"
+)
+
+# What may name an intent file. The agent_type on the consume side comes out of
+# the harness payload; building a path from a payload-controlled string is how
+# a hook gets walked out of its own directory, so anything that is not a plain
+# name gets no sidecar lookup at all.
+_INTENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class LedgerError(Exception):
@@ -542,6 +561,128 @@ def derive_manifest(prompt: str) -> dict[str, Any]:
         except ValueError:
             saw_malformed = True
     return empty_manifest(DERIVED_V1_MALFORMED if saw_malformed else DERIVED_V1_NO_MANIFEST)
+
+
+# === Dispatch-intent sidecar ===
+
+def intents_dir() -> Path:
+    """The ``.fleetproof/intents/`` directory, resolved beside the runs dir."""
+    return runs_dir().parent / INTENTS_DIRNAME
+
+
+def intent_path(agent_type: str | None) -> Path | None:
+    """The sidecar path for ``agent_type``, or None when it cannot name a file."""
+    if not agent_type or not _INTENT_NAME_RE.match(agent_type):
+        return None
+    return intents_dir() / f"{agent_type}.json"
+
+
+def write_intent(
+    agent_type: str,
+    prompt: str,
+    *,
+    manifest: dict[str, Any] | None = None,
+    tier: str | None = None,
+) -> Path:
+    """Write the dispatch-intent sidecar for the next spawn of ``agent_type``.
+
+    The dispatcher calls this (via ``fleetproof dispatch intent``) *before*
+    spawning, so the SubagentStart capture finds the real prompt waiting instead
+    of recording a placeholder. Overwrites an existing intent for the same agent
+    type — the newest declaration wins, matching how a re-issued dispatch prompt
+    supersedes the one it replaces. Validation is strict here, on the write
+    side, where an error still has someone to land on; the consume side (a hook
+    that must not crash a spawn) degrades instead.
+    """
+    path = intent_path(agent_type)
+    if path is None:
+        raise LedgerError(
+            f"Agent type {agent_type!r} cannot name an intent file; use a plain "
+            "name (letters, digits, dot, dash, underscore)."
+        )
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise LedgerError("An intent needs a prompt; refusing to record an empty one.")
+    intent: dict[str, Any] = {
+        "agent_type": agent_type,
+        "prompt": prompt,
+        "created_at": _now_iso(),
+    }
+    if manifest is not None:
+        try:
+            intent["manifest"] = _coerce_manifest(manifest)
+        except ValueError as e:
+            raise LedgerError(f"Unusable manifest: {e}") from e
+    if tier is not None:
+        intent["tier"] = _validate_tier(tier)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(path, intent)
+    return path
+
+
+def consume_intent(agent_type: str | None) -> tuple[dict[str, Any] | None, list[str]]:
+    """Read, validate, and DELETE the intent sidecar for one spawning agent.
+
+    Returns ``(fields, notes)``. ``fields`` is ``{"prompt", "manifest", "tier"}``
+    — manifest coerced (or None), tier validated (or None) — or None when no
+    usable intent exists. ``notes`` are human-readable degradation notes for the
+    caller to surface; an intent that half-worked must be visible, not silent.
+
+    Consumption is unconditional once a matching file is found: one intent, one
+    spawn, even when the intent turns out malformed. A malformed sidecar left in
+    place would attach itself to the *next* spawn of the same agent type, which
+    misattributes a prompt — worse than losing it, and the note says what was
+    lost. The one exception is a file that cannot be deleted: an undeletable
+    sidecar would replay onto every later spawn, so it is not trusted either.
+    """
+    notes: list[str] = []
+    path = intent_path(agent_type)
+    if path is None or not path.exists():
+        return None, notes
+    raw = _read_json(path)
+    try:
+        path.unlink()
+    except OSError as e:
+        notes.append(f"could not delete intent file {path}: {e}; ignoring it")
+        return None, notes
+    if raw is None:
+        notes.append(
+            f"intent file {path.name} was unreadable or not a JSON object; "
+            "capturing with the placeholder prompt instead"
+        )
+        return None, notes
+    prompt = raw.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        notes.append(
+            f"intent file {path.name} has no usable prompt; "
+            "capturing with the placeholder prompt instead"
+        )
+        return None, notes
+    fields: dict[str, Any] = {"prompt": prompt, "manifest": None, "tier": None}
+    raw_manifest = raw.get("manifest")
+    if raw_manifest is not None:
+        try:
+            fields["manifest"] = _coerce_manifest(raw_manifest)
+        except ValueError as e:
+            # Degrade to derive-from-prompt, with the failure written into the
+            # manifest notes so it survives on the dispatch record itself.
+            notes.append(
+                f"intent manifest for {agent_type!r} was malformed ({e}); "
+                "deriving from the intent prompt instead"
+            )
+            derived = derive_manifest(prompt)
+            base = derived.get("notes") or ""
+            derived["notes"] = (f"{base}; " if base else "") + INTENT_MANIFEST_MALFORMED
+            fields["manifest"] = derived
+    raw_tier = raw.get("tier")
+    if raw_tier is not None:
+        if isinstance(raw_tier, str) and raw_tier in VALID_TIERS:
+            fields["tier"] = raw_tier
+        else:
+            notes.append(
+                f"intent tier {raw_tier!r} is not one of {sorted(VALID_TIERS)}; "
+                "using the captured-subagent default"
+            )
+    return fields, notes
 
 
 # === Creating a dispatch ===
