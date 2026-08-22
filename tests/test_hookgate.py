@@ -622,6 +622,255 @@ def test_subagent_shims_run_via_the_plugin_root_fallback(tmp_path):
     assert "report-before-idle" in decision["reason"]
 
 
+# === dispatch-intent sidecar (SubagentStart) ===
+
+_INTENT_PROMPT = "Refactor the widget module and prove it with the manifest checks."
+
+
+def _intent_manifest(cmd_exit=0):
+    cmd = f'"{sys.executable}" -c "raise SystemExit({cmd_exit})"'
+    return {
+        "deliverables": ["the widget refactor"],
+        "checks": [{"id": "m-widget", "cmd": cmd}],
+        "check_map": {"the widget refactor": ["m-widget"]},
+        "notes": "declared by the dispatcher",
+    }
+
+
+def test_subagent_start_consumes_intent_sidecar(tmp_path, monkeypatch):
+    # The whole point of the sidecar: the real prompt, manifest, and tier land
+    # on the captured dispatch, and the intent file is gone afterwards.
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import intent_path, list_dispatches, write_intent
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    path = write_intent("tester", _INTENT_PROMPT,
+                        manifest=_intent_manifest(), tier="leaf")
+    assert path.exists()
+
+    _feed(monkeypatch, _start_payload())
+    assert subagent_start_main() == 0
+
+    d = list_dispatches()[0]
+    assert d.prompt == _INTENT_PROMPT
+    assert d.tier == "leaf"
+    assert d.tier_source == "declared"
+    assert d.manifest["deliverables"] == ["the widget refactor"]
+    assert d.manifest["check_map"] == {"the widget refactor": ["m-widget"]}
+    assert d.agent["capture"] == "start"
+    # Consumed: one intent, one spawn.
+    assert not path.exists()
+    assert intent_path("tester") is not None  # the name itself stays mappable
+
+
+def test_second_spawn_after_consumption_gets_the_placeholder(tmp_path, monkeypatch):
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import list_dispatches, write_intent
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    write_intent("tester", _INTENT_PROMPT)
+
+    _feed(monkeypatch, _start_payload(agent_id="agent-1"))
+    subagent_start_main()
+    _feed(monkeypatch, _start_payload(agent_id="agent-2"))
+    subagent_start_main()
+
+    # Two spawns in the same second sort unpredictably; key on the agent id.
+    by_agent = {d.agent_id: d for d in list_dispatches()}
+    assert by_agent["agent-1"].prompt == _INTENT_PROMPT
+    assert "[uncaptured]" in by_agent["agent-2"].prompt
+    assert by_agent["agent-2"].tier == "lane"
+
+
+def test_intent_for_a_different_agent_type_is_left_alone(tmp_path, monkeypatch):
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import intent_path, list_dispatches, write_intent
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    write_intent("someone-else", _INTENT_PROMPT)
+
+    _feed(monkeypatch, _start_payload(agent_type="tester"))
+    assert subagent_start_main() == 0
+
+    assert "[uncaptured]" in list_dispatches()[0].prompt
+    assert intent_path("someone-else").exists()  # not consumed by the wrong spawn
+
+
+def test_malformed_intent_json_degrades_to_placeholder(tmp_path, monkeypatch, capsys):
+    # The capture must survive a hand-mangled sidecar: placeholder path, loud
+    # stderr note, and the bad file consumed so it cannot poison the next spawn.
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import intent_path, intents_dir, list_dispatches
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    intents_dir().mkdir(parents=True, exist_ok=True)
+    (intents_dir() / "tester.json").write_text("not json at all", encoding="utf-8")
+
+    _feed(monkeypatch, _start_payload())
+    assert subagent_start_main() == 0
+
+    d = list_dispatches()[0]
+    assert "[uncaptured]" in d.prompt
+    assert "intent file tester.json" in capsys.readouterr().err
+    assert not intent_path("tester").exists()
+
+
+def test_malformed_manifest_in_a_valid_intent_degrades_with_a_note(
+        tmp_path, monkeypatch, capsys):
+    # A valid intent whose manifest is unusable keeps its real prompt; the
+    # manifest degrades to derive-from-prompt with the failure written into the
+    # manifest notes, where it survives on the dispatch record itself.
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import INTENT_MANIFEST_MALFORMED, intents_dir, list_dispatches
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    intents_dir().mkdir(parents=True, exist_ok=True)
+    (intents_dir() / "tester.json").write_text(json.dumps({
+        "agent_type": "tester",
+        "prompt": _INTENT_PROMPT,
+        "manifest": {"deliverables": "not-an-array"},
+    }), encoding="utf-8")
+
+    _feed(monkeypatch, _start_payload())
+    assert subagent_start_main() == 0
+
+    d = list_dispatches()[0]
+    assert d.prompt == _INTENT_PROMPT
+    assert d.manifest["deliverables"] == []
+    assert INTENT_MANIFEST_MALFORMED in d.manifest["notes"]
+    assert "malformed" in capsys.readouterr().err
+
+
+def test_invalid_intent_tier_falls_back_to_the_captured_default(
+        tmp_path, monkeypatch, capsys):
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import intents_dir, list_dispatches
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    intents_dir().mkdir(parents=True, exist_ok=True)
+    (intents_dir() / "tester.json").write_text(json.dumps({
+        "agent_type": "tester", "prompt": _INTENT_PROMPT, "tier": "captain",
+    }), encoding="utf-8")
+
+    _feed(monkeypatch, _start_payload())
+    assert subagent_start_main() == 0
+
+    d = list_dispatches()[0]
+    assert d.prompt == _INTENT_PROMPT
+    assert d.tier == "lane"
+    assert "captain" in capsys.readouterr().err
+
+
+# === manifest checks in the stop gate (SubagentStop) ===
+
+def _era_config(tmp_path: Path) -> None:
+    """Telemetry-era cutover in force, so the gate builds telemetry.json."""
+    (tmp_path / ".fleetproof" / "config.json").write_text(
+        json.dumps({"telemetry_era": "2026-01-01"}), encoding="utf-8")
+
+
+def _spawn_with_intent(tmp_path, monkeypatch, manifest, spec=None):
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import write_intent
+    _setup_project(tmp_path, spec if spec is not None else [_LEAF_ONLY], monkeypatch)
+    _era_config(tmp_path)
+    write_intent("tester", _INTENT_PROMPT, manifest=manifest, tier="lane")
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
+
+
+def test_manifest_checks_grade_a_dispatch_the_spec_ignores(tmp_path, monkeypatch, capsys):
+    # The L21 fix, end to end: the repo spec has nothing at lane tier, so before
+    # 0.3.1 this dispatch terminated ungraded. Its own manifest checks now run
+    # as blocking, the verdict lands, and coverage joins through check_map.
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    from fleetproof.telemetry import load_telemetry
+    _spawn_with_intent(tmp_path, monkeypatch, _intent_manifest(cmd_exit=0))
+
+    _feed(monkeypatch, _stop_payload(message="Refactored and verified."))
+    assert subagent_stop_main() == 0
+    assert capsys.readouterr().out == ""  # allowed to stop
+
+    d = list_dispatches()[0]
+    assert d.verdict == "verified"
+    assert d.state == "terminated"
+    telemetry = load_telemetry(d.run_id)
+    assert telemetry["outcome.class"] == "verified"
+    assert telemetry["outcome.verifier"]["checks_run"] == 1
+    assert telemetry["outcome.coverage"] > 0
+
+
+def test_failing_manifest_check_contradicts_and_blocks(tmp_path, monkeypatch, capsys):
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _spawn_with_intent(tmp_path, monkeypatch, _intent_manifest(cmd_exit=1))
+
+    _feed(monkeypatch, _stop_payload(message="Refactored, honest."))
+    assert subagent_stop_main() == 0
+    decision = json.loads(capsys.readouterr().out)
+    assert decision["decision"] == "block"
+    assert "m-widget" in decision["reason"]
+
+    d = list_dispatches()[0]
+    assert d.state == "contradicted"
+    assert d.is_terminal is False  # the retry lands on this same dispatch
+
+
+def test_manifest_checks_union_with_tier_selected_repo_checks(tmp_path, monkeypatch, capsys):
+    # Both sources grade the same stop: the lane-tier repo check and the
+    # dispatch's own manifest check each execute exactly once.
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _spawn_with_intent(tmp_path, monkeypatch, _intent_manifest(cmd_exit=0),
+                       spec=[_LANE_PASS])
+
+    _feed(monkeypatch, _stop_payload(message="Done, both ways."))
+    assert subagent_stop_main() == 0
+    assert capsys.readouterr().out == ""
+
+    assert _graded_check_ids() == ["lane-ok", "m-widget"]
+    assert list_dispatches()[0].verdict == "verified"
+
+
+def test_manifest_check_colliding_with_a_repo_check_id_defers_to_the_spec(
+        tmp_path, monkeypatch, capsys):
+    # One id, one command: the repo spec is the more attested source, so a
+    # manifest check reusing a selected repo check's id is dropped rather than
+    # run as a second command under the same name.
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    manifest = {
+        "checks": [{"id": "lane-ok",
+                    "cmd": f'"{sys.executable}" -c "raise SystemExit(1)"'}],
+    }
+    _spawn_with_intent(tmp_path, monkeypatch, manifest, spec=[_LANE_PASS])
+
+    _feed(monkeypatch, _stop_payload(message="Done."))
+    assert subagent_stop_main() == 0
+    assert capsys.readouterr().out == ""  # the repo's lane-ok passes; no block
+
+    assert _graded_check_ids() == ["lane-ok"]
+    assert list_dispatches()[0].verdict == "verified"
+
+
+def test_malformed_manifest_check_entries_are_skipped_loudly(
+        tmp_path, monkeypatch, capsys):
+    # Junk entries must neither run half-parsed nor take down the gate — and a
+    # skipped check never counts as executed, so it can never read as a pass.
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    manifest = _intent_manifest(cmd_exit=0)
+    manifest["checks"] = [
+        "not-an-object",
+        {"id": "no-cmd"},
+        {"id": "multi-line", "cmd": "echo a\necho b"},
+    ] + manifest["checks"]
+    _spawn_with_intent(tmp_path, monkeypatch, manifest)
+
+    _feed(monkeypatch, _stop_payload(message="Done."))
+    assert subagent_stop_main() == 0
+    err = capsys.readouterr().err
+    assert "skipped" in err
+
+    assert _graded_check_ids() == ["m-widget"]  # only the well-formed entry ran
+    assert list_dispatches()[0].verdict == "verified"
+
+
 def test_read_hook_input_tolerates_utf8_bom(monkeypatch):
     # Some shells prepend a BOM when piping; losing the payload would silently
     # lose session grouping and drift detection.

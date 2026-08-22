@@ -131,6 +131,61 @@ def test_dispatch_new_bad_manifest_file(cli_runs, tmp_path, capsys):
                  str(tmp_path / "absent.json")]) == 2
 
 
+def test_dispatch_intent_writes_sidecar_and_prints_path(cli_runs, tmp_path, capsys):
+    pf = tmp_path / "prompt.md"
+    pf.write_text("do the real work\nwith a real prompt", encoding="utf-8")
+    mf = tmp_path / "manifest.json"
+    mf.write_text(json.dumps({"manifest": {
+        "deliverables": ["a"],
+        "checks": [{"id": "c1", "cmd": "true"}],
+        "check_map": {"a": ["c1"]},
+    }}), encoding="utf-8")
+
+    assert main(["dispatch", "intent", "--agent", "recon", "--prompt-file", str(pf),
+                 "--manifest", str(mf), "--tier", "lane"]) == 0
+    path = Path(capsys.readouterr().out.strip())
+    assert path.exists()
+    assert path.name == "recon.json"
+
+    intent = json.loads(path.read_text(encoding="utf-8"))
+    assert intent["agent_type"] == "recon"
+    assert intent["prompt"] == "do the real work\nwith a real prompt"
+    assert intent["manifest"]["check_map"] == {"a": ["c1"]}
+    assert intent["tier"] == "lane"
+    assert intent["created_at"]
+
+
+def test_dispatch_intent_json_format(cli_runs, tmp_path, capsys):
+    pf = tmp_path / "prompt.md"
+    pf.write_text("work", encoding="utf-8")
+    assert main(["dispatch", "intent", "--agent", "recon", "--prompt-file", str(pf),
+                 "--format", "json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert Path(out["intent_path"]).exists()
+
+
+def test_dispatch_intent_rejects_bad_inputs(cli_runs, tmp_path, capsys):
+    pf = tmp_path / "prompt.md"
+    pf.write_text("work", encoding="utf-8")
+    # Missing prompt file: an intent with no prompt is the placeholder problem
+    # the sidecar exists to fix, so it fails at write time.
+    assert main(["dispatch", "intent", "--agent", "recon",
+                 "--prompt-file", str(tmp_path / "absent.md")]) == 2
+    # Unparseable manifest file vs. parseable-but-unusable manifest shape.
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    assert main(["dispatch", "intent", "--agent", "recon", "--prompt-file", str(pf),
+                 "--manifest", str(bad)]) == 2
+    unusable = tmp_path / "unusable.json"
+    unusable.write_text(json.dumps({"deliverables": "not-an-array"}), encoding="utf-8")
+    assert main(["dispatch", "intent", "--agent", "recon", "--prompt-file", str(pf),
+                 "--manifest", str(unusable)]) == 1
+    # A path-shaped agent type must never become a path.
+    assert main(["dispatch", "intent", "--agent", "../evil",
+                 "--prompt-file", str(pf)]) == 1
+
+
 def test_dispatch_report_and_close(cli_runs, tmp_path, capsys):
     run_id = _dispatch_new(capsys)
     rf = tmp_path / "report.json"
