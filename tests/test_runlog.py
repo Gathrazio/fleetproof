@@ -128,6 +128,18 @@ def test_filter_env_denylist_covers_the_field_observed_holes():
     assert out["MONKEY"] == "safe"
 
 
+def test_filter_env_catches_underscored_connection_string_names():
+    # conn(ection)?str matched CONNSTR but not CONNECTION_STRING or CONN_STR —
+    # the underscore between the words slipped the whole family through.
+    out = filter_env({
+        "DB_CONNECTION_STRING": "c", "SVC_CONN_STR": "c",
+        "AZURE_STORAGE_CONNECTIONSTRING": "c",
+    })
+    assert out["DB_CONNECTION_STRING"] == "<redacted>"
+    assert out["SVC_CONN_STR"] == "<redacted>"
+    assert out["AZURE_STORAGE_CONNECTIONSTRING"] == "<redacted>"
+
+
 # === record / read-back (written by one path, read by another) ===
 
 def test_record_creates_files_and_reads_back(tmp_runs):

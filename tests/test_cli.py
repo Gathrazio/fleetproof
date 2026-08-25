@@ -113,6 +113,17 @@ def test_dispatch_new_reads_prompt_file(cli_runs, tmp_path, capsys):
     assert load_dispatch(run_id).prompt == "multi\nline\nprompt"
 
 
+def test_dispatch_new_prompt_file_strips_a_windows_bom(cli_runs, tmp_path, capsys):
+    # PowerShell redirection writes UTF-8 with a BOM; a plain utf-8 read embeds
+    # ﻿ at the start of the recorded prompt forever.
+    pf = tmp_path / "prompt.txt"
+    pf.write_bytes(b"\xef\xbb\xbfbom prompt")
+    assert main(["dispatch", "new", "--prompt-file", str(pf)]) == 0
+    run_id = capsys.readouterr().out.strip()
+    from fleetproof.ledger import load_dispatch
+    assert load_dispatch(run_id).prompt == "bom prompt"
+
+
 def test_dispatch_new_agent_name_writes_a_cli_capture(cli_runs, tmp_path, capsys,
                                                       monkeypatch):
     # The joinable form: the record awaits its agent_id (adopted at the first
@@ -204,6 +215,16 @@ def test_dispatch_intent_role_flag_writes_the_role_field(cli_runs, tmp_path, cap
     intent = json.loads(path.read_text(encoding="utf-8"))
     assert intent["role"] == "tester"
     assert intent["agent_type"] == "widget-refactor"
+
+
+def test_dispatch_intent_prompt_file_strips_a_windows_bom(cli_runs, tmp_path, capsys):
+    pf = tmp_path / "prompt.md"
+    pf.write_bytes(b"\xef\xbb\xbfbom prompt")
+    assert main(["dispatch", "intent", "--agent", "recon",
+                 "--prompt-file", str(pf)]) == 0
+    path = Path(capsys.readouterr().out.strip())
+    intent = json.loads(path.read_text(encoding="utf-8"))
+    assert intent["prompt"] == "bom prompt"
 
 
 def test_dispatch_intent_json_format(cli_runs, tmp_path, capsys):

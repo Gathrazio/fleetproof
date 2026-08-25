@@ -336,7 +336,10 @@ def _resolve_prompt(args: argparse.Namespace) -> str:
     if args.prompt:
         return args.prompt
     try:
-        return Path(args.prompt_file).read_text(encoding="utf-8")
+        # utf-8-sig: a prompt file written by PowerShell redirection carries a
+        # BOM, and a plain utf-8 read embeds it at the start of the recorded
+        # prompt (same rationale as _load_json_file).
+        return Path(args.prompt_file).read_text(encoding="utf-8-sig")
     except OSError as e:
         raise ValueError(f"Could not read prompt file {args.prompt_file}: {e}") from e
 
@@ -412,7 +415,9 @@ def _cmd_dispatch_intent(args: argparse.Namespace) -> int:
     consumes it.
     """
     try:
-        prompt = Path(args.prompt_file).read_text(encoding="utf-8")
+        # utf-8-sig for the same reason as _resolve_prompt: strip a
+        # PowerShell-redirection BOM before it lands in the sidecar.
+        prompt = Path(args.prompt_file).read_text(encoding="utf-8-sig")
     except OSError as e:
         _emit_error("bad_prompt",
                     f"Could not read prompt file {args.prompt_file}: {e}", args.format)

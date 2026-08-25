@@ -66,7 +66,7 @@ SENSITIVE_ENV_PATTERNS = [
     re.compile(p, re.IGNORECASE) for p in (
         r"token", r"secret", r"password", r"passwd", r"api[_-]?key",
         r"auth", r"credential", r"private[_-]?key", r"session",
-        r"[_-]key\b", r"sas", r"pwd", r"conn(ection)?str", r"pfx", r"dsn",
+        r"[_-]key\b", r"sas", r"pwd", r"conn(ection)?[_-]?str", r"pfx", r"dsn",
         r"cert",
     )
 ]
