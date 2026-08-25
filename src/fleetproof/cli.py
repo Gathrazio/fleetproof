@@ -13,6 +13,8 @@ surface as it can. Subcommands:
     record    PostToolUse-hook entry: append an evidence record from hook stdin
     subagent-start SubagentStart-hook entry: put a spawning subagent on the ledger
     subagent-stop  SubagentStop-hook entry: the per-subagent report-and-verify gate
+    arm       arm the bridge Stop gate (the default state)
+    disarm    set the bridge Stop gate to advisory; requires --note
     dispatch  ledger verbs: new / report / close a dispatch; intent writes the
               sidecar the SubagentStart capture consumes
     fleet     the dispatch board — every dispatch, its state, and whether it reported
@@ -48,7 +50,11 @@ from .checks import (
     short_spec_hash,
 )
 from .hookgate import (
+    BRIDGE_ADVISORY,
+    BRIDGE_ARMED,
+    load_arming,
     record_tool_main,
+    set_arming,
     stop_gate_main,
     subagent_start_main,
     subagent_stop_main,
@@ -489,6 +495,46 @@ def _truncate(value: str, width: int) -> str:
     return value if len(value) <= width else value[:width - 3] + "..."
 
 
+def _cmd_arm(args: argparse.Namespace) -> int:
+    path = set_arming(BRIDGE_ARMED, note=(args.note or "").strip())
+    if args.format == "json":
+        print(json.dumps({"ok": True, "bridge": BRIDGE_ARMED, "path": str(path)}))
+    else:
+        print("bridge gate: armed. Blocking check failures block the stop again.")
+    return 0
+
+
+def _cmd_disarm(args: argparse.Namespace) -> int:
+    # Asymmetric with arm on purpose: switching the gate OFF requires a reason,
+    # and a whitespace note is no reason.
+    note = (args.note or "").strip()
+    if not note:
+        _emit_error(
+            "bad_note",
+            "disarm needs a non-empty --note; switching the gate off requires "
+            "a reason.", args.format)
+        return 2
+    path = set_arming(BRIDGE_ADVISORY, note=note)
+    if args.format == "json":
+        print(json.dumps({"ok": True, "bridge": BRIDGE_ADVISORY, "note": note,
+                          "path": str(path)}))
+    else:
+        print(f"bridge gate: ADVISORY (disarmed): {note}")
+        print("Checks still run and render; check failures no longer block the "
+              "bridge's stop. The ledger sweep still blocks on stalled "
+              "dispatches, and subagents are still graded. Re-arm: fleetproof arm")
+    return 0
+
+
+def _arming_board_line(arming: dict) -> str:
+    """The fleet board's echo of a disarmed gate — the note travels with it."""
+    note = str(arming.get("note") or "no note recorded")
+    set_at = str(arming.get("set_at") or "?")[:19]
+    by = str(arming.get("by") or "?")
+    return (f"bridge gate: ADVISORY (disarmed): {note} "
+            f"[set {set_at} by {by}; re-arm: fleetproof arm]")
+
+
 def _cmd_fleet_orphans(args: argparse.Namespace) -> int:
     """The orphan-stop view: unpaired stops, which are sightings, not dispatches."""
     orphans = list_orphan_stops(session_id=args.session)
@@ -521,14 +567,23 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
         return _cmd_fleet_orphans(args)
     records = list_dispatches(session_id=args.session, non_terminal_only=args.open)
     orphans = list_orphan_stops(session_id=args.session)
+    # The board echoes a disarmed bridge gate whenever it is advisory — the
+    # armed default stays quiet. Silence here is what makes the echo a signal.
+    arming = load_arming()
+    advisory = arming.get("bridge") == BRIDGE_ADVISORY
     if args.format == "json":
-        print(json.dumps({
+        payload = {
             "dispatches": [
                 dict(r.to_dict(), age=_format_age(r.started_at)) for r in records
             ],
             "orphan_stop_count": len(orphans),
-        }, indent=2))
+        }
+        if advisory:
+            payload["arming"] = arming
+        print(json.dumps(payload, indent=2))
         return 0
+    if advisory:
+        print(_arming_board_line(arming))
     if not records:
         print("No dispatches found.")
         if orphans:
@@ -722,6 +777,28 @@ def build_parser() -> argparse.ArgumentParser:
         "subagent-stop",
         help="SubagentStop-hook entry: record the report, grade it, block a false 'done'.")
     p_sstop.set_defaults(func=_cmd_subagent_stop)
+
+    p_arm = sub.add_parser(
+        "arm",
+        help="Arm the bridge Stop gate (the default): blocking check failures "
+             "block the bridge's stop.")
+    p_arm.add_argument("--note", default=None,
+                       help="Optional note recorded with the arming state.")
+    _add_format(p_arm)
+    p_arm.set_defaults(func=_cmd_arm)
+
+    p_disarm = sub.add_parser(
+        "disarm",
+        help="Set the bridge Stop gate to advisory: checks still run and "
+             "render, but check failures no longer block the bridge's stop. "
+             "The ledger sweep still blocks on stalled dispatches; subagent "
+             "gating is unaffected. Requires --note.")
+    p_disarm.add_argument(
+        "--note", required=True,
+        help="Why the gate is coming down (required; recorded in "
+             ".fleetproof/arming.json and echoed by `fleetproof fleet`).")
+    _add_format(p_disarm)
+    p_disarm.set_defaults(func=_cmd_disarm)
 
     p_dispatch = sub.add_parser("dispatch", help="Dispatch-ledger verbs.")
     dsub = p_dispatch.add_subparsers(dest="dispatch_command", required=True)

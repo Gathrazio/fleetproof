@@ -1289,3 +1289,102 @@ def test_read_hook_input_tolerates_utf8_bom(monkeypatch):
 
     monkeypatch.setattr(_sys, "stdin", io.StringIO("\ufeff{\"session_id\": \"s-1\"}\n"))
     assert _read_hook_input() == {"session_id": "s-1"}
+
+
+# === arming: separate "can't end a turn" from "claims done" (B2) ===
+
+def test_default_with_no_arming_file_is_armed(tmp_path, monkeypatch):
+    from fleetproof.hookgate import BRIDGE_ARMED, load_arming
+    _setup_project(tmp_path, [_FAIL], monkeypatch)
+    assert load_arming()["bridge"] == BRIDGE_ARMED
+    decision, code = stop_gate()
+    assert decision["decision"] == "block"  # armed = current behavior
+
+
+def test_malformed_arming_file_reads_as_armed(tmp_path, monkeypatch):
+    # The fail-safe direction is the gate ON: a corrupt arming file must not
+    # read as a disarm nobody asked for.
+    from fleetproof.hookgate import BRIDGE_ARMED, arming_path, load_arming
+    _setup_project(tmp_path, [_FAIL], monkeypatch)
+    arming_path().write_text("{not json", encoding="utf-8")
+    assert load_arming()["bridge"] == BRIDGE_ARMED
+    decision, code = stop_gate()
+    assert decision["decision"] == "block"
+
+
+def test_advisory_bridge_renders_check_failures_as_context_not_block(
+        tmp_path, monkeypatch):
+    # The field workaround was flipping every check to block:false at phase
+    # boundaries — a spec edit, which post-B1 is drift that wedges in-flight
+    # dispatches. Arming lives OUTSIDE the hashed spec: checks still run, the
+    # failure is rendered with the advisory marker, the decision does not block.
+    from fleetproof.hookgate import BRIDGE_ADVISORY, set_arming
+    _setup_project(tmp_path, [_FAIL, dict(_PASS, id="fine")], monkeypatch)
+    set_arming(BRIDGE_ADVISORY, note="publish phase")
+
+    decision, code = stop_gate()
+    assert code == 0
+    assert decision is not None
+    assert "decision" not in decision  # never a block on check failures
+    ctx = decision["hookSpecificOutput"]["additionalContext"]
+    assert "[FLEETPROOF ADVISORY" in ctx
+    assert "bridge gate disarmed: publish phase" in ctx
+    # The full per-check breakdown still renders — advisory is not silent.
+    assert "[FAIL] bad:" in ctx and "[pass] fine:" in ctx
+
+
+def test_ledger_sweep_still_blocks_while_advisory(tmp_path, monkeypatch):
+    # A half-closed dispatch is bookkeeping, not phase: arming governs the
+    # check gate only, and a stalled dispatch blocks the stop regardless.
+    from fleetproof.hookgate import BRIDGE_ADVISORY, set_arming
+    _setup_project(tmp_path, [_FAIL], monkeypatch)
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-advisory-sweep")
+    set_arming(BRIDGE_ADVISORY, note="publish phase")
+    stalled = _make_dispatch(report=True)
+
+    decision, code = stop_gate()
+    assert decision["decision"] == "block"
+    assert stalled in decision["reason"]
+    assert "reported but never terminated" in decision["reason"]
+    # The check failure stayed advisory: it is context, not part of the block.
+    assert "blocking check(s) failed" not in decision["reason"]
+    assert "[FLEETPROOF ADVISORY" in decision["hookSpecificOutput"]["additionalContext"]
+
+
+def test_subagent_gate_ignores_arming(tmp_path, monkeypatch, capsys):
+    # Arming is the bridge's turn-end switch. A subagent's "done" claim is
+    # always graded: disarming the bridge must not un-grade the fleet.
+    from fleetproof.hookgate import BRIDGE_ADVISORY, set_arming, \
+        subagent_start_main, subagent_stop_main
+    _setup_project(tmp_path, [_LANE_ARTIFACT], monkeypatch)
+    set_arming(BRIDGE_ADVISORY, note="publish phase")
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
+
+    _feed(monkeypatch, _stop_payload(message="Shipped the artifact."))
+    assert subagent_stop_main() == 0
+    decision = json.loads(capsys.readouterr().out)
+    assert decision["decision"] == "block"
+
+
+def test_flipping_arming_trips_no_drift_mechanism(tmp_path, monkeypatch):
+    # The whole point of arming.json living outside the spec and outside the
+    # checks tree: flipping it mid-session must not read as drift anywhere.
+    from fleetproof.checks import checks_tree_hash, spec_hash
+    from fleetproof.hookgate import BRIDGE_ADVISORY, BRIDGE_ARMED, set_arming
+    _setup_project(tmp_path, [_PASS], monkeypatch)
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-arming-drift")
+
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000001-bbbb01")
+    first, code = stop_gate()
+    assert first is None  # baseline
+
+    spec_before, tree_before = spec_hash(), checks_tree_hash()
+    set_arming(BRIDGE_ADVISORY, note="publish phase")
+    set_arming(BRIDGE_ARMED, note="publish done")
+    assert spec_hash() == spec_before
+    assert checks_tree_hash() == tree_before
+
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000002-bbbb02")
+    second, code = stop_gate()
+    assert second is None  # pass, no drift note, no advisory residue

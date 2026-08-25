@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from typing import Any
 
 from pathlib import Path
@@ -117,6 +118,74 @@ def _apply_session_id(payload: dict[str, Any]) -> None:
         os.environ[SESSION_ID_ENV] = sid
 
 
+# === Arming: separate "can't end a turn" from "claims done" ===
+#
+# The bridge's Stop gate conflates ending a turn with claiming the work done,
+# and blocking checks that can only pass at the end of a release train
+# deadlocked the bridge mid-phase. The field workaround — flip every check to
+# block:false, flip back at publish — is a spec edit, which post-B1 is drift
+# that wedges every in-flight dispatch. So the switch lives OUTSIDE the hashed
+# spec and outside the checks tree: .fleetproof/arming.json is never pinned,
+# and flipping it trips no drift mechanism. It governs the bridge gate only —
+# the ledger sweep still blocks on stalled dispatches (a half-closed dispatch
+# is bookkeeping, not phase), and subagents are always graded.
+
+ARMING_FILENAME = "arming.json"
+BRIDGE_ARMED = "armed"
+BRIDGE_ADVISORY = "advisory"
+
+# The advisory sibling of GATE_BLOCK_MARKER: same machine-shaped opener, but
+# it says plainly that nothing is blocked and why the gate is down.
+ADVISORY_MARKER_TEMPLATE = "[FLEETPROOF ADVISORY — bridge gate disarmed: {note}]"
+
+
+def arming_path() -> Path:
+    """The ``.fleetproof/arming.json`` file, resolved beside the runs dir."""
+    return runs_dir().parent / ARMING_FILENAME
+
+
+def load_arming() -> dict[str, Any]:
+    """The bridge arming state; ``{"bridge": "armed"}`` when absent or unusable.
+
+    Armed is the fail-safe direction: no file, a corrupt file, or an unknown
+    value all read as the gate ON — a disarm nobody recorded is a disarm
+    nobody asked for.
+    """
+    try:
+        raw = json.loads(arming_path().read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return {"bridge": BRIDGE_ARMED}
+    if not isinstance(raw, dict) or raw.get("bridge") not in (BRIDGE_ARMED, BRIDGE_ADVISORY):
+        return {"bridge": BRIDGE_ARMED}
+    return raw
+
+
+def set_arming(bridge: str, note: str = "", by: str | None = None) -> Path:
+    """Write the arming state. Returns the path written.
+
+    The note travels in the file and is echoed by ``fleet`` — a disarmed gate
+    with no visible reason is indistinguishable from a neutered one, which is
+    exactly the ambiguity the note exists to remove.
+    """
+    if bridge not in (BRIDGE_ARMED, BRIDGE_ADVISORY):
+        raise ValueError(
+            f"bridge must be {BRIDGE_ARMED!r} or {BRIDGE_ADVISORY!r}; got {bridge!r}.")
+    path = arming_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "bridge": bridge,
+        "note": note or "",
+        "set_at": datetime.now(timezone.utc).isoformat(),
+        "by": by or os.environ.get("USER") or os.environ.get("USERNAME") or "unknown",
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def _advisory_context(note: str, body: str) -> str:
+    return ADVISORY_MARKER_TEMPLATE.format(note=note or "no note recorded") + "\n" + body
+
+
 def _spec_gate() -> tuple[str | None, str | None]:
     """The bridge's spec verdict, as ``(block_reason_or_None, context_or_None)``.
 
@@ -130,8 +199,18 @@ def _spec_gate() -> tuple[str | None, str | None]:
     case — without a tier, the bridge's Stop hook grades itself on leaf- and
     lane-tier checks that describe some subagent's work, not the session's, and
     blocks the bridge on a failure that was never the bridge's to answer for.
+
+    Arming: when ``.fleetproof/arming.json`` says the bridge gate is
+    ``advisory``, everything here still runs and still renders — but every
+    ground to block converts to context carrying the advisory marker, and the
+    decision never blocks. The disarm is recorded, attributed, and echoed by
+    ``fleet``; the ledger sweep (in :func:`stop_gate`) is not arming's to
+    switch off.
     """
     session_id = os.environ.get(SESSION_ID_ENV)
+    arming = load_arming()
+    advisory = arming.get("bridge") == BRIDGE_ADVISORY
+    advisory_note = str(arming.get("note") or "")
     try:
         checks = load_checks()
     except CheckSpecError as e:
@@ -142,25 +221,27 @@ def _spec_gate() -> tuple[str | None, str | None]:
         # corrupting checks.json must not read as "verified").
         baseline = session_spec_baseline(session_id)
         if baseline:
-            return (
+            reason = (
                 "FleetProof: a check spec graded this session earlier (baseline "
                 f"{short_spec_hash(baseline)}) but is now missing or unreadable "
                 f"({e}). Restore .fleetproof/checks.json before stopping — a "
-                "promised gate cannot be switched off by removing its spec.",
-                None,
-            )
+                "promised gate cannot be switched off by removing its spec.")
+            if advisory:
+                return None, _advisory_context(advisory_note, reason)
+            return reason, None
         return None, None
 
     if not checks:
         baseline = session_spec_baseline(session_id)
         if baseline:
-            return (
+            reason = (
                 "FleetProof: .fleetproof/checks.json now declares zero checks, "
                 "but a spec graded this session earlier (baseline "
                 f"{short_spec_hash(baseline)}). An emptied spec mid-session is "
-                "how a gate gets neutered; restore the checks before stopping.",
-                None,
-            )
+                "how a gate gets neutered; restore the checks before stopping.")
+            if advisory:
+                return None, _advisory_context(advisory_note, reason)
+            return reason, None
         return None, None
 
     report = run_checks(checks, tier=TIER_BRIDGE)
@@ -200,6 +281,9 @@ def _spec_gate() -> tuple[str | None, str | None]:
         )
         if any_drift:
             reason += " " + drift_note
+        if advisory:
+            return None, _advisory_context(
+                advisory_note, reason + ("\n" + drift_ctx if drift_ctx else ""))
         return reason, drift_ctx
 
     if report.verdict == "pass":
@@ -215,12 +299,20 @@ def _spec_gate() -> tuple[str | None, str | None]:
             return None, drift_ctx
         return None, None
 
-    reason = _failure_reason(report)
-    if any_drift:
-        reason += " " + drift_note
     context = _evidence_context(report)
     if drift_ctx:
         context = drift_ctx + "\n" + context
+    if advisory:
+        # Checks ran, a blocking one failed, and nothing blocks: the failure
+        # renders in full so a disarmed gate is loud, never silent.
+        body = (f"{len(report.blocking_failures)}/{report.total} blocking "
+                "check(s) failed — rendered as context only; the bridge gate "
+                "is disarmed and check failures do not block this stop.\n"
+                + context)
+        return None, _advisory_context(advisory_note, body)
+    reason = _failure_reason(report)
+    if any_drift:
+        reason += " " + drift_note
     return reason, context
 
 

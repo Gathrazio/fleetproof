@@ -527,3 +527,42 @@ def test_dispatch_close_reason_flag(cli_runs, capsys):
     assert main(["dispatch", "close", swept_id, "--reason", "sweep-idle"]) == 0
     capsys.readouterr()
     assert load_dispatch(swept_id).terminate_reason == "sweep-idle"
+
+
+# === arm / disarm (B2) ===
+
+def test_disarm_and_arm_roundtrip(cli_runs, capsys):
+    import json as _json
+    from fleetproof.hookgate import arming_path
+    assert main(["disarm", "--note", "publish phase"]) == 0
+    raw = _json.loads(arming_path().read_text(encoding="utf-8"))
+    assert raw["bridge"] == "advisory"
+    assert raw["note"] == "publish phase"
+    assert raw["set_at"] and raw["by"]
+
+    assert main(["arm"]) == 0
+    raw = _json.loads(arming_path().read_text(encoding="utf-8"))
+    assert raw["bridge"] == "armed"
+
+
+def test_disarm_requires_a_note(cli_runs, capsys):
+    # Asymmetric on purpose: switching the gate OFF requires a reason.
+    with pytest.raises(SystemExit):
+        main(["disarm"])
+    assert main(["disarm", "--note", "   "]) == 2  # a blank note is no note
+
+
+def test_fleet_echoes_the_advisory_state(cli_runs, capsys):
+    assert main(["disarm", "--note", "publish phase"]) == 0
+    capsys.readouterr()
+    _dispatch_new(capsys)
+    assert main(["fleet"]) == 0
+    out = capsys.readouterr().out
+    assert "ADVISORY" in out
+    assert "publish phase" in out
+
+    assert main(["arm"]) == 0
+    capsys.readouterr()
+    assert main(["fleet"]) == 0
+    out = capsys.readouterr().out
+    assert "ADVISORY" not in out  # armed is the default; the board stays quiet
