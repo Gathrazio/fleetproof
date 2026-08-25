@@ -409,7 +409,8 @@ def _cmd_dispatch_intent(args: argparse.Namespace) -> int:
             manifest = inner
 
     try:
-        path = write_intent(args.agent, prompt, manifest=manifest, tier=args.tier)
+        path = write_intent(args.agent, prompt, manifest=manifest, tier=args.tier,
+                            role=args.role)
     except LedgerError as e:
         _emit_error("ledger_error", str(e), args.format)
         return 1
@@ -749,6 +750,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_dint.add_argument("--tier", choices=sorted(VALID_TIERS), default=None,
                         help="Declare the tier. Omit to record the captured-subagent "
                              "default (lane).")
+    p_dint.add_argument("--role", default=None,
+                        help="Second match key: a spawn whose agent_type equals "
+                             "this exactly consumes the intent even when the "
+                             "filename does not match.")
     _add_format(p_dint)
     p_dint.set_defaults(func=_cmd_dispatch_intent)
 

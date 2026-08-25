@@ -800,6 +800,114 @@ def test_invalid_intent_tier_falls_back_to_the_captured_default(
     assert "captain" in capsys.readouterr().err
 
 
+def test_intent_miss_is_loud_on_stderr(tmp_path, monkeypatch, capsys):
+    # A role-keyed intent that silently misses leaves a placeholder prompt and
+    # a defaulted lane tier with nothing telling the dispatcher (observed in a
+    # field deployment on Windows). A miss must name itself.
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import write_intent
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    write_intent("someone-else", _INTENT_PROMPT)
+
+    _feed(monkeypatch, _start_payload(agent_type="tester"))
+    assert subagent_start_main() == 0
+
+    err = capsys.readouterr().err
+    assert "no intent matched spawn 'tester'" in err
+    assert "defaulted tier 'lane'" in err
+    assert "someone-else.json" in err  # the sidecars that WERE present, listed
+
+
+def test_intent_miss_note_says_none_when_no_sidecars_exist(tmp_path, monkeypatch, capsys):
+    from fleetproof.hookgate import subagent_start_main
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    _feed(monkeypatch, _start_payload(agent_type="tester"))
+    assert subagent_start_main() == 0
+    err = capsys.readouterr().err
+    assert "no intent matched spawn 'tester'" in err
+    assert "Sidecars present: none." in err
+
+
+def test_intent_matched_by_role_field(tmp_path, monkeypatch):
+    # The sidecar is keyed by the harness agent_type (the spawn *name*), so a
+    # dispatcher naming spawns per-task can declare the role instead: a sidecar
+    # whose "role" field equals the payload's agent_type matches. Exact string
+    # equality only — prefix matching invites collisions and stays out.
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import intent_path, list_dispatches, write_intent
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    path = write_intent("widget-refactor", _INTENT_PROMPT, tier="leaf",
+                        role="tester")
+
+    _feed(monkeypatch, _start_payload(agent_type="tester"))
+    assert subagent_start_main() == 0
+
+    d = list_dispatches()[0]
+    assert d.prompt == _INTENT_PROMPT
+    assert d.tier == "leaf"
+    assert not path.exists()  # consumed, same as a name match
+    assert intent_path("widget-refactor") is not None
+
+
+def test_intent_exact_filename_beats_a_role_match(tmp_path, monkeypatch):
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import intent_path, list_dispatches, write_intent
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    write_intent("tester", "the exact-name prompt")
+    write_intent("aaa-first-by-sort", "the role-keyed prompt", role="tester")
+
+    _feed(monkeypatch, _start_payload(agent_type="tester"))
+    assert subagent_start_main() == 0
+
+    assert list_dispatches()[0].prompt == "the exact-name prompt"
+    # The role-keyed sidecar is untouched: one intent, one spawn.
+    assert intent_path("aaa-first-by-sort").exists()
+
+
+def test_role_prefix_does_not_match(tmp_path, monkeypatch, capsys):
+    # Explicitly out: a payload name that merely STARTS with a sidecar's name
+    # (or role) is no match. Prefix matching is how 'build' intents end up on
+    # 'build-docs' spawns.
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import intent_path, list_dispatches, write_intent
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    write_intent("tester", _INTENT_PROMPT, role="tester")
+
+    _feed(monkeypatch, _start_payload(agent_type="tester-1"))
+    assert subagent_start_main() == 0
+
+    assert "[uncaptured]" in list_dispatches()[0].prompt
+    assert intent_path("tester").exists()
+    assert "no intent matched spawn 'tester-1'" in capsys.readouterr().err
+
+
+def test_dispatch_records_intent_source_hash(tmp_path, monkeypatch):
+    # Decision-0011 interlock: a consumed sidecar's name and byte hash land on
+    # the dispatch, so a forged or replaced intent is attributable post-hoc.
+    import hashlib
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import intent_path, list_dispatches, write_intent
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    path = write_intent("tester", _INTENT_PROMPT)
+    expected_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    _feed(monkeypatch, _start_payload())
+    assert subagent_start_main() == 0
+
+    d = list_dispatches()[0]
+    assert d.intent_source == {"file": "tester.json", "sha256": expected_sha}
+    assert not intent_path("tester").exists()
+
+
+def test_placeholder_capture_records_no_intent_source(tmp_path, monkeypatch):
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import list_dispatches
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    _feed(monkeypatch, _start_payload())
+    assert subagent_start_main() == 0
+    assert list_dispatches()[0].intent_source is None
+
+
 # === manifest checks in the stop gate (SubagentStop) ===
 
 def _era_config(tmp_path: Path) -> None:

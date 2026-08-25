@@ -222,6 +222,11 @@ class DispatchRecord:
     # a dispatch created by hand (or by v0.2 Phase A) has no agent block, and it
     # reads back as None.
     agent: dict[str, Any] | None = None
+    # Which intent sidecar this dispatch's prompt came from — file name plus a
+    # SHA-256 of the sidecar bytes as consumed, so a forged or replaced sidecar
+    # is attributable after the fact. Additive: None on placeholder captures
+    # and on every record written before this field existed.
+    intent_source: dict[str, Any] | None = None
     # The telemetry-era cutover this dispatch was created under, stamped at
     # creation from deployment config. Additive: absent on every record created
     # before the cutover (or before this field existed), reading back as None —
@@ -310,6 +315,7 @@ class DispatchRecord:
             "transitions": self.transitions,
             "started_at": self.started_at,
             "agent": self.agent,
+            "intent_source": self.intent_source,
             "telemetry_era": self.telemetry_era,
             "state": self.state,
             "verdict": self.verdict,
@@ -340,6 +346,7 @@ def load_dispatch(run_id: str) -> DispatchRecord | None:
     transitions = dispatch.get("transitions")
     manifest = dispatch.get("manifest")
     agent = dispatch.get("agent")
+    intent_source = dispatch.get("intent_source")
     return DispatchRecord(
         run_id=run_id,
         run_dir=run_dir,
@@ -353,6 +360,7 @@ def load_dispatch(run_id: str) -> DispatchRecord | None:
         transitions=transitions if isinstance(transitions, list) else [],
         started_at=root.get("started_at"),
         agent=agent if isinstance(agent, dict) else None,
+        intent_source=intent_source if isinstance(intent_source, dict) else None,
         telemetry_era=dispatch.get("telemetry_era") or None,
     )
 
@@ -598,6 +606,7 @@ def write_intent(
     *,
     manifest: dict[str, Any] | None = None,
     tier: str | None = None,
+    role: str | None = None,
 ) -> Path:
     """Write the dispatch-intent sidecar for the next spawn of ``agent_type``.
 
@@ -608,6 +617,18 @@ def write_intent(
     supersedes the one it replaces. Validation is strict here, on the write
     side, where an error still has someone to land on; the consume side (a hook
     that must not crash a spawn) degrades instead.
+
+    ``role`` is the second match key: a spawn whose payload agent_type equals
+    this string consumes the sidecar even when the filename does not match —
+    exact string equality only, never a prefix, because prefix matching is how
+    a 'build' intent lands on a 'build-docs' spawn. It exists for dispatchers
+    that name spawns per-task rather than per-role.
+
+    Trust note, stated honestly: the intents directory must be treated as
+    write-restricted to the dispatcher. A hook cannot enforce that — an agent
+    with filesystem access could forge or replace a sidecar mid-run — so the
+    consumed sidecar's name and byte hash are recorded on the dispatch
+    (``intent_source``), making a swap attributable post-hoc, not preventable.
     """
     path = intent_path(agent_type)
     if path is None:
@@ -617,11 +638,15 @@ def write_intent(
         )
     if not isinstance(prompt, str) or not prompt.strip():
         raise LedgerError("An intent needs a prompt; refusing to record an empty one.")
+    if role is not None and (not isinstance(role, str) or not role.strip()):
+        raise LedgerError("An intent role must be a non-empty string or omitted.")
     intent: dict[str, Any] = {
         "agent_type": agent_type,
         "prompt": prompt,
         "created_at": _now_iso(),
     }
+    if role is not None:
+        intent["role"] = role
     if manifest is not None:
         try:
             intent["manifest"] = _coerce_manifest(manifest)
@@ -634,13 +659,40 @@ def write_intent(
     return path
 
 
+def _intent_by_role(agent_type: str | None) -> Path | None:
+    """The first sidecar (sorted by name) whose ``role`` field equals ``agent_type``.
+
+    Exact string equality only. The reverse direction — a payload name that
+    merely *starts with* a sidecar's name or role — is deliberately not a
+    match: prefix matching invites collisions between similarly named spawns.
+    """
+    if not agent_type:
+        return None
+    directory = intents_dir()
+    if not directory.exists():
+        return None
+    for path in sorted(directory.glob("*.json")):
+        raw = _read_json(path)
+        if isinstance(raw, dict) and raw.get("role") == agent_type:
+            return path
+    return None
+
+
 def consume_intent(agent_type: str | None) -> tuple[dict[str, Any] | None, list[str]]:
     """Read, validate, and DELETE the intent sidecar for one spawning agent.
 
-    Returns ``(fields, notes)``. ``fields`` is ``{"prompt", "manifest", "tier"}``
-    — manifest coerced (or None), tier validated (or None) — or None when no
-    usable intent exists. ``notes`` are human-readable degradation notes for the
-    caller to surface; an intent that half-worked must be visible, not silent.
+    Returns ``(fields, notes)``. ``fields`` is ``{"prompt", "manifest", "tier",
+    "source"}`` — manifest coerced (or None), tier validated (or None), source
+    the consumed file's name plus a SHA-256 of its bytes (the post-hoc
+    attribution for a forged or replaced sidecar; see :func:`write_intent`) —
+    or None when no usable intent exists. ``notes`` are human-readable
+    degradation notes for the caller to surface; an intent that half-worked
+    must be visible, not silent. A clean miss (no file matched at all) returns
+    ``(None, [])`` and the caller announces it — a silent miss leaves a
+    placeholder prompt and a defaulted tier with nobody the wiser.
+
+    Matching order: the sidecar named ``<agent_type>.json``, then any sidecar
+    whose ``role`` field equals the agent_type exactly.
 
     Consumption is unconditional once a matching file is found: one intent, one
     spawn, even when the intent turns out malformed. A malformed sidecar left in
@@ -652,13 +704,25 @@ def consume_intent(agent_type: str | None) -> tuple[dict[str, Any] | None, list[
     notes: list[str] = []
     path = intent_path(agent_type)
     if path is None or not path.exists():
+        path = _intent_by_role(agent_type)
+    if path is None:
         return None, notes
-    raw = _read_json(path)
+    try:
+        raw_bytes: bytes | None = path.read_bytes()
+    except OSError:
+        raw_bytes = None
     try:
         path.unlink()
     except OSError as e:
         notes.append(f"could not delete intent file {path}: {e}; ignoring it")
         return None, notes
+    raw: dict[str, Any] | None = None
+    if raw_bytes is not None:
+        try:
+            parsed = json.loads(raw_bytes.decode("utf-8"))
+            raw = parsed if isinstance(parsed, dict) else None
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raw = None
     if raw is None:
         notes.append(
             f"intent file {path.name} was unreadable or not a JSON object; "
@@ -672,7 +736,15 @@ def consume_intent(agent_type: str | None) -> tuple[dict[str, Any] | None, list[
             "capturing with the placeholder prompt instead"
         )
         return None, notes
-    fields: dict[str, Any] = {"prompt": prompt, "manifest": None, "tier": None}
+    fields: dict[str, Any] = {
+        "prompt": prompt,
+        "manifest": None,
+        "tier": None,
+        "source": {
+            "file": path.name,
+            "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+        },
+    }
     raw_manifest = raw.get("manifest")
     if raw_manifest is not None:
         try:
@@ -822,6 +894,7 @@ def create_dispatch(
     manifest: dict[str, Any] | None = None,
     parent_run_id: str | None = None,
     agent: dict[str, Any] | None = None,
+    intent_source: dict[str, Any] | None = None,
     by: str = "cli",
     spec_path: Path | None = None,
 ) -> str:
@@ -837,7 +910,9 @@ def create_dispatch(
     passing one records ``"declared"``. ``manifest`` omitted means derive one from
     the prompt. ``agent`` records the harness subagent this dispatch stands for
     (``agent_id``/``agent_type``/``capture``), which is what lets a later
-    SubagentStop find this record again. ``spec_path`` overrides which spec file
+    SubagentStop find this record again. ``intent_source`` attributes the
+    prompt to the consumed intent sidecar (file name + byte hash) so a forged
+    sidecar is traceable post-hoc. ``spec_path`` overrides which spec file
     gets hashed (hooks/tests); by default the project's ``.fleetproof/checks.json``
     is used, and an unreadable spec pins ``null`` rather than failing the dispatch.
     """
@@ -897,6 +972,10 @@ def create_dispatch(
     # stays the shape Phase A wrote and readers keep treating absent as None.
     if resolved_agent is not None:
         dispatch["agent"] = resolved_agent
+    # Same posture for the intent-sidecar attribution: only a consumed sidecar
+    # puts it on the record.
+    if intent_source is not None:
+        dispatch["intent_source"] = dict(intent_source)
     _write_json(run_dir / DISPATCH_FILENAME, dispatch)
     return run_id
 

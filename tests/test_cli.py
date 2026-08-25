@@ -155,6 +155,19 @@ def test_dispatch_intent_writes_sidecar_and_prints_path(cli_runs, tmp_path, caps
     assert intent["created_at"]
 
 
+def test_dispatch_intent_role_flag_writes_the_role_field(cli_runs, tmp_path, capsys):
+    # --role keys the sidecar to what the spawn is FOR, so a per-task spawn
+    # name still finds its intent (match = filename OR role, exact equality).
+    pf = tmp_path / "prompt.md"
+    pf.write_text("work", encoding="utf-8")
+    assert main(["dispatch", "intent", "--agent", "widget-refactor",
+                 "--prompt-file", str(pf), "--role", "tester"]) == 0
+    path = Path(capsys.readouterr().out.strip())
+    intent = json.loads(path.read_text(encoding="utf-8"))
+    assert intent["role"] == "tester"
+    assert intent["agent_type"] == "widget-refactor"
+
+
 def test_dispatch_intent_json_format(cli_runs, tmp_path, capsys):
     pf = tmp_path / "prompt.md"
     pf.write_text("work", encoding="utf-8")

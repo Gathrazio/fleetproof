@@ -69,6 +69,7 @@ from .ledger import (
     consume_intent,
     create_dispatch,
     find_dispatch_by_agent,
+    intents_dir,
     list_dispatches,
     load_dispatch,
     record_orphan_stop,
@@ -414,6 +415,16 @@ def capture_subagent_start(payload: dict[str, Any]) -> str:
     intent, notes = consume_intent(agent_type)
     for note in notes:
         sys.stderr.write(f"[fleetproof] {note}\n")
+    if intent is None and not notes:
+        # A clean miss — no sidecar matched by name or role. Said loudly,
+        # because the silent version of this is a placeholder prompt and a
+        # defaulted tier that nobody notices until the verdicts are worthless
+        # (observed in a field deployment on Windows).
+        sys.stderr.write(
+            f"[fleetproof] no intent matched spawn '{agent_type or 'unknown'}' "
+            "— captured with placeholder prompt at defaulted tier "
+            f"'{CAPTURED_SUBAGENT_TIER}'. Sidecars present: "
+            f"{_sidecar_listing()}.\n")
     prompt = intent["prompt"] if intent else _placeholder_prompt(agent_type)
     manifest = intent["manifest"] if intent else None
     tier = (intent["tier"] if intent else None) or CAPTURED_SUBAGENT_TIER
@@ -422,8 +433,18 @@ def capture_subagent_start(payload: dict[str, Any]) -> str:
         tier=tier,
         manifest=manifest,
         agent={"agent_id": agent_id, "agent_type": agent_type, "capture": CAPTURE_START},
+        intent_source=intent["source"] if intent else None,
         by="hook",
     )
+
+
+def _sidecar_listing() -> str:
+    """The intent files currently on disk, or 'none' — for the miss note."""
+    try:
+        names = sorted(p.name for p in intents_dir().glob("*.json"))
+    except OSError:
+        names = []
+    return ", ".join(names) if names else "none"
 
 
 def subagent_start_main() -> int:
