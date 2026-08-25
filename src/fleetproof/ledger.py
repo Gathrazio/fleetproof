@@ -71,7 +71,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .checks import VALID_TIERS, checks_tree_hash, spec_hash
+from .checks import VALID_TIERS, checks_tree_hash, spec_hash, unknown_tier_message
 from .config import telemetry_era_stamp
 from .runlog import (
     PARENT_RUN_ID_ENV,
@@ -613,10 +613,14 @@ def infer_tier(parent_run_id: str | None) -> str:
 
 
 def _validate_tier(tier: str) -> str:
+    """The tier string, or a LedgerError that names the legal values.
+
+    Every path that bypasses argparse's ``choices`` lands here — a tier
+    inside an intent sidecar, a manifest file, a library caller — so this is
+    where an invented tier gets told what the vocabulary is.
+    """
     if tier not in VALID_TIERS:
-        raise LedgerError(
-            f"Unknown tier {tier!r}; expected one of {sorted(VALID_TIERS)}."
-        )
+        raise LedgerError(unknown_tier_message(tier))
     return tier
 
 
@@ -896,7 +900,7 @@ def consume_intent(agent_type: str | None) -> tuple[dict[str, Any] | None, list[
             fields["tier"] = raw_tier
         else:
             notes.append(
-                f"intent tier {raw_tier!r} is not one of {sorted(VALID_TIERS)}; "
+                f"intent {unknown_tier_message(raw_tier)}; "
                 "using the captured-subagent default"
             )
     return fields, notes

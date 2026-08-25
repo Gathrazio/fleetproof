@@ -278,3 +278,23 @@ def test_tree_hash_is_recursive_and_deterministic(tmp_path):
 def test_tree_hash_none_when_spec_unreadable(tmp_path):
     from fleetproof.checks import checks_tree_hash
     assert checks_tree_hash(tmp_path / "absent.json") is None
+
+
+def test_spec_with_an_invented_tier_names_the_legal_tiers(tmp_path):
+    from fleetproof.checks import CheckSpecError, load_checks
+    spec = tmp_path / "checks.json"
+    spec.write_text(json.dumps({"checks": [
+        {"id": "x", "run": "true", "expect": "exit0", "tier": "lead"},
+    ]}), encoding="utf-8")
+    with pytest.raises(CheckSpecError) as excinfo:
+        load_checks(spec)
+    assert "unknown tier 'lead'" in str(excinfo.value)
+    assert "legal tiers: bridge, coordinator, lane, leaf" in str(excinfo.value)
+
+
+def test_checker_tier_rejection_names_the_legal_tiers():
+    from fleetproof.checker import select_checks
+    with pytest.raises(ValueError) as excinfo:
+        select_checks([], "lead")
+    assert "legal tiers: bridge, coordinator, lane, leaf" in str(excinfo.value)
+

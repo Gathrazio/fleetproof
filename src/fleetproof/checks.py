@@ -63,6 +63,20 @@ _VALID_EXPECT_KEYS = {"exit", "regex", "file_exists"}
 # spec hashing) can re-export it instead of the two disagreeing about spelling.
 VALID_TIERS = frozenset({"leaf", "lane", "coordinator", "bridge"})
 
+
+def unknown_tier_message(tier: object) -> str:
+    """The one wording every tier rejection uses: the bad value AND the legal set.
+
+    An invented tier ("lead", "captain") is an operator typo, and a rejection
+    that names only the typo sends them to the docs to find the vocabulary
+    (asked for twice from a field deployment on Windows). Every site that
+    validates a tier string — ledger, spec loader, checker, intent sidecar —
+    composes its message from this so the legal list can never drift between
+    surfaces.
+    """
+    return (f"unknown tier {str(tier)!r} — legal tiers: "
+            + ", ".join(sorted(VALID_TIERS)))
+
 # Who can actually satisfy a check: any tier, or the operator — a seat outside
 # the fleet entirely, for criteria no agent can close out (a license renewal, a
 # signing ceremony). Validated with the same strictness as tiers: a typo'd
@@ -315,7 +329,7 @@ def _parse_check(entry: Any, index: int) -> Check:
     tier = entry.get("tier")
     if tier is not None and (not isinstance(tier, str) or tier not in VALID_TIERS):
         raise CheckSpecError(
-            f"{where} ({cid}): 'tier' must be one of {sorted(VALID_TIERS)} or omitted."
+            f"{where} ({cid}): 'tier' {unknown_tier_message(tier)} (or omit it)."
         )
 
     owner = entry.get("owner")

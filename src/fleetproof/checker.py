@@ -30,6 +30,7 @@ from .checks import (
     load_checks,
     short_spec_hash,
     spec_hash,
+    unknown_tier_message,
 )
 from .runlog import list_run_records, project_root, record, runs_dir
 
@@ -325,7 +326,7 @@ def select_checks(checks: list[Check], tier: str | None) -> list[Check]:
     if tier is None:
         return list(checks)
     if tier not in VALID_TIERS:
-        raise ValueError(f"Unknown tier {tier!r}; expected one of {sorted(VALID_TIERS)}.")
+        raise ValueError(unknown_tier_message(tier))
     return [c for c in checks if c.tier == tier or c.tier is None]
 
 

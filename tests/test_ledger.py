@@ -812,3 +812,40 @@ def test_close_rejects_a_blank_parked_reason(ledger_runs):
         close_dispatch(run_id, reason="parked: ")
     with pytest.raises(LedgerError):
         close_dispatch(run_id, reason="parked:   ")
+
+
+# === invented tiers name the legal values ===
+
+def test_invented_tier_error_names_the_legal_tiers(ledger_runs):
+    # "unknown tier 'lead'" alone sends the operator to the docs for the
+    # vocabulary; the rejection carries it (asked for from a field deployment
+    # on Windows).
+    with pytest.raises(LedgerError) as excinfo:
+        create_dispatch("work", tier="lead")
+    msg = str(excinfo.value)
+    assert "unknown tier 'lead'" in msg
+    assert "legal tiers: bridge, coordinator, lane, leaf" in msg
+
+
+def test_invented_tier_in_write_intent_names_the_legal_tiers(ledger_runs, tmp_path):
+    from fleetproof.ledger import write_intent
+    with pytest.raises(LedgerError) as excinfo:
+        write_intent("tester", "work", tier="captain")
+    assert "unknown tier 'captain'" in str(excinfo.value)
+    assert "legal tiers: bridge, coordinator, lane, leaf" in str(excinfo.value)
+
+
+def test_invented_tier_in_a_sidecar_note_names_the_legal_tiers(ledger_runs, tmp_path):
+    # The consume side degrades instead of raising (it runs inside a hook),
+    # but its degradation note must carry the same vocabulary.
+    from fleetproof.ledger import consume_intent, intents_dir
+    intents_dir().mkdir(parents=True, exist_ok=True)
+    (intents_dir() / "tester.json").write_text(json.dumps({
+        "agent_type": "tester", "prompt": "work", "tier": "captain",
+    }), encoding="utf-8")
+    fields, notes = consume_intent("tester")
+    assert fields is not None and fields["tier"] is None
+    assert any("unknown tier 'captain'" in n
+               and "legal tiers: bridge, coordinator, lane, leaf" in n
+               for n in notes)
+
