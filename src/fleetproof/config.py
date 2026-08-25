@@ -96,6 +96,29 @@ def telemetry_era_stamp(config: dict[str, Any] | None = None) -> str | None:
     return raw.strip()
 
 
+def telemetry_era_configured(config: dict[str, Any] | None = None) -> str | None:
+    """The configured cutover date string, or None when telemetry is OFF.
+
+    Distinct from :func:`telemetry_era_stamp`: this answers "did the operator
+    ever configure an era at all" (a well-formed ``YYYY-MM-DD``, whatever the
+    calendar says), which is what a summary needs in order to say plainly
+    that the layer is off. A future-dated era is configured but not yet
+    stamping; a missing, blank, or malformed value is not configured. Four
+    screens of ``n/a`` with no line saying the era was never set rendered an
+    off-state exactly like an on-state with nothing to report (observed in a
+    field deployment on Windows).
+    """
+    cfg = config if config is not None else load_config()
+    raw = cfg.get("telemetry_era")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        date.fromisoformat(raw.strip())
+    except ValueError:
+        return None
+    return raw.strip()
+
+
 def run_context(config: dict[str, Any] | None = None) -> str:
     """The deployment's declared run context; ``production`` when unconfigured.
 

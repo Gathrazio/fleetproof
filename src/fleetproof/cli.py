@@ -1085,19 +1085,46 @@ def _parse_date(value: str | None, label: str) -> "date | None":
         raise ValueError(f"--{label} must be YYYY-MM-DD: {e}") from e
 
 
+# === Telemetry off-state ===
+#
+# A summary over a repo with no telemetry_era rendered "54 dispatch(es), 0
+# classifiable ... severity: no failures" on a run that produced a real
+# abandoned and two real contradictions — correct (nothing was ever era-
+# stamped, and pre-telemetry is never back-filled) but an off-state that
+# reads exactly like an on-state with nothing to report (observed in a field
+# deployment on Windows). The first line now says which it is.
+
+_TELEMETRY_OFF_LINE = (
+    "telemetry is OFF for this repo: no telemetry_era in .fleetproof/config.json "
+    "— set it (YYYY-MM-DD) to begin classifying dispatches created from that "
+    "date; pre-telemetry dispatches are never back-filled.")
+_TELEMETRY_ALL_PRE_LINE = (
+    "  all {n} dispatch(es) in this window predate telemetry_era {era} — "
+    "pre-telemetry, never back-filled; nothing here is classifiable yet.")
+_SEVERITY_NONE_CLASSIFIABLE = "n/a (0 classifiable)"
+
+
 def _cmd_telemetry_summary(args: argparse.Namespace) -> int:
-    from .telemetry_export import summarize
+    from .telemetry_export import BUCKET_PRE_TELEMETRY, summarize
     summary = summarize()
+    era = summary.get("telemetry_era")
     if args.format == "json":
         print(json.dumps(summary, indent=2))
         return 0
+    if era is None:
+        # Said FIRST, before any number: every rate below is n/a because the
+        # layer is off, not because the fleet was clean.
+        print(_TELEMETRY_OFF_LINE)
     print("Telemetry summary (LOCAL-ONLY: clear-text names and exact times;")
     print("anything shareable goes through `fleetproof telemetry export`).")
     for name, block in summary["windows"].items():
         counts = block["counts"]
         shown = {k: v for k, v in counts.items() if v}
-        print(f"\n[{name}] {block['total_dispatches']} dispatch(es), "
+        total = block["total_dispatches"]
+        print(f"\n[{name}] {total} dispatch(es), "
               f"{block['classifiable_dispatches']} classifiable")
+        if era is not None and total and counts.get(BUCKET_PRE_TELEMETRY) == total:
+            print(_TELEMETRY_ALL_PRE_LINE.format(n=total, era=era))
         print(f"  outcomes: {shown if shown else 'none'}")
         for metric in ("delivery_failure_rate", "false_claim_rate",
                        "abandoned_rate",
@@ -1108,7 +1135,13 @@ def _cmd_telemetry_summary(args: argparse.Namespace) -> int:
             rate = f"{m['rate']:.3f}" if m["rate"] is not None else "n/a"
             print(f"  {metric}: {m['numerator']}/{m['denominator']} = {rate}")
         sev = block["severity_distribution"]
-        print(f"  severity: {({k: v for k, v in sev.items() if v}) or 'no failures'}")
+        sev_shown = {k: v for k, v in sev.items() if v}
+        if block["classifiable_dispatches"] == 0:
+            # "no failures" over zero classifiable dispatches is a claim about
+            # a fleet that was never measured. Never print it.
+            print(f"  severity: {_SEVERITY_NONE_CLASSIFIABLE}")
+        else:
+            print(f"  severity: {sev_shown or 'no failures'}")
         override = block["override_rate_by_source"]
         for source in ("hook", "operator"):
             m = override[source]

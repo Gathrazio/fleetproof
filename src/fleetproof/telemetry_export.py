@@ -43,7 +43,7 @@ from typing import Any
 
 from . import __version__
 from .checks import VALID_TIERS
-from .config import VALID_RUN_CONTEXTS
+from .config import VALID_RUN_CONTEXTS, telemetry_era_configured
 from .ledger import (
     CAPTURE_STOP_ONLY,
     DispatchRecord,
@@ -323,6 +323,9 @@ def summarize() -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "derivation_version": DERIVATION_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        # The off-state, said as data: None means no telemetry_era is
+        # configured for this repo, so nothing here can ever classify.
+        "telemetry_era": telemetry_era_configured(),
         "windows": windows,
         "spec_hash_timeline": _spec_hash_timeline(rows),
     }

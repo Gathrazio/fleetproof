@@ -1205,3 +1205,74 @@ def test_dispatch_new_with_a_manifest_warns_and_strict_refuses(cli_runs, tmp_pat
                  "--session-id", "s1", "--strict-controls"]) == 1
     from fleetproof.ledger import list_dispatches
     assert len(list_dispatches()) == 1  # the strict attempt recorded nothing
+
+
+# === telemetry summary off-state (C8) ===
+
+def _graded_dispatch(capsys) -> str:
+    """A dispatch that reported, was verified, and closed — classifiable
+    only when an era stamped it at creation."""
+    from fleetproof.ledger import close_dispatch, record_report, record_verdict
+    run_id = _dispatch_new(capsys)
+    record_report(run_id, {"summary": "done"})
+    record_verdict(run_id, "verified")
+    close_dispatch(run_id)
+    return run_id
+
+
+def test_telemetry_summary_says_off_when_no_era_is_configured(cli_runs, capsys):
+    # Fifty-four dispatches, every rate n/a, "severity: no failures" — with no
+    # line saying the layer was never switched on (observed in a field
+    # deployment on Windows). The off-state is now the FIRST line.
+    _graded_dispatch(capsys)
+    capsys.readouterr()
+    assert main(["telemetry", "summary"]) == 0
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    assert lines[0].startswith("telemetry is OFF for this repo: no telemetry_era in "
+                               ".fleetproof/config.json")
+    assert "pre-telemetry dispatches are never back-filled" in lines[0]
+    assert "severity: n/a (0 classifiable)" in out
+    assert "no failures" not in out
+    assert "predate telemetry_era" not in out
+
+
+def test_telemetry_summary_json_carries_the_off_state(cli_runs, capsys):
+    assert main(["telemetry", "summary", "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["telemetry_era"] is None
+
+
+def test_telemetry_summary_names_the_era_when_every_row_predates_it(cli_runs, capsys):
+    # Era configured AFTER the dispatches were created: nothing is
+    # back-filled, and the summary says so with the date instead of
+    # rendering four screens of n/a.
+    _graded_dispatch(capsys)
+    (cli_runs.parent / "config.json").write_text(
+        json.dumps({"telemetry_era": "2026-01-01"}), encoding="utf-8")
+    capsys.readouterr()
+    assert main(["telemetry", "summary"]) == 0
+    out = capsys.readouterr().out
+    assert not out.startswith("telemetry is OFF")
+    assert ("[full] 1 dispatch(es), 0 classifiable\n"
+            "  all 1 dispatch(es) in this window predate telemetry_era 2026-01-01") in out
+    assert "severity: n/a (0 classifiable)" in out
+    assert "no failures" not in out
+
+
+def test_telemetry_summary_with_classifiable_rows_prints_neither_line(cli_runs, capsys):
+    (cli_runs.parent / "config.json").write_text(
+        json.dumps({"telemetry_era": "2026-01-01"}), encoding="utf-8")
+    _graded_dispatch(capsys)
+    from fleetproof.telemetry import build_telemetry
+    from fleetproof.ledger import list_dispatches
+    build_telemetry(list_dispatches()[0].run_id)
+    capsys.readouterr()
+    assert main(["telemetry", "summary"]) == 0
+    out = capsys.readouterr().out
+    assert "telemetry is OFF" not in out
+    assert "predate telemetry_era" not in out
+    assert "[full] 1 dispatch(es), 1 classifiable" in out
+    assert "severity: no failures" in out  # the existing wording, unchanged
+    assert main(["telemetry", "summary", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["telemetry_era"] == "2026-01-01"
