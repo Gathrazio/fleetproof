@@ -86,6 +86,46 @@ from .runlog import (
 from .telemetry import TelemetryError, build_telemetry, record_failure_loss
 
 
+# === Liveness beacon ===
+#
+# The harness registers hooks at session start, so a plugin installed or
+# enabled mid-session is a gate that looks installed and grades nothing until
+# the session restarts (observed in a field deployment on Windows). The read
+# surfaces — fleet, check, report — are where an operator would look, so each
+# says plainly when the current session has left no hook-produced record.
+
+_LIVENESS_WARNING = (
+    "WARNING: no hook has fired for this session — if you installed or "
+    "enabled the plugin mid-session, the gate is INERT until the session "
+    "restarts.")
+_LIVENESS_UNKNOWN = "hooks-liveness unknown (not running under a hook session)."
+
+
+def _session_has_hook_evidence(session_id: str) -> bool:
+    """True when this session left any record only a hook could have written."""
+    for run in list_run_records():
+        if (run.session_id or None) != session_id:
+            continue
+        if run.root_tool == "claude-tool":
+            return True
+    for dispatch in list_dispatches(session_id=session_id):
+        if any(t.get("by") == "hook" for t in dispatch.transitions
+               if isinstance(t, dict)):
+            return True
+    return False
+
+
+def _print_liveness_line(soft_when_unknown: bool = False) -> None:
+    """One stderr line about hook liveness; stderr so json output stays clean."""
+    session_id = os.environ.get(SESSION_ID_ENV)
+    if not session_id:
+        if soft_when_unknown:
+            print(_LIVENESS_UNKNOWN, file=sys.stderr)
+        return
+    if not _session_has_hook_evidence(session_id):
+        print(_LIVENESS_WARNING, file=sys.stderr)
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     path = Path(args.path) if args.path else default_checks_path()
     if path.exists() and not args.force:
@@ -99,6 +139,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_check(args: argparse.Namespace) -> int:
+    _print_liveness_line()
     spec_path = Path(args.spec) if args.spec else None
     try:
         checks = load_checks(spec_path)
@@ -217,6 +258,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
 
 def _cmd_report(args: argparse.Namespace) -> int:
+    _print_liveness_line()
     out = Path(args.output) if args.output else project_root() / PROJECT_MARKER / "fleetproof-report.html"
     written = write_report(out)
     print(f"Wrote report to {written}")
@@ -473,6 +515,7 @@ def _orphan_count_line(orphans: list[dict]) -> str:
 
 
 def _cmd_fleet(args: argparse.Namespace) -> int:
+    _print_liveness_line(soft_when_unknown=True)
     if args.orphans:
         return _cmd_fleet_orphans(args)
     records = list_dispatches(session_id=args.session, non_terminal_only=args.open)

@@ -354,6 +354,70 @@ def test_fleet_orphans_flag_lists_the_orphans(cli_runs, capsys):
     assert json.loads(capsys.readouterr().out)["orphans"] == []
 
 
+# === liveness beacon ===
+
+def _passing_spec(tmp_path: Path) -> Path:
+    spec = tmp_path / "checks.json"
+    spec.write_text(json.dumps({"checks": [
+        {"id": "ok", "run": f'"{sys.executable}" -c "raise SystemExit(0)"',
+         "expect": "exit0"},
+    ]}), encoding="utf-8")
+    return spec
+
+
+def test_liveness_warning_when_session_has_no_hook_record(
+        cli_runs, tmp_path, monkeypatch, capsys):
+    # A plugin installed mid-session registers no hooks until restart: the gate
+    # looks installed and grades nothing. Each read surface must say so.
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-inert")
+    spec = _passing_spec(tmp_path)
+
+    assert main(["fleet"]) == 0
+    assert "no hook has fired for this session" in capsys.readouterr().err
+    assert main(["check", "--spec", str(spec), "--no-record"]) == 0
+    err = capsys.readouterr().err
+    assert "no hook has fired for this session" in err and "INERT" in err
+    assert main(["report", "-o", str(tmp_path / "r.html")]) == 0
+    assert "no hook has fired for this session" in capsys.readouterr().err
+
+
+def test_liveness_warning_absent_once_a_hook_record_exists(
+        cli_runs, tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-alive")
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000001-abcdef")
+    with runlog.record("claude-tool", "Bash", {}):
+        pass
+
+    assert main(["fleet"]) == 0
+    assert "no hook has fired" not in capsys.readouterr().err
+    assert main(["check", "--spec", str(_passing_spec(tmp_path)),
+                 "--no-record"]) == 0
+    assert "no hook has fired" not in capsys.readouterr().err
+
+
+def test_liveness_warning_absent_with_a_hook_created_dispatch(
+        cli_runs, monkeypatch, capsys):
+    # A dispatch whose transitions carry by="hook" is hook evidence too — the
+    # subagent hooks can fire in a session before any PostToolUse record lands.
+    from fleetproof.ledger import create_dispatch
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-alive-2")
+    create_dispatch("hook-captured work", tier="lane", by="hook")
+
+    assert main(["fleet"]) == 0
+    assert "no hook has fired" not in capsys.readouterr().err
+
+
+def test_liveness_unknown_line_only_in_fleet_without_a_session(
+        cli_runs, tmp_path, capsys):
+    # No session id in env means liveness is unanswerable, not bad: only the
+    # board says so, softly; check and report stay silent.
+    assert main(["fleet"]) == 0
+    assert "hooks-liveness unknown" in capsys.readouterr().err
+    assert main(["report", "-o", str(tmp_path / "r.html")]) == 0
+    err = capsys.readouterr().err
+    assert "hooks-liveness" not in err and "no hook has fired" not in err
+
+
 # === hook entry subcommands + tier-scoped check ===
 
 def test_subagent_hook_subcommands_are_wired(cli_runs, monkeypatch, capsys):
