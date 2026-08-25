@@ -1893,3 +1893,64 @@ def test_cli_dispatch_with_a_manifest_is_an_inheritance_source(tmp_path, monkeyp
     assert by_agent["agent-8"].inherited_from is None
     assert bare  # the bare dispatch exists and was not treated as a contract
 
+
+# === the bridge Stop gate says when a claim was closed ungraded ===
+
+def test_bridge_stop_gate_announces_ungraded_terminations_on_stderr(
+        tmp_path, monkeypatch, capsys):
+    # The dispatcher's next stop carries the same line the board prints. It
+    # is stderr only: the dispatch is terminal, the sweep has nothing to hold
+    # the bridge on, and stdout stays exactly what it was.
+    from fleetproof.ledger import close_dispatch, record_report
+    _setup_project(tmp_path, [_PASS], monkeypatch)
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-ungraded")
+    run_id = _make_dispatch(report=True)
+    close_dispatch(run_id, by="hook")
+
+    decision, code = stop_gate()
+    assert code == 0
+    assert decision is None  # unchanged: a terminated dispatch is not swept
+    err = capsys.readouterr().err
+    assert "[fleetproof] 1 dispatch(es) terminated ungraded this session" in err
+    assert run_id in err
+
+
+def test_bridge_stop_gate_is_silent_when_nothing_terminated_ungraded(
+        tmp_path, monkeypatch, capsys):
+    from fleetproof.ledger import close_dispatch, record_verdict
+    _setup_project(tmp_path, [_PASS], monkeypatch)
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-other-ungraded")
+    theirs = _make_dispatch(report=True)
+    close_dispatch(theirs, by="hook")           # another session's miss
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-clean")
+    mine = _make_dispatch(report=True)
+    record_verdict(mine, "verified")
+    close_dispatch(mine, by="hook")             # graded, then closed
+
+    decision, code = stop_gate()
+    assert decision is None
+    assert "terminated ungraded" not in capsys.readouterr().err
+
+
+def test_a_field_shaped_ungraded_stop_is_announced_at_the_next_bridge_stop(
+        tmp_path, monkeypatch, capsys):
+    # End to end through the hooks, without inheritance available: a
+    # placeholder capture with an empty manifest at a tier the spec leaves
+    # empty stops ungraded — and the bridge hears about it on its next stop.
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _setup_project(tmp_path, [_LEAF_ONLY], monkeypatch)
+    _feed(monkeypatch, _start_payload(session="sess-field"))
+    subagent_start_main()
+    _feed(monkeypatch, _stop_payload(message="nothing more was needed",
+                                     session="sess-field"))
+    assert subagent_stop_main() == 0
+    capsys.readouterr()
+    d = list_dispatches()[0]
+    assert d.terminated_ungraded
+
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-field")
+    # (The leaf-only spec makes the bridge's own spec gate block — unrelated
+    # and unchanged; the announcement rides on stderr regardless.)
+    stop_gate()
+    assert f"terminated ungraded this session — {d.run_id}" in capsys.readouterr().err

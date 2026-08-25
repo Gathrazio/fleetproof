@@ -751,3 +751,70 @@ def test_fleet_board_marks_an_inherited_tier_with_a_tilde(cli_runs, capsys):
     inherited = next(r for r in rows if r["tier_source"] == "inherited")
     assert inherited["inherited_from"] == source
 
+
+def _ungraded_termination(session: str | None = None) -> str:
+    from fleetproof.ledger import close_dispatch, create_dispatch, record_report
+    run_id = create_dispatch("re-message", tier="lane", session_id=session)
+    record_report(run_id, {"summary": "already done in my prior turn"})
+    close_dispatch(run_id, by="hook")
+    return run_id
+
+
+def test_fleet_announces_ungraded_terminations_this_session(cli_runs, capsys,
+                                                             monkeypatch):
+    # The board column was honest but passive; the line arrives unprompted,
+    # after the orphan count, naming the run ids.
+    from fleetproof.ledger import close_dispatch, create_dispatch, record_report
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-x")
+    ungraded = _ungraded_termination("sess-x")
+    other = _ungraded_termination("sess-other")   # not this session
+    graded = create_dispatch("fine", tier="lane", session_id="sess-x")
+    record_report(graded, {"summary": "ok"})
+    from fleetproof.ledger import record_verdict
+    record_verdict(graded, "verified")
+    close_dispatch(graded)
+    assert main(["fleet"]) == 0
+    out = capsys.readouterr().out
+    assert "1 dispatch(es) terminated ungraded this session" in out
+    assert ungraded in out.split("terminated ungraded this session")[1]
+    assert other not in out.split("terminated ungraded this session")[1]
+    assert "an absent grade is not a passing grade" in out
+    # After the orphan-count line's slot: it is the last line of the board.
+    assert out.rstrip().splitlines()[-1].startswith("1 dispatch(es) terminated ungraded")
+    out.encode("cp1252")
+
+
+def test_fleet_prints_nothing_about_ungraded_when_there_are_none(cli_runs, capsys,
+                                                                 monkeypatch):
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-x")
+    _ungraded_termination("sess-other")
+    _dispatch_new(capsys)
+    capsys.readouterr()
+    assert main(["fleet"]) == 0
+    assert "terminated ungraded" not in capsys.readouterr().out
+
+
+def test_fleet_open_filter_cannot_hide_the_ungraded_line(cli_runs, capsys, monkeypatch):
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-x")
+    _ungraded_termination("sess-x")
+    assert main(["fleet", "--open"]) == 0
+    out = capsys.readouterr().out
+    assert "No dispatches found." in out
+    assert "1 dispatch(es) terminated ungraded this session" in out
+
+
+def test_fleet_without_a_session_counts_the_dispatches_shown(cli_runs, capsys):
+    _ungraded_termination(None)
+    assert main(["fleet"]) == 0
+    out = capsys.readouterr().out
+    assert "1 dispatch(es) terminated ungraded in the dispatches shown" in out
+
+
+def test_fleet_json_carries_the_ungraded_terminations(cli_runs, capsys, monkeypatch):
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-x")
+    run_id = _ungraded_termination("sess-x")
+    assert main(["fleet", "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["terminated_ungraded_count"] == 1
+    assert payload["terminated_ungraded"] == [run_id]
+    assert payload["dispatches"][0]["terminated_ungraded"] is True

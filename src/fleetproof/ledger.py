@@ -55,6 +55,7 @@ Public API:
     close_dispatch(run_id, by=..., reason=...)
     load_dispatch(run_id) -> DispatchRecord | None
     list_dispatches(*, session_id, open_only, non_terminal_only) -> list[DispatchRecord]
+    list_ungraded_terminations(session_id) -> list[DispatchRecord]
     find_dispatch_by_agent(session_id, agent_id) -> DispatchRecord | None
     find_dispatch_for_stop(session_id, agent_id, agent_type) -> (record_or_None, notes)
     find_inheritable_intent(session_id, agent_type) -> DispatchRecord | None
@@ -366,6 +367,30 @@ class DispatchRecord:
         return None
 
     @property
+    def terminated_ungraded(self) -> bool:
+        """True when this dispatch claimed something and was closed with no verdict.
+
+        Precisely: the state is ``terminated``; no ``verified``/``contradicted``
+        transition was ever appended (:attr:`verdict` is None); at least one
+        ``reported`` transition exists (there was a claim to grade); and the
+        terminate reason is not a park (``parked: ...`` is the operator closing
+        it on purpose, with the reason on record — it renders as ``parked``,
+        not as a silent miss). A dispatch terminated straight from
+        ``dispatched`` is excluded: it never claimed anything, so nothing
+        went ungraded — it died, and the terminate reason says how.
+
+        This is the shape of the silent fail-open observed in a field
+        deployment on Windows: dispatched, reported, terminated 8 ms later,
+        no verdict, ever — and the board's ``done`` column read clean.
+        """
+        if not self.is_terminal or self.verdict is not None:
+            return False
+        if is_parked_reason(self.terminate_reason):
+            return False
+        return any(isinstance(t, dict) and t.get("state") == STATE_REPORTED
+                   for t in self.transitions)
+
+    @property
     def agent_id(self) -> str | None:
         """The harness agent id this dispatch tracks, or None if not agent-backed."""
         if not isinstance(self.agent, dict):
@@ -461,6 +486,7 @@ class DispatchRecord:
             "has_report": self.has_report,
             "report_count": self.report_count,
             "block_count": self.block_count,
+            "terminated_ungraded": self.terminated_ungraded,
         }
 
 
@@ -571,6 +597,37 @@ def list_dispatches(
             continue
         out.append(record)
     return out
+
+
+def list_ungraded_terminations(session_id: str | None) -> list[DispatchRecord]:
+    """Dispatches in ``session_id`` that :attr:`DispatchRecord.terminated_ungraded`, newest first.
+
+    ``None`` session means every dispatch on disk (the caller says so in its
+    wording). This is the count both the fleet board and the bridge Stop
+    gate announce: an absent grade is not a passing grade, and a board
+    column nobody is required to read is not an announcement.
+    """
+    return [r for r in list_dispatches(session_id=session_id) if r.terminated_ungraded]
+
+
+def ungraded_termination_line(ungraded: list[DispatchRecord], scope_known: bool) -> str | None:
+    """The one line that says a claim was closed with no verdict, or None when none was.
+
+    Shared by the fleet board and the bridge Stop gate so the dispatcher
+    reads the same sentence in both places. The ``ungraded`` column and its
+    legend were already honest; they were honest on a board nobody is
+    required to look at, and a re-messaged teammate's second turn closed
+    ungraded and rendered ``done`` with nobody the wiser (observed in a
+    field deployment on Windows). Silence when the count is zero — the line
+    is a signal, not a header.
+    """
+    if not ungraded:
+        return None
+    scope = "this session" if scope_known else "in the dispatches shown"
+    ids = ", ".join(r.run_id for r in ungraded)
+    return (f"{len(ungraded)} dispatch(es) terminated ungraded {scope} — {ids}. "
+            "A claim was recorded and closed with no verdict; an absent grade "
+            "is not a passing grade.")
 
 
 def find_dispatch_by_agent(session_id: str | None, agent_id: str | None) -> DispatchRecord | None:
@@ -705,13 +762,18 @@ def find_inheritable_intent(
     """
     if not session_id or not agent_type:
         return None
+    candidates = []
     for record in list_dispatches(session_id=session_id):
         agent = record.agent if isinstance(record.agent, dict) else {}
-        if agent.get("agent_type") != agent_type:
-            continue
-        if carried_declared_intent(record):
-            return record
-    return None
+        if agent.get("agent_type") == agent_type and carried_declared_intent(record):
+            candidates.append(record)
+    if not candidates:
+        return None
+    # "Newest" by started_at (microsecond ISO on _root.json), not by run-id
+    # order: run ids are second-resolution plus a hash, so two dispatches
+    # in the same second sort by hash — and the wrong link in a chain of
+    # re-messages would inherit a stale contract.
+    return max(candidates, key=lambda r: (r.started_at or "", r.run_id))
 
 
 # === Tier inference ===

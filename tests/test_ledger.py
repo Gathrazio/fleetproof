@@ -946,3 +946,45 @@ def test_inherited_tier_source_requires_its_source_and_vice_versa(ledger_runs):
     # A 0.4.0 record has no such field; it reads back as None.
     assert load_dispatch(source).inherited_from is None
 
+
+# === "terminated ungraded", precisely ===
+
+def test_terminated_ungraded_is_reported_then_closed_with_no_verdict(ledger_runs):
+    # The field shape: dispatched -> reported -> terminated, no verdict, ever.
+    from fleetproof.ledger import list_ungraded_terminations
+    run_id = create_dispatch("work", tier="lane")
+    record_report(run_id, _ok_report())
+    close_dispatch(run_id, by="hook")
+    record = load_dispatch(run_id)
+    assert record.terminated_ungraded is True
+    assert record.to_dict()["terminated_ungraded"] is True
+    assert [r.run_id for r in list_ungraded_terminations(None)] == [run_id]
+
+
+def test_terminated_ungraded_excludes_graded_unreported_parked_and_open(ledger_runs):
+    from fleetproof.ledger import REASON_PARKED_PREFIX, REASON_SWEEP_IDLE
+    # Graded then closed: a verdict is on record.
+    graded = create_dispatch("a", tier="lane")
+    record_report(graded, _ok_report())
+    record_verdict(graded, STATE_VERIFIED)
+    close_dispatch(graded)
+    assert load_dispatch(graded).terminated_ungraded is False
+    # Contradicted then abandoned: the verdict stands.
+    contradicted = create_dispatch("b", tier="lane")
+    record_report(contradicted, _ok_report())
+    record_verdict(contradicted, STATE_CONTRADICTED)
+    close_dispatch(contradicted)
+    assert load_dispatch(contradicted).terminated_ungraded is False
+    # Died before it ever reported: nothing was claimed, so nothing went ungraded.
+    died = create_dispatch("c", tier="lane")
+    close_dispatch(died, reason=REASON_SWEEP_IDLE)
+    assert load_dispatch(died).terminated_ungraded is False
+    # Parked after reporting: the operator closed it on purpose, reason kept.
+    parked = create_dispatch("d", tier="lane")
+    record_report(parked, _ok_report())
+    close_dispatch(parked, reason=REASON_PARKED_PREFIX + "grader defect")
+    assert load_dispatch(parked).terminated_ungraded is False
+    # Reported and still open (stalled): not terminated at all.
+    stalled = create_dispatch("e", tier="lane")
+    record_report(stalled, _ok_report())
+    assert load_dispatch(stalled).terminated_ungraded is False

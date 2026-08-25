@@ -70,8 +70,10 @@ from .ledger import (
     create_dispatch,
     list_dispatches,
     list_orphan_stops,
+    list_ungraded_terminations,
     load_dispatch,
     record_report,
+    ungraded_termination_line,
     write_intent,
 )
 # The board and the HTML report describe a dispatch with the same words, defined
@@ -644,6 +646,13 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
         return _cmd_fleet_orphans(args)
     records = list_dispatches(session_id=args.session, non_terminal_only=args.open)
     orphans = list_orphan_stops(session_id=args.session)
+    # "This session" is the --session filter, else the hook session the CLI
+    # is running inside (FLEETPROOF_SESSION_ID); with neither, the count runs
+    # over everything on the board and the wording says so. Counted off the
+    # ledger directly, not off `records`, so --open cannot hide it.
+    scope_session = args.session or os.environ.get(SESSION_ID_ENV) or None
+    ungraded = list_ungraded_terminations(scope_session)
+    ungraded_line = ungraded_termination_line(ungraded, scope_known=bool(scope_session))
     # The board echoes a disarmed bridge gate whenever it is advisory — the
     # armed default stays quiet. Silence here is what makes the echo a signal.
     arming = load_arming()
@@ -654,6 +663,8 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
                 dict(r.to_dict(), age=_format_age(r.started_at)) for r in records
             ],
             "orphan_stop_count": len(orphans),
+            "terminated_ungraded_count": len(ungraded),
+            "terminated_ungraded": [r.run_id for r in ungraded],
         }
         if advisory:
             payload["arming"] = arming
@@ -665,6 +676,8 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
         print("No dispatches found.")
         if orphans:
             print(_orphan_count_line(orphans))
+        if ungraded_line:
+            print(ungraded_line)
         return 0
     print(f"{'run_id':<24} {'state':<26} {'tier':<12} {'agent':<18} "
           f"{'verdict':<13} {'age':>7} {'session':<14}")
@@ -694,6 +707,8 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
               "graded further.")
     if orphans:
         print(_orphan_count_line(orphans))
+    if ungraded_line:
+        print(ungraded_line)
     return 0
 
 

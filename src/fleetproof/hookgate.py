@@ -82,11 +82,13 @@ from .ledger import (
     find_inheritable_intent,
     intents_dir,
     list_dispatches,
+    list_ungraded_terminations,
     load_dispatch,
     record_block,
     record_orphan_stop,
     record_report,
     record_verdict,
+    ungraded_termination_line,
 )
 from .runlog import SESSION_ID_ENV, record, runs_dir
 from .telemetry import build_telemetry
@@ -445,6 +447,7 @@ def stop_gate() -> tuple[dict[str, Any] | None, int]:
     if stalled:
         stalled_reason = _stalled_reason(stalled)
         reason = f"{reason} {stalled_reason}" if reason else stalled_reason
+    _announce_ungraded_terminations(session_id)
 
     context_parts = [p for p in (context, _ledger_context(stalled, in_fleet)) if p]
     if reason is None and not context_parts:
@@ -460,6 +463,29 @@ def stop_gate() -> tuple[dict[str, Any] | None, int]:
             "additionalContext": "\n".join(context_parts),
         }
     return decision, 0
+
+
+def _announce_ungraded_terminations(session_id: str | None) -> None:
+    """One stderr line per bridge stop naming this session's ungraded terminations.
+
+    The simpler of the two designs on offer, chosen and documented here: every
+    ungraded terminal dispatch in the session is named on every bridge stop,
+    rather than only those since the previous stop. No marker file, no
+    state, nothing to get out of sync — and a bridge sees the line for as
+    long as the condition holds, which is the point: a claim that was
+    closed with no verdict does not stop being ungraded because a turn
+    ended. Stderr only, never a block and never additionalContext — the
+    dispatch is already terminal, the sweep has nothing to hold the bridge
+    on, and the existing "a terminated dispatch is not the sweep's business"
+    contract stays byte-identical on stdout. Wording shared with the fleet
+    board (:func:`fleetproof.ledger.ungraded_termination_line`).
+    """
+    if not session_id:
+        return
+    line = ungraded_termination_line(
+        list_ungraded_terminations(session_id), scope_known=True)
+    if line:
+        sys.stderr.write(f"[fleetproof] {line}\n")
 
 
 def _drift_context(
