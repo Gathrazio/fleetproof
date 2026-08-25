@@ -291,7 +291,10 @@ def test_subagent_start_creates_lane_dispatch_with_agent_block(tmp_path, monkeyp
     assert len(dispatches) == 1
     d = dispatches[0]
     assert d.tier == "lane"
-    assert d.tier_source == "declared"
+    # No intent declared this tier — it is the capture default, and the one
+    # provenance field that could reveal an intent miss must say so instead of
+    # asserting the opposite (observed in a field deployment on Windows).
+    assert d.tier_source == "defaulted"
     assert d.agent == {"agent_id": "agent-1", "agent_type": "tester", "capture": "start"}
     assert d.session_id == "sess-fleet"
     assert d.state == "dispatched"
@@ -797,7 +800,27 @@ def test_invalid_intent_tier_falls_back_to_the_captured_default(
     d = list_dispatches()[0]
     assert d.prompt == _INTENT_PROMPT
     assert d.tier == "lane"
+    # The declared tier was unusable, so the recorded one is a default.
+    assert d.tier_source == "defaulted"
     assert "captain" in capsys.readouterr().err
+
+
+def test_intent_without_a_tier_records_a_defaulted_tier_source(tmp_path, monkeypatch):
+    # An intent that declares a prompt but no tier still lands on the capture
+    # default: the tier is defaulted, not declared, and the record must not
+    # claim otherwise.
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import list_dispatches, write_intent
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    write_intent("tester", _INTENT_PROMPT)
+
+    _feed(monkeypatch, _start_payload())
+    assert subagent_start_main() == 0
+
+    d = list_dispatches()[0]
+    assert d.prompt == _INTENT_PROMPT
+    assert d.tier == "lane"
+    assert d.tier_source == "defaulted"
 
 
 def test_intent_miss_is_loud_on_stderr(tmp_path, monkeypatch, capsys):

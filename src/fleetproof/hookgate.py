@@ -64,6 +64,7 @@ from .ledger import (
     STATE_DISPATCHED,
     STATE_VERIFIED,
     TIER_BRIDGE,
+    TIER_SOURCE_DEFAULTED,
     LedgerError,
     close_dispatch,
     consume_intent,
@@ -427,10 +428,14 @@ def capture_subagent_start(payload: dict[str, Any]) -> str:
             f"{_sidecar_listing()}.\n")
     prompt = intent["prompt"] if intent else _placeholder_prompt(agent_type)
     manifest = intent["manifest"] if intent else None
-    tier = (intent["tier"] if intent else None) or CAPTURED_SUBAGENT_TIER
+    intent_tier = intent["tier"] if intent else None
+    # Only an intent-declared tier is a declaration. The lane fallback records
+    # tier_source="defaulted": the one provenance field that could reveal an
+    # intent miss must not assert a declaration nobody made.
     return create_dispatch(
         prompt,
-        tier=tier,
+        tier=intent_tier or CAPTURED_SUBAGENT_TIER,
+        tier_source=None if intent_tier else TIER_SOURCE_DEFAULTED,
         manifest=manifest,
         agent={"agent_id": agent_id, "agent_type": agent_type, "capture": CAPTURE_START},
         intent_source=intent["source"] if intent else None,

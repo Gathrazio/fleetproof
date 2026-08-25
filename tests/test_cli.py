@@ -304,6 +304,21 @@ def test_fleet_board_labels_state_tier_agent_and_verdict(cli_runs, capsys):
     out.encode("cp1252")
 
 
+def test_fleet_board_marks_a_defaulted_tier_with_a_question_mark(cli_runs, capsys):
+    # 'lane!' claims the dispatcher declared the tier; a capture that fell back
+    # to the default must read as 'lane?' — a defaulted tier is a hint that an
+    # intent went missing, and the ! marker asserted the opposite.
+    from fleetproof.ledger import TIER_SOURCE_DEFAULTED, create_dispatch
+    create_dispatch("captured with no intent", tier="lane",
+                    tier_source=TIER_SOURCE_DEFAULTED)
+    assert main(["fleet"]) == 0
+    out = capsys.readouterr().out
+    assert "lane?" in out
+    assert "lane!" not in out
+    assert "tier? = defaulted (no intent matched)" in out
+    out.encode("cp1252")
+
+
 def test_fleet_json_still_emits_the_full_records(cli_runs, capsys):
     # The human board changed shape; the machine-readable form must not.
     run_id = _dispatch_new(capsys)

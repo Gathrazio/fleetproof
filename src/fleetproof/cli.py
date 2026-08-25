@@ -546,8 +546,8 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
           f"{ungraded} ungraded.")
     # The legend is not decoration: '!' and '(stalled)' are load-bearing and an
     # unexplained marker on an audit surface is worse than no marker.
-    print("tier! = declared, not inferred.  (stalled) = reported or graded but "
-          "never closed.")
+    print("tier! = declared, not inferred.  tier? = defaulted (no intent "
+          "matched).  (stalled) = reported or graded but never closed.")
     print("ungraded = no verdict on record; an absent grade is not a passing grade.")
     if orphans:
         print(_orphan_count_line(orphans))

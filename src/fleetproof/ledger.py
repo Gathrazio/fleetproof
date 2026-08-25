@@ -139,6 +139,18 @@ TIERS = VALID_TIERS
 
 TIER_SOURCE_INFERRED = "inferred"
 TIER_SOURCE_DECLARED = "declared"
+# The third provenance: nobody declared this tier and nothing inferred it — it
+# is the capture fallback. Split out from "declared" because a defaulted tier
+# is the strongest available hint that an intent went missing, and recording
+# it as declared asserted the opposite (observed in a field deployment on
+# Windows).
+TIER_SOURCE_DEFAULTED = "defaulted"
+
+VALID_TIER_SOURCES = frozenset({
+    TIER_SOURCE_INFERRED,
+    TIER_SOURCE_DECLARED,
+    TIER_SOURCE_DEFAULTED,
+})
 
 # Evidence kinds a reported deliverable may claim, weakest last. "executed" means
 # a command ran and its result is on record; "believed" means nobody checked.
@@ -895,6 +907,7 @@ def create_dispatch(
     parent_run_id: str | None = None,
     agent: dict[str, Any] | None = None,
     intent_source: dict[str, Any] | None = None,
+    tier_source: str | None = None,
     by: str = "cli",
     spec_path: Path | None = None,
 ) -> str:
@@ -907,7 +920,10 @@ def create_dispatch(
     that was in force when the work was ordered.
 
     ``tier`` omitted means infer it (recorded as ``tier_source="inferred"``);
-    passing one records ``"declared"``. ``manifest`` omitted means derive one from
+    passing one records ``"declared"`` — unless ``tier_source`` overrides the
+    attribution explicitly, which is how a capture that fell back to a default
+    tier records ``"defaulted"`` instead of a declaration nobody made.
+    ``manifest`` omitted means derive one from
     the prompt. ``agent`` records the harness subagent this dispatch stands for
     (``agent_id``/``agent_type``/``capture``), which is what lets a later
     SubagentStop find this record again. ``intent_source`` attributes the
@@ -923,10 +939,17 @@ def create_dispatch(
 
     if tier is None:
         resolved_tier = infer_tier(resolved_parent)
-        tier_source = TIER_SOURCE_INFERRED
+        resolved_tier_source = TIER_SOURCE_INFERRED
     else:
         resolved_tier = _validate_tier(tier)
-        tier_source = TIER_SOURCE_DECLARED
+        resolved_tier_source = TIER_SOURCE_DECLARED
+    if tier_source is not None:
+        if tier_source not in VALID_TIER_SOURCES:
+            raise LedgerError(
+                f"Unknown tier_source {tier_source!r}; expected one of "
+                f"{sorted(VALID_TIER_SOURCES)} or omit it."
+            )
+        resolved_tier_source = tier_source
 
     if manifest is None:
         resolved_manifest = derive_manifest(prompt)
@@ -956,7 +979,7 @@ def create_dispatch(
     dispatch: dict[str, Any] = {
         "prompt": prompt,
         "tier": resolved_tier,
-        "tier_source": tier_source,
+        "tier_source": resolved_tier_source,
         "manifest": resolved_manifest,
         "spec_sha256_pinned": spec_hash(spec_path),
         "transitions": [_transition(STATE_DISPATCHED, by)],

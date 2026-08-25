@@ -98,6 +98,22 @@ def test_create_records_session_id_from_env(ledger_runs, monkeypatch):
     assert record.session_id == "sess-fleet"
 
 
+def test_create_dispatch_tier_source_override(ledger_runs):
+    # The caller can say explicitly HOW the tier was arrived at — a capture
+    # that fell back to the lane default records "defaulted", never the
+    # "declared" its non-None tier argument would otherwise imply.
+    from fleetproof.ledger import TIER_SOURCE_DEFAULTED
+    record = load_dispatch(create_dispatch(
+        "captured work", tier="lane", tier_source=TIER_SOURCE_DEFAULTED))
+    assert record.tier == "lane"
+    assert record.tier_source == "defaulted"
+
+
+def test_create_dispatch_rejects_an_unknown_tier_source(ledger_runs):
+    with pytest.raises(LedgerError):
+        create_dispatch("work", tier="lane", tier_source="guessed")
+
+
 def test_create_defaults_parent_to_current_run(ledger_runs, monkeypatch):
     parent = create_dispatch("bridge work")
     monkeypatch.setenv(runlog.RUN_ID_ENV, parent)

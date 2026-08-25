@@ -37,6 +37,7 @@ from .ledger import (
     STATE_TERMINATED,
     STATE_VERIFIED,
     TIER_SOURCE_DECLARED,
+    TIER_SOURCE_DEFAULTED,
     DispatchRecord,
 )
 from .runlog import RunRecord, list_run_records
@@ -87,15 +88,23 @@ def state_label(dispatch: DispatchRecord) -> str:
 
 
 def tier_label(dispatch: DispatchRecord) -> str:
-    """Tier, with a trailing '!' when it was declared rather than inferred.
+    """Tier, with a trailing '!' when declared and '?' when defaulted.
 
     Inference is a guess off the shape of the run tree, and it degrades to ``lane``
-    when a parent record is unreadable — so which of the two produced this tier
-    changes how much the tier is worth. One character keeps the column skimmable.
+    when a parent record is unreadable — so which of the three produced this tier
+    changes how much the tier is worth. A defaulted tier ('?') means no intent
+    declared one and the capture fell back — the visible trace of a missed
+    intent, which the '!' marker used to paper over by claiming a declaration.
+    One character keeps the column skimmable.
     """
     if not dispatch.tier:
         return "-"
-    marker = "!" if dispatch.tier_source == TIER_SOURCE_DECLARED else ""
+    if dispatch.tier_source == TIER_SOURCE_DECLARED:
+        marker = "!"
+    elif dispatch.tier_source == TIER_SOURCE_DEFAULTED:
+        marker = "?"
+    else:
+        marker = ""
     return f"{dispatch.tier}{marker}"
 
 
