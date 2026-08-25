@@ -1954,3 +1954,140 @@ def test_a_field_shaped_ungraded_stop_is_announced_at_the_next_bridge_stop(
     # and unchanged; the announcement rides on stderr regardless.)
     stop_gate()
     assert f"terminated ungraded this session — {d.run_id}" in capsys.readouterr().err
+
+
+# === manifest checks carry the full spec-check shape (C4) ===
+
+def _manifest_with(*entries):
+    manifest = _intent_manifest(cmd_exit=0)
+    manifest["checks"] = list(entries)
+    manifest["check_map"] = {"the widget refactor": [e["id"] for e in entries
+                                                    if isinstance(e, dict) and "id" in e]}
+    return manifest
+
+
+def _last_verdict_checks() -> list[dict]:
+    for run in runlog.list_run_records():
+        for sub in run.sub_invocations:
+            if sub.tool == "fleetproof" and sub.subcmd == "check":
+                payload = sub.load_output()
+                if isinstance(payload, dict):
+                    return payload.get("checks", [])
+    return []
+
+
+def test_owned_manifest_check_is_advisory_at_the_wrong_seat(tmp_path, monkeypatch, capsys):
+    # The field's verbatim rendering, now reachable from a manifest: the check
+    # runs, fails, renders as owned-elsewhere, and neither blocks nor
+    # contradicts the lane dispatch it was declared on.
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _spawn_with_intent(tmp_path, monkeypatch, _manifest_with(
+        {"id": "m-owned", "cmd": f'"{sys.executable}" -c "raise SystemExit(1)"',
+         "owner": "operator"}))
+
+    _feed(monkeypatch, _stop_payload(message="Did the lane part."))
+    assert subagent_stop_main() == 0
+    assert capsys.readouterr().out == ""  # allowed to stop
+
+    d = list_dispatches()[0]
+    assert d.verdict == "verified"
+    assert not any(t.get("state") == "contradicted" for t in d.transitions)
+    [result] = _last_verdict_checks()
+    assert result["blocking"] is False
+    assert result["detail"] == "exit 1 (expected 0); owner: operator — advisory at tier lane"
+
+
+def test_block_false_manifest_check_fails_without_contradicting(tmp_path, monkeypatch, capsys):
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _spawn_with_intent(tmp_path, monkeypatch, _manifest_with(
+        {"id": "m-advisory", "cmd": f'"{sys.executable}" -c "raise SystemExit(1)"',
+         "block": False, "description": "slow suite, advisory"}))
+
+    _feed(monkeypatch, _stop_payload(message="Done."))
+    assert subagent_stop_main() == 0
+    assert capsys.readouterr().out == ""
+
+    d = list_dispatches()[0]
+    assert d.verdict == "verified"
+    [result] = _last_verdict_checks()
+    assert result["passed"] is False and result["blocking"] is False
+
+
+def test_manifest_check_expect_regex_and_exit_code(tmp_path, monkeypatch, capsys):
+    # Every expectation kind checks.py supports reaches the manifest through
+    # the same normalizer; two of them exercised end to end.
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _spawn_with_intent(tmp_path, monkeypatch, _manifest_with(
+        {"id": "m-regex", "cmd": [sys.executable, "-c", "print('ALL_GREEN 7')"],
+         "expect": {"regex": r"ALL_GREEN \d+"}},
+        {"id": "m-exit3", "run": f'"{sys.executable}" -c "raise SystemExit(3)"',
+         "expect": {"exit": 3}}))
+
+    _feed(monkeypatch, _stop_payload(message="Done."))
+    assert subagent_stop_main() == 0
+    assert capsys.readouterr().out == ""
+    assert _graded_check_ids() == ["m-regex", "m-exit3"]
+    assert list_dispatches()[0].verdict == "verified"
+    results = {r["id"]: r for r in _last_verdict_checks()}
+    assert results["m-regex"]["expectation"] == r"output matches /ALL_GREEN \d+/"
+    assert results["m-exit3"]["expectation"] == "exit code 3"
+
+
+def test_manifest_check_regex_that_does_not_match_blocks(tmp_path, monkeypatch, capsys):
+    from fleetproof.hookgate import subagent_stop_main
+    _spawn_with_intent(tmp_path, monkeypatch, _manifest_with(
+        {"id": "m-regex", "cmd": [sys.executable, "-c", "print('nope')"],
+         "expect": {"regex": "ALL_GREEN"}}))
+    _feed(monkeypatch, _stop_payload(message="Done."))
+    assert subagent_stop_main() == 0
+    decision = json.loads(capsys.readouterr().out)
+    assert decision["decision"] == "block"
+    assert "no match for /ALL_GREEN/" in decision["reason"]
+
+
+def test_manifest_check_redact_pattern_applies_to_the_persisted_tail(
+        tmp_path, monkeypatch, capsys):
+    from fleetproof.hookgate import subagent_stop_main
+    _spawn_with_intent(tmp_path, monkeypatch, _manifest_with(
+        {"id": "m-redact", "cmd": [sys.executable, "-c", "print('hostpw=hunter2')"],
+         "redact": [r"hostpw=\S+"]}))
+    _feed(monkeypatch, _stop_payload(message="Done."))
+    assert subagent_stop_main() == 0
+    [result] = _last_verdict_checks()
+    assert "hunter2" not in result["stdout_tail"]
+    assert "[REDACTED:custom]" in result["stdout_tail"]
+
+
+def test_legacy_id_cmd_manifest_check_is_unchanged(tmp_path, monkeypatch, capsys):
+    # {"id","cmd"} still parses to blocking, expect-exit0, the manifest
+    # description — exactly what 0.4.0 recorded for it.
+    from fleetproof.hookgate import _manifest_checks
+    from fleetproof.ledger import list_dispatches
+    _spawn_with_intent(tmp_path, monkeypatch, _intent_manifest(cmd_exit=0))
+    [check] = _manifest_checks(list_dispatches()[0])
+    assert check.id == "m-widget"
+    assert check.block is True
+    assert check.expect == {"kind": "exit0"}
+    assert check.owner is None and check.redact == () and check.tier is None
+    assert check.description == "dispatch-manifest check"
+
+
+def test_manifest_check_with_a_tier_is_skipped_loudly(tmp_path, monkeypatch, capsys):
+    # A manifest is graded at its dispatch's tier; an entry that tries to
+    # declare one is malformed, skipped, and said — never half-run.
+    from fleetproof.hookgate import subagent_stop_main
+    _spawn_with_intent(tmp_path, monkeypatch, _manifest_with(
+        {"id": "m-tiered", "cmd": f'"{sys.executable}" -c "raise SystemExit(0)"',
+         "tier": "lane"},
+        {"id": "m-bad-expect", "cmd": f'"{sys.executable}" -c "raise SystemExit(0)"',
+         "expect": {"bogus": 1}},
+        {"id": "m-ok", "cmd": f'"{sys.executable}" -c "raise SystemExit(0)"'}))
+    _feed(monkeypatch, _stop_payload(message="Done."))
+    assert subagent_stop_main() == 0
+    err = capsys.readouterr().err
+    assert "'tier' is not a manifest field" in err
+    assert "unknown expect kind 'bogus'" in err
+    assert _graded_check_ids() == ["m-ok"]

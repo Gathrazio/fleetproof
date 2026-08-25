@@ -453,8 +453,12 @@ Beyond `{ "id", "run", "expect", "block" }`, a check can declare a `tier`
 captured output before anything is persisted. `run` may also be a JSON array
 of argv strings, executed with `shell=False` — no shell at all, which on
 Windows means no cmd.exe quoting hazards; the string form keeps shell
-semantics for compatibility. Manifest checks (`{ "id", "cmd" }`) accept the
-same array form. Checks execute from the resolved project root, not from
+semantics for compatibility. Manifest checks — the `checks` array of a
+dispatch manifest — carry the same shape with `cmd` in place of `run` (`run`
+is accepted as an alias): `expect` of every kind, `block`, `owner`, `redact`,
+`description`. Only `tier` is refused there, because a manifest is graded at
+its own dispatch's tier. A bare `{ "id", "cmd" }` entry still means blocking,
+exit-0. Checks execute from the resolved project root, not from
 wherever the hook's shell happened to be `cd`'d, and every rendered verdict
 prints the cwd it ran from.
 

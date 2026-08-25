@@ -280,8 +280,58 @@ def load_checks(path: Path | None = None) -> list[Check]:
     return checks
 
 
-def _parse_check(entry: Any, index: int) -> Check:
-    where = f"checks[{index}]"
+# The key a dispatch manifest uses for its command. A manifest predates the
+# spec's ``run`` vocabulary and every field deployment writes ``cmd``; ``run``
+# is accepted as an alias so a check can be moved between the two files by
+# copying the entry.
+MANIFEST_CMD_KEY = "cmd"
+MANIFEST_CHECK_DESCRIPTION = "dispatch-manifest check"
+
+
+def parse_manifest_check(entry: Any, where: str) -> Check:
+    """Parse one dispatch-manifest check entry with the spec's own parser.
+
+    A manifest check accepts everything a ``checks.json`` check accepts —
+    ``expect`` (every kind), ``block`` (default true), ``owner``, ``redact``,
+    ``description`` — with two differences: the command key is ``cmd``
+    (``run`` accepted as an alias), and ``tier`` is refused, because a
+    manifest is already per-dispatch and the dispatch's own tier is the only
+    tier its checks can be graded at. Everything else is delegated to
+    :func:`_parse_check`, so the two files can never disagree about what an
+    expectation means. In the field every lane-grading check was a manifest
+    check and the manifest shape was ``{"id", "cmd"}`` only — so ``owner``,
+    the anti-wedge field, governed nothing that graded a lane (observed in a
+    field deployment on Windows).
+
+    ``where`` names the entry in error text (the manifest has no file:index
+    the spec parser could name). Raises :class:`CheckSpecError`; the gate
+    turns that into skipped-with-stderr, never a half-run check.
+    """
+    if not isinstance(entry, dict):
+        raise CheckSpecError(f"{where} is not an object.")
+    if "tier" in entry:
+        raise CheckSpecError(
+            f"{where}: 'tier' is not a manifest field — a manifest is graded at "
+            "its own dispatch's tier.")
+    normalized = dict(entry)
+    cmd = normalized.pop(MANIFEST_CMD_KEY, None)
+    if cmd is None:
+        cmd = normalized.pop("run", None)
+    else:
+        normalized.pop("run", None)
+    if isinstance(cmd, str) and not cmd.strip():
+        raise CheckSpecError(f"{where}: '{MANIFEST_CMD_KEY}' must not be blank.")
+    normalized["run"] = cmd
+    normalized.setdefault("description", MANIFEST_CHECK_DESCRIPTION)
+    return _parse_check(normalized, 0, where=where, run_key=MANIFEST_CMD_KEY)
+
+
+def _parse_check(entry: Any, index: int, *, where: str | None = None,
+                 run_key: str = "run") -> Check:
+    # ``where`` overrides the spec's "checks[i]" location for a caller that
+    # has a better name for the entry; ``run_key`` is only how the command
+    # field is *named* in error text (the manifest says ``cmd``).
+    where = where or f"checks[{index}]"
     if not isinstance(entry, dict):
         raise CheckSpecError(f"{where} must be an object.")
 
@@ -292,14 +342,14 @@ def _parse_check(entry: Any, index: int) -> Check:
     run = entry.get("run")
     if run is not None and not isinstance(run, (str, list)):
         raise CheckSpecError(
-            f"{where} ({cid}): 'run' must be a string, an array of strings, "
+            f"{where} ({cid}): '{run_key}' must be a string, an array of strings, "
             "or omitted.")
     if isinstance(run, str) and ("\n" in run or "\r" in run):
         # cmd.exe executes only the first line and silently discards the rest,
         # inheriting line 1's exit code (finding H5) — a check that half-runs is
         # worse than one that refuses to parse.
         raise CheckSpecError(
-            f"{where} ({cid}): 'run' must be a single line — on Windows only the "
+            f"{where} ({cid}): '{run_key}' must be a single line — on Windows only the "
             "first line would execute. Chain with '&&' or call a script instead."
         )
     if isinstance(run, list):
@@ -309,14 +359,14 @@ def _parse_check(entry: Any, index: int) -> Check:
         # name a program to run.
         if not run:
             raise CheckSpecError(
-                f"{where} ({cid}): argv-form 'run' needs at least one element.")
+                f"{where} ({cid}): argv-form '{run_key}' needs at least one element.")
         for j, element in enumerate(run):
             if not isinstance(element, str):
                 raise CheckSpecError(
-                    f"{where} ({cid}): 'run'[{j}] must be a string.")
+                    f"{where} ({cid}): '{run_key}'[{j}] must be a string.")
             if "\n" in element or "\r" in element:
                 raise CheckSpecError(
-                    f"{where} ({cid}): 'run'[{j}] must be a single line.")
+                    f"{where} ({cid}): '{run_key}'[{j}] must be a single line.")
 
     block = entry.get("block", True)
     if not isinstance(block, bool):
@@ -358,7 +408,7 @@ def _parse_check(entry: Any, index: int) -> Check:
     # A file_exists check may have no command; every other kind needs one.
     if run is None and expect["kind"] != "file_exists":
         raise CheckSpecError(
-            f"{where} ({cid}): a '{expect['kind']}' check requires a 'run' command."
+            f"{where} ({cid}): a '{expect['kind']}' check requires a '{run_key}' command."
         )
 
     return Check(id=cid, run=run, expect=expect, block=block, description=description,

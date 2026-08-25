@@ -62,6 +62,7 @@ from .checks import (
     CheckSpecError,
     checks_tree_hash,
     load_checks,
+    parse_manifest_check,
     short_spec_hash,
     spec_hash,
 )
@@ -810,43 +811,29 @@ def _try_build_telemetry(run_id: str, check_report=None, checks=None) -> None:
         sys.stderr.write(f"[fleetproof] telemetry build failed for {run_id}: {e}\n")
 
 
-def _usable_manifest_cmd(cmd: Any) -> str | None:
-    """None when ``cmd`` is a runnable manifest command, else why it is not.
-
-    Mirrors the spec loader's rules for ``run``: a single-line string (shell
-    form, finding H5 — cmd.exe executes only the first line), or an argv array
-    of single-line strings (shell-free form, same as a spec check's argv
-    ``run``).
-    """
-    if isinstance(cmd, str):
-        if not cmd.strip():
-            return "'cmd' must not be blank"
-        if "\n" in cmd or "\r" in cmd:
-            return "'cmd' must be a single line"
-        return None
-    if isinstance(cmd, list):
-        if not cmd:
-            return "argv-form 'cmd' needs at least one element"
-        for j, element in enumerate(cmd):
-            if not isinstance(element, str):
-                return f"'cmd'[{j}] must be a string"
-            if "\n" in element or "\r" in element:
-                return f"'cmd'[{j}] must be a single line"
-        return None
-    return "'cmd' must be a string or an array of strings"
-
-
 def _manifest_checks(dispatch) -> list[Check]:
-    """Runnable blocking checks declared on the dispatch's own manifest.
+    """Runnable checks declared on the dispatch's own manifest, as full Checks.
 
-    A manifest check is an ``{"id", "cmd"}`` entry: always blocking, always
-    expect-exit0, with ``cmd`` either a shell line or an argv array — the same
-    two forms a spec check's ``run`` takes. The richer expectation kinds stay
-    a ``checks.json`` feature — the manifest is a per-dispatch contract, and
-    its checks exist so a manifest-bearing dispatch can grade without
-    pre-registering into the spec-hash-pinned repo file.
+    A manifest check carries the full spec-check shape — ``expect`` of every
+    kind, ``block`` (default true), ``owner``, ``redact``, ``description`` —
+    parsed by the same :func:`fleetproof.checks.parse_manifest_check` the
+    spec loader's rules are built from, so the two files cannot disagree
+    about what a check means. The command key is ``cmd`` (``run`` accepted);
+    ``tier`` is refused because a manifest is already per-dispatch. The
+    legacy ``{"id", "cmd"}`` entry parses exactly as before: blocking,
+    expect-exit0.
 
-    An entry that is not that shape is skipped with a stderr note rather than
+    This used to be the ``{"id", "cmd"}`` shape only, with the safety fields
+    "a checks.json feature". In the field every lane-grading check was a
+    manifest check and zero spec checks selected at lane tier, so ``owner`` —
+    the field that keeps a check nobody at the graded seat can satisfy from
+    wedging that seat — governed nothing that graded a lane (observed in a
+    field deployment on Windows). Ownership on a manifest check now has the
+    spec path's exact semantics: at any tier but the owner's it runs, renders
+    ``owner: <seat> — advisory at tier <tier>``, and cannot contradict the
+    dispatch.
+
+    An entry that does not parse is skipped with a stderr note rather than
     run half-parsed. A skipped check is never a passing check: its id never
     reaches the executed set, so the deliverable it vouched for reads as
     uncovered — the error lands on the self-critical side of the metric.
@@ -858,22 +845,15 @@ def _manifest_checks(dispatch) -> list[Check]:
     seen: set[str] = set()
     for i, entry in enumerate(entries):
         where = f"manifest check [{i}] on dispatch {dispatch.run_id}"
-        if not isinstance(entry, dict):
-            sys.stderr.write(f"[fleetproof] {where} is not an object; skipped\n")
+        try:
+            check = parse_manifest_check(entry, where)
+        except CheckSpecError as e:
+            sys.stderr.write(f"[fleetproof] {e}; skipped\n")
             continue
-        cid, cmd = entry.get("id"), entry.get("cmd")
-        if not isinstance(cid, str) or not cid:
-            sys.stderr.write(f"[fleetproof] {where} needs a string 'id'; skipped\n")
+        if check.id in seen:
             continue
-        problem = _usable_manifest_cmd(cmd)
-        if problem is not None:
-            sys.stderr.write(f"[fleetproof] {where}: {problem}; skipped\n")
-            continue
-        if cid in seen:
-            continue
-        seen.add(cid)
-        out.append(Check(id=cid, run=cmd, expect={"kind": "exit0"}, block=True,
-                         description="dispatch-manifest check"))
+        seen.add(check.id)
+        out.append(check)
     return out
 
 
@@ -904,7 +884,8 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
        proceeds ungraded: blocking would wedge tiers that have no stake in
        the edit at all.
     4. Grade the agent's own tier of the spec, unioned with the checks declared
-       on this dispatch's own manifest (blocking, expect-exit0). Blocking
+       on this dispatch's own manifest (full spec-check shape; see
+       :func:`_manifest_checks`). Blocking
        failure -> ``contradicted`` and block (the agent gets its turn back, and
        the retry re-reports onto this same dispatch) — unless this is the
        dispatch's :data:`MAX_CONTRADICTIONS`-th contradiction, which is

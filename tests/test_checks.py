@@ -298,3 +298,35 @@ def test_checker_tier_rejection_names_the_legal_tiers():
         select_checks([], "lead")
     assert "legal tiers: bridge, coordinator, lane, leaf" in str(excinfo.value)
 
+
+
+# === parse_manifest_check: the manifest shares the spec's parser (C4) ===
+
+def test_parse_manifest_check_accepts_run_as_an_alias_for_cmd():
+    from fleetproof.checks import parse_manifest_check
+    a = parse_manifest_check({"id": "x", "cmd": "echo a"}, "m[0]")
+    b = parse_manifest_check({"id": "x", "run": "echo a"}, "m[0]")
+    assert a.run == b.run == "echo a"
+    # cmd wins when both are present; run is dropped, not merged.
+    c = parse_manifest_check({"id": "x", "cmd": "echo a", "run": "echo b"}, "m[0]")
+    assert c.run == "echo a"
+
+
+def test_parse_manifest_check_names_the_entry_and_the_cmd_key_in_errors():
+    from fleetproof.checks import CheckSpecError, parse_manifest_check
+    with pytest.raises(CheckSpecError, match=r"m\[2\] \(x\): 'cmd' must be a single line"):
+        parse_manifest_check({"id": "x", "cmd": "a\nb"}, "m[2]")
+    with pytest.raises(CheckSpecError, match="'cmd' must not be blank"):
+        parse_manifest_check({"id": "x", "cmd": "   "}, "m[2]")
+    with pytest.raises(CheckSpecError, match="requires a 'cmd' command"):
+        parse_manifest_check({"id": "x"}, "m[2]")
+    with pytest.raises(CheckSpecError, match="is not an object"):
+        parse_manifest_check("junk", "m[2]")
+    with pytest.raises(CheckSpecError, match="'tier' is not a manifest field"):
+        parse_manifest_check({"id": "x", "cmd": "echo", "tier": "lane"}, "m[2]")
+
+
+def test_parse_manifest_check_file_exists_needs_no_cmd():
+    from fleetproof.checks import parse_manifest_check
+    c = parse_manifest_check({"id": "x", "expect": {"file_exists": "out.txt"}}, "m[0]")
+    assert c.run is None and c.expect == {"kind": "file_exists", "path": "out.txt"}
