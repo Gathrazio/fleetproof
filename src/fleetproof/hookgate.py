@@ -338,6 +338,8 @@ def _evidence_context(report, drifted: bool = False, baseline_hash: str | None =
         status = "pass" if r.passed else ("FAIL" if r.blocking else "warn")
         parts.append(f"- [{status}] {r.id}: {r.detail}")
     parts.append(f"Spec hash: {short_spec_hash(report.spec_sha256)}")
+    if getattr(report, "cwd", None):
+        parts.append(f"cwd: {report.cwd}")
     if report.run_id:
         parts.append(f"Evidence recorded under run {report.run_id} in .fleetproof/runs/.")
     return "\n".join(parts)

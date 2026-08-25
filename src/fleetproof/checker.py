@@ -30,7 +30,7 @@ from .checks import (
     short_spec_hash,
     spec_hash,
 )
-from .runlog import list_run_records, record, runs_dir
+from .runlog import list_run_records, project_root, record, runs_dir
 
 # Per-check wall-clock ceiling. A check that hangs is a failed check, not a hung fleet.
 DEFAULT_TIMEOUT_S = 600
@@ -60,6 +60,11 @@ class CheckReport:
     # Which tier's checks this verdict covers; None means "every check in the
     # spec" (the v0.1 behaviour). Additive — older records omit it entirely.
     tier: str | None = None
+    # The directory every check in this report executed from — on the verdict
+    # itself because a cwd surprise (a hook inheriting a shell that cd'd away)
+    # produces a wall of false reds that is undiagnosable without it. Additive:
+    # None on older records and on reports built without running.
+    cwd: str | None = None
 
     @property
     def total(self) -> int:
@@ -105,6 +110,7 @@ class CheckReport:
             # reader treats a missing value as None (no hash on record).
             "spec_sha256": self.spec_sha256,
             "tier": self.tier,
+            "cwd": self.cwd,
             "summary": {
                 "total": self.total,
                 "passed": self.passed,
@@ -262,7 +268,12 @@ def run_checks(
     """Run every selected check and (by default) append the verdict to the run log.
 
     ``checks`` defaults to the loaded ``.fleetproof/checks.json``. ``cwd`` defaults
-    to the current working directory — the directory the fleet actually worked in.
+    to the *project root* resolved from the current working directory — not the
+    cwd itself, because the checker usually runs inside a hook that inherits
+    whatever directory the working shell happened to be in, and a shell that
+    cd'd into a subdirectory turned every relative path in the spec into a
+    false red (observed in a field deployment on Windows). The spec's relative
+    paths are written against the repo, so the repo root is what they mean.
     ``spec_path`` is the check-spec file whose bytes get hashed onto the verdict;
     when omitted it is resolved from ``cwd`` the same way the checker itself finds
     the spec, so the recorded hash always describes the spec that governed the run.
@@ -276,11 +287,11 @@ def run_checks(
     if checks is None:
         checks = load_checks(spec_path)
     checks = select_checks(checks, tier)
-    work_dir = Path(cwd) if cwd is not None else Path.cwd()
+    work_dir = Path(cwd) if cwd is not None else project_root(Path.cwd())
     resolved_spec = Path(spec_path) if spec_path is not None else default_checks_path(work_dir)
     sha = spec_hash(resolved_spec)
 
-    report = CheckReport(spec_sha256=sha, tier=tier)
+    report = CheckReport(spec_sha256=sha, tier=tier, cwd=str(work_dir))
     if not record_to_log:
         for check in checks:
             report.results.append(run_check(check, work_dir, timeout))
@@ -364,6 +375,10 @@ def format_report_text(report: CheckReport) -> str:
             f"{s['blocking_failed']} blocking failure(s)."
         )
     lines.append(f"spec: {short_spec_hash(report.spec_sha256)}")
+    # Where the checks ran: the one fact that separates a real red from a
+    # cwd surprise. Omitted only on reports that never executed anything.
+    if report.cwd:
+        lines.append(f"cwd: {report.cwd}")
     # Only surfaced when scoped, so untiered (v0.1) output is byte-identical.
     if report.tier:
         lines.append(f"tier: {report.tier}")

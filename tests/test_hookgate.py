@@ -569,6 +569,31 @@ def test_subagent_gate_fails_open_but_loudly_when_it_breaks(tmp_path, monkeypatc
     assert "failed open" in captured.err
 
 
+def test_stop_gate_grades_from_the_project_root_not_the_shell_cwd(tmp_path, monkeypatch):
+    # The artifact exists at the project root; the shell happens to be deep in
+    # a subdirectory when the hook fires. Grading from the shell's cwd read
+    # this as missing — a false red on work that was actually done.
+    _setup_project(tmp_path, [
+        {"id": "artifact", "expect": {"file_exists": "artifact.txt"}, "block": True},
+    ], monkeypatch)
+    (tmp_path / "artifact.txt").write_text("real", encoding="utf-8")
+    sub = tmp_path / "deep" / "inside"
+    sub.mkdir(parents=True)
+    monkeypatch.chdir(sub)
+
+    decision, code = stop_gate()
+    assert code == 0
+    assert decision is None
+
+
+def test_gate_evidence_context_names_the_cwd(tmp_path, monkeypatch):
+    _setup_project(tmp_path, [_FAIL], monkeypatch)
+    decision, code = stop_gate()
+    assert decision["decision"] == "block"
+    ctx = decision["hookSpecificOutput"]["additionalContext"]
+    assert any(line.startswith("cwd: ") for line in ctx.splitlines())
+
+
 # === bridge Stop hook: ledger sweep ===
 
 def _make_dispatch(tier="lane", report=False):

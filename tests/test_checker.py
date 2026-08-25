@@ -166,6 +166,39 @@ def _tiered_set():
     ]
 
 
+# === checks execute from the project root, and say so ===
+
+def test_run_checks_defaults_cwd_to_the_project_root(tmp_path, monkeypatch):
+    # A hook fires with the shell's cwd, and a bridge that cd'd into a subdir
+    # graded every relative path from there — a wall of false reds (observed
+    # in a field deployment on Windows). The default cwd is the project root.
+    from fleetproof.checker import format_report_text
+    (tmp_path / ".fleetproof").mkdir()
+    (tmp_path / "artifact.txt").write_text("real", encoding="utf-8")
+    sub = tmp_path / "deep" / "inside"
+    sub.mkdir(parents=True)
+    monkeypatch.chdir(sub)
+
+    report = run_checks(
+        [_check("artifact", expect={"kind": "file_exists", "path": "artifact.txt"})],
+        record_to_log=False)
+    assert report.results[0].passed is True
+    assert Path(report.cwd).resolve() == tmp_path.resolve()
+    # And the verdict says where it graded, so a cwd surprise is diagnosable.
+    assert f"cwd: {report.cwd}" in format_report_text(report)
+
+
+def test_run_checks_explicit_cwd_still_wins(tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "artifact.txt").write_text("real", encoding="utf-8")
+    report = run_checks(
+        [_check("artifact", expect={"kind": "file_exists", "path": "artifact.txt"})],
+        cwd=elsewhere, record_to_log=False)
+    assert report.results[0].passed is True
+    assert Path(report.cwd) == elsewhere
+
+
 # === advisory verdict rendering ===
 
 _OK = f'"{sys.executable}" -c "raise SystemExit(0)"'
