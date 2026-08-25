@@ -242,6 +242,27 @@ def run_check(check: Check, cwd: Path, timeout: int = DEFAULT_TIMEOUT_S) -> Chec
     )
 
 
+def _apply_ownership(result: CheckResult, check: Check, tier: str | None) -> CheckResult:
+    """Demote an owned check to advisory when graded away from its owner's seat.
+
+    A blocking check with an ``owner`` is only a *blocking* check at the
+    owner's own tier; selected anywhere else it still runs — the criterion
+    stays visible — but its failure grades ``warn`` and cannot fail the
+    verdict. A check only the coordinator (or the operator, who is not an
+    agent tier at all) can satisfy wedged the lane it was assigned to through
+    an unwinnable retry loop (observed in a field deployment on Windows).
+    A run with no tier at all (the bare CLI's full-spec run) is the operator's
+    own surface, and the operator is the one seat every owner answers to, so
+    nothing is demoted there.
+    """
+    if check.owner is None or tier is None or check.owner == tier:
+        return result
+    result.blocking = False
+    if not result.passed:
+        result.detail += f"; owner: {check.owner} — advisory at tier {tier}"
+    return result
+
+
 def select_checks(checks: list[Check], tier: str | None) -> list[Check]:
     """The subset of ``checks`` that governs ``tier``.
 
@@ -301,13 +322,15 @@ def run_checks(
                          tier=tier, cwd=str(work_dir))
     if not record_to_log:
         for check in checks:
-            report.results.append(run_check(check, work_dir, timeout))
+            report.results.append(
+                _apply_ownership(run_check(check, work_dir, timeout), check, tier))
         return report
 
     with record("fleetproof", "check", {"check_count": len(checks), "tier": tier}) as handle:
         report.run_id = handle.run_id
         for check in checks:
-            report.results.append(run_check(check, work_dir, timeout))
+            report.results.append(
+                _apply_ownership(run_check(check, work_dir, timeout), check, tier))
         payload = report.to_dict()
         payload["recorded_from_pid"] = _self_pid()
         handle.set_output(payload)

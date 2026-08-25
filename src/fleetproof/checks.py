@@ -57,6 +57,12 @@ _VALID_EXPECT_KEYS = {"exit", "regex", "file_exists"}
 # spec hashing) can re-export it instead of the two disagreeing about spelling.
 VALID_TIERS = frozenset({"leaf", "lane", "coordinator", "bridge"})
 
+# Who can actually satisfy a check: any tier, or the operator — a seat outside
+# the fleet entirely, for criteria no agent can close out (a license renewal, a
+# signing ceremony). Validated with the same strictness as tiers: a typo'd
+# owner silently defaulting would silently re-arm the check at every seat.
+VALID_OWNERS = frozenset(VALID_TIERS | {"operator"})
+
 # The line a drifted verdict carries everywhere it surfaces (gate output, report,
 # CLI). One canonical string so the three surfaces never disagree about wording.
 SPEC_DRIFT_NOTE = (
@@ -92,6 +98,13 @@ class Check:
     # Additive: absent from a v0.1 spec entry, and read back as None there. None
     # means "untiered", which the checker scopes to the bridge tier.
     tier: str | None = None
+    # Which seat can actually satisfy this check (a tier, or "operator").
+    # Additive: absent means the check blocks wherever it is selected (the
+    # pre-ownership behaviour). When present and the check is graded at a
+    # different tier, it runs but grades advisory for that run — a blocking
+    # check nobody at the graded seat can fix is a wedge, not a gate
+    # (observed in a field deployment on Windows).
+    owner: str | None = None
 
     def describe_expectation(self) -> str:
         kind = self.expect["kind"]
@@ -262,6 +275,12 @@ def _parse_check(entry: Any, index: int) -> Check:
             f"{where} ({cid}): 'tier' must be one of {sorted(VALID_TIERS)} or omitted."
         )
 
+    owner = entry.get("owner")
+    if owner is not None and (not isinstance(owner, str) or owner not in VALID_OWNERS):
+        raise CheckSpecError(
+            f"{where} ({cid}): 'owner' must be one of {sorted(VALID_OWNERS)} or omitted."
+        )
+
     expect = _normalize_expect(entry.get("expect", "exit0"), cid, where)
 
     # A file_exists check may have no command; every other kind needs one.
@@ -271,7 +290,7 @@ def _parse_check(entry: Any, index: int) -> Check:
         )
 
     return Check(id=cid, run=run, expect=expect, block=block, description=description,
-                 tier=tier)
+                 tier=tier, owner=owner)
 
 
 def _normalize_expect(expect: Any, cid: str, where: str) -> dict[str, Any]:

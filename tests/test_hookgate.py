@@ -1506,3 +1506,29 @@ def test_abandonment_context_survives_a_stop_hook_retry(tmp_path, monkeypatch, c
     decision = json.loads(capsys.readouterr().out)
     assert "abandoned after 3 contradicted stops" in (
         decision["hookSpecificOutput"]["additionalContext"])
+
+
+# === check ownership at the subagent gate (B4) ===
+
+def test_owner_advisory_failure_never_contradicts_the_dispatch(
+        tmp_path, monkeypatch, capsys):
+    # A failing check owned by another seat grades advisory for this run: no
+    # block, no contradicted transition (so it can never feed the B3 ladder),
+    # and the dispatch verifies with the failure on record as a warn.
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    owned_fail = {"id": "release-signed",
+                  "run": f'"{sys.executable}" -c "raise SystemExit(1)"',
+                  "expect": "exit0", "owner": "coordinator"}
+    _setup_project(tmp_path, [owned_fail], monkeypatch)
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
+
+    _feed(monkeypatch, _stop_payload(message="Did my lane's part."))
+    assert subagent_stop_main() == 0
+    assert capsys.readouterr().out == ""  # allowed to stop
+
+    d = list_dispatches()[0]
+    assert d.verdict == "verified"
+    assert d.state == "terminated"
+    assert not any(t.get("state") == "contradicted" for t in d.transitions)

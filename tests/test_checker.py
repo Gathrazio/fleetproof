@@ -20,8 +20,9 @@ from fleetproof.checks import Check, load_checks, spec_hash
 from fleetproof.runlog import list_run_records
 
 
-def _check(cid, run=None, expect=None, block=True, tier=None):
-    return Check(id=cid, run=run, expect=expect or {"kind": "exit0"}, block=block, tier=tier)
+def _check(cid, run=None, expect=None, block=True, tier=None, owner=None):
+    return Check(id=cid, run=run, expect=expect or {"kind": "exit0"}, block=block, tier=tier,
+                 owner=owner)
 
 
 def test_exit0_pass_and_fail(tmp_project):
@@ -316,3 +317,59 @@ def test_no_drift_without_session_context(tmp_runs, tmp_path):
     report = run_checks(load_checks(spec), cwd=tmp_path, record_to_log=True, spec_path=spec)
     assert session_spec_baseline(None) is None
     assert spec_drifted(report.spec_sha256, None) == (False, None)
+
+
+# === check ownership (B4: a blocking check must be satisfiable by its seat) ===
+
+def test_owned_check_failing_away_from_its_seat_grades_advisory(tmp_project):
+    # A blocking check only the coordinator can satisfy, graded at lane tier:
+    # it runs, its failure renders warn, and it cannot fail the verdict — a
+    # check nobody at this seat can fix must not wedge the seat (observed in a
+    # field deployment on Windows).
+    from fleetproof.checker import format_report_text
+    report = run_checks([_check("release-signed", run=_BAD, owner="coordinator")],
+                        cwd=tmp_project, record_to_log=False, tier="lane")
+    assert report.verdict == "pass"
+    assert report.blocking_failures == []
+    result = report.results[0]
+    assert result.passed is False
+    assert result.blocking is False
+    assert "owner: coordinator — advisory at tier lane" in result.detail
+    assert "[warn] release-signed" in format_report_text(report)
+
+
+def test_owned_check_blocks_at_its_own_tier(tmp_project):
+    report = run_checks([_check("release-signed", run=_BAD, owner="lane")],
+                        cwd=tmp_project, record_to_log=False, tier="lane")
+    assert report.verdict == "fail"
+    assert "owner:" not in report.results[0].detail
+
+
+def test_operator_owned_check_is_advisory_at_every_agent_tier(tmp_project):
+    # Operator-owned checks exist to keep a criterion visible without wedging
+    # anyone; the operator closes them out of band.
+    for tier in ("leaf", "lane", "coordinator", "bridge"):
+        report = run_checks([_check("license-renewed", run=_BAD, owner="operator")],
+                            cwd=tmp_project, record_to_log=False, tier=tier)
+        assert report.verdict == "pass", tier
+        assert f"owner: operator — advisory at tier {tier}" in report.results[0].detail
+
+
+def test_ownership_does_not_demote_a_tierless_full_run(tmp_project):
+    # A run with no tier at all (bare `fleetproof check`) is the operator's own
+    # full-spec surface, and the operator is the one seat every owner answers
+    # to — an owned check blocks there per its block field.
+    report = run_checks([_check("release-signed", run=_BAD, owner="coordinator")],
+                        cwd=tmp_project, record_to_log=False)
+    assert report.verdict == "fail"
+
+
+def test_owned_check_that_passes_is_advisory_but_unannotated(tmp_project):
+    # The demotion applies to the grade, the note only to a failure — and a
+    # tier whose every selected check belongs to other seats renders ADVISORY
+    # (A6), because nothing was at stake at this seat.
+    report = run_checks([_check("release-signed", run=_OK, owner="coordinator")],
+                        cwd=tmp_project, record_to_log=False, tier="lane")
+    assert report.results[0].blocking is False
+    assert "owner:" not in report.results[0].detail
+    assert report.all_advisory is True

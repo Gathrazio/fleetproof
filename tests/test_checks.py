@@ -107,6 +107,39 @@ def test_non_string_tier_raises(tmp_path):
         load_checks(p)
 
 
+# === optional owner field (B4: who can actually satisfy this check) ===
+
+def test_owner_absent_reads_back_as_none(tmp_path):
+    p = _write(tmp_path, {"checks": [{"id": "a", "run": "x"}]})
+    assert load_checks(p)[0].owner is None
+
+
+def test_owner_field_parsed(tmp_path):
+    p = _write(tmp_path, {"checks": [
+        {"id": "a", "run": "x", "owner": "leaf"},
+        {"id": "b", "run": "x", "owner": "lane"},
+        {"id": "c", "run": "x", "owner": "coordinator"},
+        {"id": "d", "run": "x", "owner": "bridge"},
+        {"id": "e", "run": "x", "owner": "operator"},
+    ]})
+    assert {c.id: c.owner for c in load_checks(p)} == {
+        "a": "leaf", "b": "lane", "c": "coordinator", "d": "bridge",
+        "e": "operator",
+    }
+
+
+def test_unknown_owner_raises(tmp_path):
+    p = _write(tmp_path, {"checks": [{"id": "a", "run": "x", "owner": "the-vendor"}]})
+    with pytest.raises(CheckSpecError):
+        load_checks(p)
+
+
+def test_non_string_owner_raises(tmp_path):
+    p = _write(tmp_path, {"checks": [{"id": "a", "run": "x", "owner": 3}]})
+    with pytest.raises(CheckSpecError):
+        load_checks(p)
+
+
 # === checks-tree hash (B1: the graders are part of the spec) ===
 
 def test_tree_hash_without_a_scripts_dir_differs_from_the_spec_hash(tmp_path):
