@@ -1549,6 +1549,61 @@ def test_abandonment_context_survives_a_stop_hook_retry(tmp_path, monkeypatch, c
         decision["hookSpecificOutput"]["additionalContext"])
 
 
+# === CLI dispatches are joinable (B7) ===
+
+def test_cli_dispatch_is_adopted_and_graded_at_stop(tmp_path, monkeypatch, capsys):
+    # A dispatch recorded via `dispatch new --agent-name` has no agent_id yet;
+    # the first matching stop adopts the record instead of forking the ledger
+    # into a CLI dispatch that never closes plus an orphan stop.
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import create_dispatch, list_dispatches, list_orphan_stops
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-fleet")
+    run_id = create_dispatch(
+        "cli-declared work", tier="lane",
+        agent={"agent_type": "tester", "agent_id": None, "capture": "cli"})
+
+    _feed(monkeypatch, _stop_payload(message="Did the CLI-dispatched work."))
+    assert subagent_stop_main() == 0
+    assert capsys.readouterr().out == ""  # graded and allowed to stop
+
+    dispatches = list_dispatches()
+    assert [d.run_id for d in dispatches] == [run_id]
+    d = dispatches[0]
+    assert d.agent["agent_id"] == "agent-1"
+    assert d.agent["capture"] == "cli"
+    assert d.verdict == "verified"
+    assert any("adopted agent_id agent-1" in (t.get("detail") or "")
+               for t in d.transitions)
+    assert list_orphan_stops() == []
+
+
+def test_ambiguous_cli_dispatches_fall_through_to_the_orphan_path(
+        tmp_path, monkeypatch, capsys):
+    # Two open CLI dispatches awaiting the same agent_type: guessing which one
+    # this stop belongs to would grade the wrong contract, so neither is
+    # adopted — the stop lands on the A1 orphan path with the ambiguity named.
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import create_dispatch, list_dispatches, list_orphan_stops
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-fleet")
+    cli_agent = {"agent_type": "tester", "agent_id": None, "capture": "cli"}
+    create_dispatch("one", tier="lane", agent=dict(cli_agent))
+    create_dispatch("two", tier="lane", agent=dict(cli_agent))
+
+    _feed(monkeypatch, _stop_payload(message="Which one was I?"))
+    assert subagent_stop_main() == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "ambiguous" in captured.err
+    assert "orphan" in captured.err
+
+    assert len(list_orphan_stops()) == 1
+    for d in list_dispatches():
+        assert d.agent_id is None
+        assert d.state == "dispatched"
+
+
 # === check ownership at the subagent gate (B4) ===
 
 def test_owner_advisory_failure_never_contradicts_the_dispatch(

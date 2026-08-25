@@ -113,6 +113,25 @@ def test_dispatch_new_reads_prompt_file(cli_runs, tmp_path, capsys):
     assert load_dispatch(run_id).prompt == "multi\nline\nprompt"
 
 
+def test_dispatch_new_agent_name_writes_a_cli_capture(cli_runs, tmp_path, capsys,
+                                                      monkeypatch):
+    # The joinable form: the record awaits its agent_id (adopted at the first
+    # matching SubagentStop) and carries the session so the stop can find it.
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-cli")
+    assert main(["dispatch", "new", "--prompt", "work", "--agent-name", "worker",
+                 "--format", "json"]) == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["agent"] == {"agent_type": "worker", "agent_id": None,
+                               "capture": "cli"}
+    assert record["session_id"] == "sess-cli"
+
+
+def test_dispatch_new_without_agent_name_writes_no_agent_block(cli_runs, capsys):
+    assert main(["dispatch", "new", "--prompt", "work", "--format", "json"]) == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["agent"] is None
+
+
 def test_dispatch_new_with_manifest_file(cli_runs, tmp_path, capsys):
     mf = tmp_path / "manifest.json"
     mf.write_text(json.dumps({"deliverables": ["a"], "notes": "n"}), encoding="utf-8")

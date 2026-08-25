@@ -573,6 +573,84 @@ def test_find_dispatch_by_agent_returns_newest_match(ledger_runs, monkeypatch):
     assert find_dispatch_by_agent("sess-1", "agent-1").run_id == max(first, second)
 
 
+# === CLI/hook join unification (B7) ===
+
+def _cli_agent(agent_type="worker"):
+    return {"agent_type": agent_type, "agent_id": None, "capture": "cli"}
+
+
+def test_capture_cli_is_a_valid_agent_block(ledger_runs):
+    run_id = create_dispatch("cli-declared work", tier="lane", agent=_cli_agent())
+    record = load_dispatch(run_id)
+    assert record.agent == _cli_agent()
+    assert record.agent_id is None
+
+
+def test_find_for_stop_prefers_the_agent_id_key(ledger_runs, monkeypatch):
+    from fleetproof.ledger import find_dispatch_for_stop
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-1")
+    create_dispatch("awaiting adoption", tier="lane", agent=_cli_agent("worker"))
+    hooked = create_dispatch("hook-captured", tier="lane",
+                             agent=_agent("agent-1", agent_type="worker"))
+    found, notes = find_dispatch_for_stop("sess-1", "agent-1", "worker")
+    assert found.run_id == hooked
+    assert notes == []
+
+
+def test_unique_name_match_adopts_the_agent_id(ledger_runs, monkeypatch):
+    from fleetproof.ledger import find_dispatch_for_stop
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-1")
+    run_id = create_dispatch("cli-declared work", tier="lane", agent=_cli_agent())
+    found, notes = find_dispatch_for_stop("sess-1", "agent-9", "worker")
+    assert found is not None and found.run_id == run_id
+    assert notes == []
+    # The adoption is durable and audited: the id is on the record, the
+    # transitions note it, and the state did not move.
+    reloaded = load_dispatch(run_id)
+    assert reloaded.agent_id == "agent-9"
+    assert reloaded.state == "dispatched"
+    assert "adopted agent_id agent-9" in reloaded.transitions[-1]["detail"]
+
+
+def test_ambiguous_name_match_adopts_nothing_and_says_so(ledger_runs, monkeypatch):
+    from fleetproof.ledger import find_dispatch_for_stop
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-1")
+    first = create_dispatch("one", tier="lane", agent=_cli_agent())
+    second = create_dispatch("two", tier="lane", agent=_cli_agent())
+    found, notes = find_dispatch_for_stop("sess-1", "agent-9", "worker")
+    assert found is None
+    assert len(notes) == 1 and "ambiguous" in notes[0]
+    assert first in notes[0] and second in notes[0]
+    for run_id in (first, second):
+        assert load_dispatch(run_id).agent_id is None
+
+
+def test_name_match_requires_an_open_dispatch(ledger_runs, monkeypatch):
+    from fleetproof.ledger import find_dispatch_for_stop
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-1")
+    run_id = create_dispatch("already reported", tier="lane", agent=_cli_agent())
+    record_report(run_id, _ok_report())
+    found, notes = find_dispatch_for_stop("sess-1", "agent-9", "worker")
+    assert found is None and notes == []
+
+
+def test_name_match_requires_the_same_session(ledger_runs, monkeypatch):
+    from fleetproof.ledger import find_dispatch_for_stop
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-1")
+    create_dispatch("session-scoped", tier="lane", agent=_cli_agent())
+    found, notes = find_dispatch_for_stop("sess-2", "agent-9", "worker")
+    assert found is None and notes == []
+
+
+def test_name_match_never_steals_a_record_that_has_an_agent_id(ledger_runs, monkeypatch):
+    from fleetproof.ledger import find_dispatch_for_stop
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-1")
+    create_dispatch("someone else's", tier="lane",
+                    agent=_agent("agent-1", agent_type="worker"))
+    found, notes = find_dispatch_for_stop("sess-1", "agent-9", "worker")
+    assert found is None and notes == []
+
+
 def test_malformed_explicit_manifest_raises(ledger_runs):
     with pytest.raises(LedgerError):
         create_dispatch("work", manifest={"checks": "tests-pass"})

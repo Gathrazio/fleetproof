@@ -51,6 +51,7 @@ Public API:
     load_dispatch(run_id) -> DispatchRecord | None
     list_dispatches(*, session_id, open_only, non_terminal_only) -> list[DispatchRecord]
     find_dispatch_by_agent(session_id, agent_id) -> DispatchRecord | None
+    find_dispatch_for_stop(session_id, agent_id, agent_type) -> (record_or_None, notes)
     derive_manifest(prompt) -> dict
     write_intent(agent_type, prompt, *, manifest, tier) -> Path
     consume_intent(agent_type) -> (fields_or_None, notes)
@@ -180,9 +181,15 @@ VALID_EVIDENCE = frozenset({"executed", "observed", "believed"})
 # "stop-only" means the first we heard of it was its own stop, so the record was
 # back-filled. The distinction matters: a stop-only sighting proves the start hook
 # is not firing, which is a hole in the capture surface, not a normal case.
+# "cli" means the dispatcher recorded it via `fleetproof dispatch new
+# --agent-name` before spawning: the agent_type is known, the agent_id is not
+# yet — it arrives by adoption at the first matching SubagentStop (see
+# :func:`find_dispatch_for_stop`), which is what lets a CLI-created dispatch
+# share the hook lifecycle instead of forking the ledger.
 CAPTURE_START = "start"
 CAPTURE_STOP_ONLY = "stop-only"
-VALID_CAPTURE = frozenset({CAPTURE_START, CAPTURE_STOP_ONLY})
+CAPTURE_CLI = "cli"
+VALID_CAPTURE = frozenset({CAPTURE_START, CAPTURE_STOP_ONLY, CAPTURE_CLI})
 
 # Ceiling on an ancestor walk, so a malformed or circular parent chain costs a
 # bounded amount of work instead of hanging a hook.
@@ -456,6 +463,80 @@ def find_dispatch_by_agent(session_id: str | None, agent_id: str | None) -> Disp
         if record.agent_id == agent_id:
             return record
     return None
+
+
+def _adopt_agent(record: DispatchRecord, agent_id: str | None, by: str) -> DispatchRecord:
+    """Write a newly learned agent_id onto a name-matched dispatch.
+
+    Not a state transition — the dispatch stays exactly as open as it was —
+    but it is an audit event, so an entry carrying the unchanged state and an
+    adoption detail is appended to the transitions list: the record must be
+    able to say *how* it came to carry this id.
+    """
+    raw = _read_json(record.run_dir / DISPATCH_FILENAME) or {}
+    agent = raw.get("agent") if isinstance(raw.get("agent"), dict) else {}
+    agent["agent_id"] = agent_id or None
+    raw["agent"] = agent
+    transitions = raw.get("transitions")
+    if not isinstance(transitions, list):
+        transitions = []
+    transitions.append(_transition(
+        record.state, by,
+        detail=f"adopted agent_id {agent_id or 'unknown'} by name-match on "
+               f"agent_type {agent.get('agent_type')!r}"))
+    raw["transitions"] = transitions
+    _write_json(record.run_dir / DISPATCH_FILENAME, raw)
+    return load_dispatch(record.run_id) or record
+
+
+def find_dispatch_for_stop(
+    session_id: str | None,
+    agent_id: str | None,
+    agent_type: str | None,
+) -> tuple[DispatchRecord | None, list[str]]:
+    """The dispatch a SubagentStop should grade, plus notes for the caller to surface.
+
+    Matching order:
+
+    1. ``agent_id`` exact — today's key (:func:`find_dispatch_by_agent`).
+    2. Name fallback: among *open* dispatches whose session equals the
+       payload's exactly, the unique record whose ``agent.agent_type`` equals
+       the payload's agent_type and whose ``agent_id`` is still null. That is
+       the ``dispatch new --agent-name`` shape: the dispatcher recorded the
+       spawn before the harness had an id, and this stop is where the id
+       becomes known — so the record adopts it (written onto the agent block,
+       noted in the transitions) and the CLI dispatch joins the hook
+       lifecycle instead of forking the ledger.
+    3. Two or more such records is not a guess this module gets to make:
+       no match, with a note naming the candidates, and the caller falls
+       through to the orphan path — a stop graded against the wrong contract
+       is worse than a sighting.
+
+    The session comparison here is exact (None matches only None), stricter
+    than the agent-id path's documented no-session fallback: adoption mutates
+    the record, and a cross-session guess is not evidence.
+    """
+    found = find_dispatch_by_agent(session_id, agent_id)
+    if found is not None:
+        return found, []
+    if not agent_type:
+        return None, []
+    candidates = [
+        r for r in list_dispatches(non_terminal_only=True)
+        if r.is_open
+        and (r.session_id or None) == (session_id or None)
+        and isinstance(r.agent, dict)
+        and r.agent.get("agent_type") == agent_type
+        and not r.agent_id
+    ]
+    if not candidates:
+        return None, []
+    if len(candidates) > 1:
+        listed = ", ".join(r.run_id for r in candidates)
+        return None, [
+            f"ambiguous name-match: {len(candidates)} open dispatches await an "
+            f"agent of type {agent_type!r} ({listed}) — adopting none of them"]
+    return _adopt_agent(candidates[0], agent_id, by="hook"), []
 
 
 # === Tier inference ===

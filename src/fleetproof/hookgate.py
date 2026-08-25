@@ -31,7 +31,10 @@ everything here is designed to fail open around the gaps):
   see — unless the dispatcher declared it up front via an intent sidecar
   (``.fleetproof/intents/<agent_type>.json``), which the start capture consumes.
 - There is no correlation field between the Task-tool call that spawned an agent
-  and that agent's stop, so ``agent_id`` + ``session_id`` is the only join key.
+  and that agent's stop, so ``agent_id`` + ``session_id`` is the primary join
+  key — with one fallback: a CLI-created dispatch that declared its spawn name
+  up front (``dispatch new --agent-name``) is joined by ``agent_type`` and
+  adopts the id at its first matching stop.
 """
 
 from __future__ import annotations
@@ -74,7 +77,7 @@ from .ledger import (
     close_dispatch,
     consume_intent,
     create_dispatch,
-    find_dispatch_by_agent,
+    find_dispatch_for_stop,
     intents_dir,
     list_dispatches,
     load_dispatch,
@@ -792,12 +795,16 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
 
     Order matters, and each step is a separate reason to refuse the stop:
 
-    1. Find this agent's dispatch. An unpaired stop — no dispatch to join —
-       records an orphan and terminates ungraded: harness-internal helper
-       agents (summaries, titles) emit SubagentStop with no SubagentStart and
-       no agent_type, and back-filling those as graded dispatches manufactured
-       phantom verified verdicts (observed in a field deployment on Windows).
-       Nobody ordered that work, so there is no claim to hold it to.
+    1. Find this agent's dispatch: by agent_id, then by name — a CLI-created
+       dispatch (``dispatch new --agent-name``) has no agent_id until the
+       first matching stop adopts it (see
+       :func:`fleetproof.ledger.find_dispatch_for_stop`). An unpaired stop —
+       no dispatch to join either way — records an orphan and terminates
+       ungraded: harness-internal helper agents (summaries, titles) emit
+       SubagentStop with no SubagentStart and no agent_type, and back-filling
+       those as graded dispatches manufactured phantom verified verdicts
+       (observed in a field deployment on Windows). Nobody ordered that work,
+       so there is no claim to hold it to.
     2. No final message means no report. Block without transitioning: an agent
        that went idle saying nothing has not reported, and recording it as
        ``reported`` would launder silence into a claim.
@@ -830,7 +837,13 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     session_id = os.environ.get(SESSION_ID_ENV)
     agent_id, agent_type = _agent_fields(payload)
 
-    dispatch = find_dispatch_by_agent(session_id, agent_id)
+    # Name fallback runs BEFORE the orphan path: a CLI-created dispatch
+    # (`dispatch new --agent-name`) is waiting for exactly this stop to learn
+    # its agent_id, and orphaning it would fork the ledger the flag exists to
+    # unify. An ambiguous name match surfaces on stderr and orphans anyway.
+    dispatch, join_notes = find_dispatch_for_stop(session_id, agent_id, agent_type)
+    for note in join_notes:
+        sys.stderr.write(f"[fleetproof] {note}\n")
     if dispatch is None:
         orphan_message = payload.get("last_assistant_message")
         record_orphan_stop(

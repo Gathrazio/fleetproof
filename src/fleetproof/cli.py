@@ -60,6 +60,7 @@ from .hookgate import (
     subagent_stop_main,
 )
 from .ledger import (
+    CAPTURE_CLI,
     REASON_ABANDONED,
     REASON_OPERATOR_CLOSE,
     REASON_PARKED_PREFIX,
@@ -372,8 +373,19 @@ def _cmd_dispatch_new(args: argparse.Namespace) -> int:
         if isinstance(inner, dict):
             manifest = inner
 
+    # --agent-name makes the dispatch joinable: the agent block records the
+    # spawn name the harness will report as agent_type, with a null agent_id
+    # the first matching SubagentStop adopts (find_dispatch_for_stop). The
+    # session id rides in from FLEETPROOF_SESSION_ID via create_dispatch, so
+    # a dispatch recorded inside a hook session lands in that session.
+    agent = None
+    if getattr(args, "agent_name", None):
+        agent = {"agent_type": args.agent_name, "agent_id": None,
+                 "capture": CAPTURE_CLI}
+
     try:
-        run_id = create_dispatch(prompt, tier=args.tier, manifest=manifest)
+        run_id = create_dispatch(prompt, tier=args.tier, manifest=manifest,
+                                 agent=agent)
     except LedgerError as e:
         _emit_error("ledger_error", str(e), args.format)
         return 1
@@ -855,6 +867,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Declare the tier. Omit to infer it from the run tree.")
     p_dnew.add_argument("--manifest", default=None,
                         help="JSON file with the dispatch manifest. Omit to derive from the prompt.")
+    p_dnew.add_argument("--agent-name", default=None,
+                        help="The Task-tool spawn name the harness will report "
+                             "as agent_type. Makes the dispatch joinable: the "
+                             "first matching SubagentStop adopts it and grades "
+                             "it, instead of the CLI record and the hook stop "
+                             "forking into two ledgers.")
     _add_format(p_dnew)
     p_dnew.set_defaults(func=_cmd_dispatch_new)
 
