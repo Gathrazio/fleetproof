@@ -180,6 +180,41 @@ def test_non_string_owner_raises(tmp_path):
         load_checks(p)
 
 
+# === per-check redact patterns (B6: redaction before persistence) ===
+
+def test_redact_absent_reads_back_as_empty(tmp_path):
+    p = _write(tmp_path, {"checks": [{"id": "a", "run": "x"}]})
+    assert load_checks(p)[0].redact == ()
+
+
+def test_redact_patterns_parsed(tmp_path):
+    p = _write(tmp_path, {"checks": [
+        {"id": "a", "run": "x", "redact": [r"internal-id-\d+", r"host=\S+"]},
+    ]})
+    assert load_checks(p)[0].redact == (r"internal-id-\d+", r"host=\S+")
+
+
+def test_uncompilable_redact_pattern_raises(tmp_path):
+    # Validated at spec load, where the error still has someone to land on —
+    # a pattern that first fails to compile inside the checker would silently
+    # skip the redaction it promised.
+    p = _write(tmp_path, {"checks": [{"id": "a", "run": "x", "redact": ["(unclosed"]}]})
+    with pytest.raises(CheckSpecError):
+        load_checks(p)
+
+
+def test_non_list_redact_raises(tmp_path):
+    p = _write(tmp_path, {"checks": [{"id": "a", "run": "x", "redact": "secret"}]})
+    with pytest.raises(CheckSpecError):
+        load_checks(p)
+
+
+def test_non_string_redact_element_raises(tmp_path):
+    p = _write(tmp_path, {"checks": [{"id": "a", "run": "x", "redact": [1]}]})
+    with pytest.raises(CheckSpecError):
+        load_checks(p)
+
+
 # === checks-tree hash (B1: the graders are part of the spec) ===
 
 def test_tree_hash_without_a_scripts_dir_differs_from_the_spec_hash(tmp_path):

@@ -107,6 +107,27 @@ def test_filter_env_redacts_secrets():
     assert out["USERNAME"] == "someuser"  # in SAFE_ENV_KEYS
 
 
+def test_filter_env_denylist_covers_the_field_observed_holes():
+    # *_KEY, SAS, CONNSTR, PWD, PFX, DSN, CERT all sailed through the original
+    # patterns and into invocation.json (observed in a field deployment on
+    # Windows). Over-redaction is the chosen side of the trade — including
+    # PWD, which is only a path.
+    out = filter_env({
+        "STORAGE_SAS": "s", "DEPLOY_KEY": "k", "DB_CONNSTR": "c",
+        "PWD": "/home/user", "SIGNING_PFX": "p", "REPORTING_DSN": "d",
+        "TLS_CERT": "t",
+        "MONKEY": "safe",  # 'key' not on a [_-]key boundary — no match
+    })
+    assert out["STORAGE_SAS"] == "<redacted>"
+    assert out["DEPLOY_KEY"] == "<redacted>"
+    assert out["DB_CONNSTR"] == "<redacted>"
+    assert out["PWD"] == "<redacted>"
+    assert out["SIGNING_PFX"] == "<redacted>"
+    assert out["REPORTING_DSN"] == "<redacted>"
+    assert out["TLS_CERT"] == "<redacted>"
+    assert out["MONKEY"] == "safe"
+
+
 # === record / read-back (written by one path, read by another) ===
 
 def test_record_creates_files_and_reads_back(tmp_runs):

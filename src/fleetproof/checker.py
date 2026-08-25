@@ -36,6 +36,45 @@ from .runlog import list_run_records, project_root, record, runs_dir
 # Per-check wall-clock ceiling. A check that hangs is a failed check, not a hung fleet.
 DEFAULT_TIMEOUT_S = 600
 
+# Secret shapes redacted from the persisted output tails before they reach
+# output.json. Real check commands echo connection strings and tokens when
+# they fail — a storage account key survived in a run record for the life of
+# the record (observed in a field deployment on Windows). Case-insensitive on
+# purpose, and each replacement names its label so a reviewer can tell *what
+# kind* of secret was there without learning the secret. Grading always runs
+# on the raw output first: redaction covers what is persisted, never what is
+# graded — a verdict that changed because the evidence was masked would be a
+# new bug.
+REDACTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    (label, re.compile(pattern, re.IGNORECASE))
+    for label, pattern in (
+        ("account-key", r"AccountKey=[^;\s]+"),
+        ("sas-sig", r"sig=[A-Za-z0-9%+/=]{16,}"),
+        ("private-key",
+         r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
+        ("jwt", r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"),
+        ("bearer-token", r"bearer\s+[A-Za-z0-9._~+/=-]{16,}"),
+    )
+]
+
+
+def redact_output(text: str, extra_patterns: tuple[str, ...] = ()) -> str:
+    """Apply the builtin redactions, then a check's own ``redact`` patterns.
+
+    ``extra_patterns`` were validated compilable at spec load; a pattern that
+    somehow fails here anyway is skipped rather than allowed to take down the
+    checker — losing one custom redaction is recoverable, losing the verdict
+    is not.
+    """
+    for label, pattern in REDACTION_PATTERNS:
+        text = pattern.sub(f"[REDACTED:{label}]", text)
+    for raw in extra_patterns:
+        try:
+            text = re.sub(raw, "[REDACTED:custom]", text)
+        except re.error:
+            continue
+    return text
+
 
 @dataclass
 class CheckResult:
@@ -234,6 +273,8 @@ def run_check(check: Check, cwd: Path, timeout: int = DEFAULT_TIMEOUT_S) -> Chec
         returncode, stdout, stderr = _run_command(check.run, cwd, timeout)
     passed, detail = _grade(check, returncode, stdout, stderr, cwd)
     duration_ms = (_time.perf_counter() - started) * 1000.0
+    # Redact before truncating, so a secret straddling the truncation boundary
+    # cannot leave half of itself behind in the kept tail.
     return CheckResult(
         id=check.id,
         expectation=check.describe_expectation(),
@@ -242,8 +283,8 @@ def run_check(check: Check, cwd: Path, timeout: int = DEFAULT_TIMEOUT_S) -> Chec
         returncode=returncode,
         detail=detail,
         duration_ms=round(duration_ms, 3),
-        stdout_tail=_tail(stdout),
-        stderr_tail=_tail(stderr),
+        stdout_tail=_tail(redact_output(stdout, check.redact)),
+        stderr_tail=_tail(redact_output(stderr, check.redact)),
     )
 
 

@@ -1012,7 +1012,16 @@ def subagent_stop_main() -> int:
 
 
 def record_tool_main() -> int:
-    """PostToolUse recorder: accrete an evidence record. Always non-blocking."""
+    """PostToolUse recorder: accrete an evidence record. Always non-blocking.
+
+    ``tool_input`` is recorded verbatim, by design: it is arbitrary code and
+    arbitrary prose, and pattern-redacting it would be false comfort — a
+    reviewer would trust a surface that still leaks anything shaped unlike
+    the patterns. The redaction layer covers the two surfaces it can be
+    honest about: check output tails (checker builtins + per-check patterns)
+    and the env snapshot (:data:`fleetproof.runlog.SENSITIVE_ENV_PATTERNS`).
+    Treat ``.fleetproof/runs/`` as sensitive as the shell history it records.
+    """
     payload = _read_hook_input()
     _apply_session_id(payload)
     tool_name = str(payload.get("tool_name", "unknown"))

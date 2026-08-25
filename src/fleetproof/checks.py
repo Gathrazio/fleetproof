@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -113,6 +114,12 @@ class Check:
     # check nobody at the graded seat can fix is a wedge, not a gate
     # (observed in a field deployment on Windows).
     owner: str | None = None
+    # Extra redaction regexes applied to this check's persisted output tails,
+    # after the checker's builtin patterns. Validated compilable here, at spec
+    # load, where the error still has someone to land on — a pattern that
+    # first failed to compile inside the checker would silently skip the
+    # redaction it promised.
+    redact: tuple[str, ...] = ()
 
     def describe_run(self) -> str | None:
         """The command for display: string form verbatim, argv form joined
@@ -317,6 +324,21 @@ def _parse_check(entry: Any, index: int) -> Check:
             f"{where} ({cid}): 'owner' must be one of {sorted(VALID_OWNERS)} or omitted."
         )
 
+    redact_raw = entry.get("redact", [])
+    if redact_raw is None:
+        redact_raw = []
+    if not isinstance(redact_raw, list):
+        raise CheckSpecError(
+            f"{where} ({cid}): 'redact' must be an array of regex strings.")
+    for j, pattern in enumerate(redact_raw):
+        if not isinstance(pattern, str):
+            raise CheckSpecError(f"{where} ({cid}): 'redact'[{j}] must be a string.")
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            raise CheckSpecError(
+                f"{where} ({cid}): 'redact'[{j}] is not a valid regex: {e}") from e
+
     expect = _normalize_expect(entry.get("expect", "exit0"), cid, where)
 
     # A file_exists check may have no command; every other kind needs one.
@@ -326,7 +348,7 @@ def _parse_check(entry: Any, index: int) -> Check:
         )
 
     return Check(id=cid, run=run, expect=expect, block=block, description=description,
-                 tier=tier, owner=owner)
+                 tier=tier, owner=owner, redact=tuple(redact_raw))
 
 
 def _normalize_expect(expect: Any, cid: str, where: str) -> dict[str, Any]:

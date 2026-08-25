@@ -56,17 +56,25 @@ SESSION_ID_ENV = "FLEETPROOF_SESSION_ID"
 # Directory the tool owns inside the user's repo.
 PROJECT_MARKER = ".fleetproof"
 
-# Env-var name patterns redacted from invocation.env_filtered
+# Env-var name patterns redacted from invocation.env_filtered. The second row
+# is the field-hardened extension: *_KEY, SAS, CONNSTR, PWD, PFX, DSN, and
+# CERT names all sailed through the original list and into invocation.json
+# (observed in a field deployment on Windows). Over-redaction of the env
+# snapshot is the chosen side of the trade — the snapshot is diagnostic
+# garnish, and yes, this redacts PWD, which is only a path.
 SENSITIVE_ENV_PATTERNS = [
     re.compile(p, re.IGNORECASE) for p in (
         r"token", r"secret", r"password", r"passwd", r"api[_-]?key",
         r"auth", r"credential", r"private[_-]?key", r"session",
+        r"[_-]key\b", r"sas", r"pwd", r"conn(ection)?str", r"pfx", r"dsn",
+        r"cert",
     )
 ]
 
-# Env vars always passed through (whitelist)
+# Env vars always passed through (whitelist). PWD is deliberately NOT here:
+# the denylist above redacts it (see the trade recorded there).
 SAFE_ENV_KEYS = frozenset({
-    "PATH", "PYTHONPATH", "PWD", "HOME", "USER", "USERNAME",
+    "PATH", "PYTHONPATH", "HOME", "USER", "USERNAME",
     RUN_ID_ENV, RUNS_DIR_ENV, "OS", "LANG", "LC_ALL", "TZ",
 })
 

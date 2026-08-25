@@ -20,9 +20,9 @@ from fleetproof.checks import Check, load_checks, spec_hash
 from fleetproof.runlog import list_run_records
 
 
-def _check(cid, run=None, expect=None, block=True, tier=None, owner=None):
+def _check(cid, run=None, expect=None, block=True, tier=None, owner=None, redact=()):
     return Check(id=cid, run=run, expect=expect or {"kind": "exit0"}, block=block, tier=tier,
-                 owner=owner)
+                 owner=owner, redact=tuple(redact))
 
 
 def test_exit0_pass_and_fail(tmp_project):
@@ -347,6 +347,68 @@ def test_argv_run_unlaunchable_is_a_failure(tmp_project):
     r = run_check(_check("gone", run=["no-such-binary-fleetproof-test"]), tmp_project)
     assert r.passed is False
     assert r.returncode is None
+
+
+# === redaction before persistence (B6) ===
+
+def test_builtin_patterns_redact_the_persisted_tails(tmp_project):
+    # Check output gets persisted verbatim to output.json, and real check
+    # commands echo connection strings and tokens when they fail (observed in
+    # a field deployment on Windows). The builtins cover the shapes that
+    # leaked: storage account keys, SAS signatures, PEM private keys, JWTs,
+    # bearer tokens.
+    emit = (
+        "print('AccountKey=abc123synthkeyvalue;EndpointSuffix=core.example');"
+        "print('https://example/x?sig=aBcDeFgHiJkLmNoPqRsT1234');"
+        "print('eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9P');"
+        "print('Authorization: Bearer synthtoken0123456789abcdef');"
+        "print('-----BEGIN RSA PRIVATE KEY-----\\nMIIEsynthetic\\n-----END RSA PRIVATE KEY-----')"
+    )
+    r = run_check(_check("leaky", run=[sys.executable, "-c", emit]), tmp_project)
+    tail = r.stdout_tail
+    assert "[REDACTED:account-key]" in tail
+    assert "[REDACTED:sas-sig]" in tail
+    assert "[REDACTED:jwt]" in tail
+    assert "[REDACTED:bearer-token]" in tail
+    assert "[REDACTED:private-key]" in tail
+    assert "abc123synthkeyvalue" not in tail
+    assert "aBcDeFgHiJkLmNoPqRsT1234" not in tail
+    assert "synthtoken0123456789abcdef" not in tail
+    assert "MIIEsynthetic" not in tail
+
+
+def test_stderr_tail_is_redacted_too(tmp_project):
+    emit = "import sys; print('AccountKey=stderrsynthkey;', file=sys.stderr)"
+    r = run_check(_check("leaky-err", run=[sys.executable, "-c", emit]), tmp_project)
+    assert "[REDACTED:account-key]" in r.stderr_tail
+    assert "stderrsynthkey" not in r.stderr_tail
+
+
+def test_grading_sees_raw_output_redaction_is_persistence_only(tmp_project):
+    # A regex expectation written against the raw output must keep grading
+    # against the raw output: redaction covers what gets *persisted*, and a
+    # grade that changed because the evidence was masked would be a new bug.
+    r = run_check(
+        _check("raw-grade",
+               run=[sys.executable, "-c", "print('AccountKey=gradesynthkey;done')"],
+               expect={"kind": "regex", "pattern": r"AccountKey=gradesynthkey"}),
+        tmp_project,
+    )
+    assert r.passed is True
+    assert "gradesynthkey" not in r.stdout_tail
+
+
+def test_per_check_redact_applies_after_the_builtins(tmp_project):
+    r = run_check(
+        _check("custom",
+               run=[sys.executable, "-c",
+                    "print('deploy-target-alpha AccountKey=alsosynthkey;')"],
+               redact=[r"deploy-target-\w+"]),
+        tmp_project,
+    )
+    assert "[REDACTED:custom]" in r.stdout_tail
+    assert "deploy-target-alpha" not in r.stdout_tail
+    assert "[REDACTED:account-key]" in r.stdout_tail
 
 
 # === check ownership (B4: a blocking check must be satisfiable by its seat) ===
