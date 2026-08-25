@@ -57,6 +57,7 @@ from .ledger import (
     REASON_OPERATOR_CLOSE,
     REASON_SESSION_END,
     REASON_SWEEP_IDLE,
+    STATE_ADVISORY,
     STATE_CONTRADICTED,
     STATE_REPORTED,
     STATE_VERIFIED,
@@ -73,11 +74,12 @@ SCHEMA_VERSION = "fleetproof-telemetry/1.1"
 # The outcome-class derivation below implements the spec's nine-row table
 # (its derivation_version 2; version 1 being the pre-red-team draft that
 # lacked ungraded and the near-miss/flake split) plus the ``abandoned`` class
-# the escalation ladder added — a tenth row, hence version 3. Purely additive:
-# no record written under version 2 can carry the abandonment terminate
-# reason, so re-deriving an older corpus under this version classes every
-# record exactly as before.
-DERIVATION_VERSION = 3
+# the escalation ladder added — a tenth row, hence version 3 — plus the
+# ``advisory`` class per-tier arming added: an eleventh row, version 4.
+# Purely additive each time: no record written under version 3 can carry an
+# advisory verdict transition, so re-deriving an older corpus under this
+# version classes every record exactly as before.
+DERIVATION_VERSION = 4
 
 # Every vocabulary a record leans on is pinned per record. The two nulls are
 # honest, not lazy: no OTel-named field carries a non-null value yet (the
@@ -105,6 +107,12 @@ CLASS_CONTRADICTED = "contradicted"
 # contradicted (a single wrong claim and an agent that wedged for three
 # rounds are different fleet problems), and by construction never verified.
 CLASS_ABANDONED = "abandoned"
+# A blocking check failed and the tier's gate was disarmed, so the stop was
+# allowed on an operator's recorded switch. Its own class: not verified (a
+# check failed), not contradicted (nothing blocked and the ladder did not
+# strike), not unverifiable (something checkable was checked — and failed).
+# Never counts as success anywhere.
+CLASS_ADVISORY = "advisory"
 CLASS_UNGRADED = "ungraded"
 CLASS_UNVERIFIABLE = "unverifiable"
 CLASS_SILENT_IDLE = "silent_idle"
@@ -117,6 +125,7 @@ OUTCOME_CLASSES = (
     CLASS_VERIFIER_FLAKE,
     CLASS_CONTRADICTED,
     CLASS_ABANDONED,
+    CLASS_ADVISORY,
     CLASS_UNGRADED,
     CLASS_UNVERIFIABLE,
     CLASS_SILENT_IDLE,
@@ -315,6 +324,9 @@ def derive_outcome_class(
             return CLASS_ABANDONED
         return CLASS_CONTRADICTED
 
+    if final_verdict == STATE_ADVISORY:
+        return CLASS_ADVISORY
+
     # No verdict ever recorded.
     if reported:
         if verifier_checks_run == 0:
@@ -374,7 +386,7 @@ def _retry_chain_elapsed_seconds(transitions: list[dict[str, Any]]) -> float:
         state = entry.get("state")
         if state == STATE_CONTRADICTED and first_contra is None:
             first_contra = at
-        if state in (STATE_CONTRADICTED, STATE_VERIFIED):
+        if state in (STATE_CONTRADICTED, STATE_VERIFIED, STATE_ADVISORY):
             last_verdict = at
     if first_contra is None or last_verdict is None:
         return 0.0

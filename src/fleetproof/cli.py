@@ -1129,7 +1129,7 @@ def _cmd_telemetry_summary(args: argparse.Namespace) -> int:
         for metric in ("delivery_failure_rate", "false_claim_rate",
                        "abandoned_rate",
                        "near_miss_rate", "verifier_flake_rate",
-                       "ungraded_rate", "unverifiable_rate",
+                       "ungraded_rate", "unverifiable_rate", "advisory_rate",
                        "telemetry_missing_rate", "stop_only_fraction"):
             m = block[metric]
             rate = f"{m['rate']:.3f}" if m["rate"] is not None else "n/a"

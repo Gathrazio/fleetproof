@@ -117,6 +117,15 @@ STATE_DISPATCHED = "dispatched"
 STATE_REPORTED = "reported"
 STATE_VERIFIED = "verified"
 STATE_CONTRADICTED = "contradicted"
+# The third verdict: the checks ran, a blocking one FAILED, and the gate that
+# graded it was disarmed (advisory) for that tier, so nothing blocked. Its own
+# value, never ``verified`` with a note in the detail: a failed check that
+# reads ``verified`` on the board is the false-attestation shape the whole
+# tier_source/ungraded work exists to prevent, and it is what the first cut
+# of per-tier arming recorded. Not ``contradicted`` either — the stop was
+# allowed, the ladder must not strike, and the class of thing it is (work
+# whose grade was suspended by an operator's recorded switch) is neither.
+STATE_ADVISORY = "advisory"
 STATE_TERMINATED = "terminated"
 
 # Legal successors per state. ``terminated`` is reachable from everywhere on
@@ -124,8 +133,10 @@ STATE_TERMINATED = "terminated"
 # not enforce that agents die politely.
 _ALLOWED_NEXT: dict[str, frozenset[str]] = {
     STATE_DISPATCHED: frozenset({STATE_REPORTED, STATE_TERMINATED}),
-    STATE_REPORTED: frozenset({STATE_VERIFIED, STATE_CONTRADICTED, STATE_TERMINATED}),
+    STATE_REPORTED: frozenset({STATE_VERIFIED, STATE_CONTRADICTED, STATE_ADVISORY,
+                               STATE_TERMINATED}),
     STATE_VERIFIED: frozenset({STATE_TERMINATED}),
+    STATE_ADVISORY: frozenset({STATE_TERMINATED}),
     # Back to reported: the gate blocked this agent's stop, so the retry lands on
     # the same dispatch. Its report is overwritten; the transition list is the
     # audit trail of how many tries it took.
@@ -134,7 +145,7 @@ _ALLOWED_NEXT: dict[str, frozenset[str]] = {
 }
 
 TERMINAL_STATES = frozenset({STATE_TERMINATED})
-VERDICT_STATES = frozenset({STATE_VERIFIED, STATE_CONTRADICTED})
+VERDICT_STATES = frozenset({STATE_VERIFIED, STATE_CONTRADICTED, STATE_ADVISORY})
 
 # Machine-set reasons a dispatch can be terminated for. The closed vocabulary
 # exists because "terminated from dispatched" is two very different stories —
@@ -1534,8 +1545,10 @@ def record_verdict(
 ) -> DispatchRecord:
     """Append the checker's verdict on a reported dispatch.
 
-    Only ``verified`` or ``contradicted``, and only after a report — grading a
-    dispatch that never reported anything would be grading nothing.
+    Only ``verified``, ``contradicted``, or ``advisory`` (a blocking failure
+    under a disarmed gate — see :data:`STATE_ADVISORY`), and only after a
+    report — grading a dispatch that never reported anything would be grading
+    nothing.
     """
     if verdict not in VERDICT_STATES:
         raise LedgerError(

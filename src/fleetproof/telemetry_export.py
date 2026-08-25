@@ -52,6 +52,7 @@ from .ledger import (
 from .runlog import runs_dir
 from .telemetry import (
     CLASS_ABANDONED,
+    CLASS_ADVISORY,
     CLASS_CONTRADICTED,
     CLASS_NEAR_MISS,
     CLASS_SILENT_IDLE,
@@ -71,7 +72,7 @@ from .telemetry import (
     load_telemetry,
 )
 
-# Census buckets beyond the nine outcome classes. None is reclassifiable into
+# Census buckets beyond the outcome classes. None is reclassifiable into
 # another: pre-telemetry is never back-filled, telemetry_missing is never
 # excused into pre-telemetry, in-flight work is not yet an outcome.
 BUCKET_PRE_TELEMETRY = "pre_telemetry"
@@ -268,6 +269,11 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             sum(1 for row in rows if row["era"] and row["stop_only"]), era_total),
         # Never folded into success.
         "unverifiable_rate": _frequency(counts[CLASS_UNVERIFIABLE], d),
+        # A blocking failure under a disarmed gate: in D (it was graded), in
+        # no success or failure numerator (the operator suspended the
+        # decision, on record), published first-class so a fleet that runs
+        # disarmed a lot can see how much of its grading it switched off.
+        "advisory_rate": _frequency(counts[CLASS_ADVISORY], d),
         "override_rate_by_source": {
             source: _rate(overrides_by_source[source], events_by_source[source])
             for source in ("hook", "operator")

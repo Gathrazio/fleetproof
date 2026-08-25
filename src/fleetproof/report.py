@@ -33,6 +33,7 @@ from .ledger import (
     DISPATCH_ROOT_TOOL,
     REASON_ABANDONED,
     ROOT_FILENAME,
+    STATE_ADVISORY,
     STATE_CONTRADICTED,
     STATE_DISPATCHED,
     STATE_TERMINATED,
@@ -58,13 +59,17 @@ FIRST_LINE_LIMIT = 240
 STATUS_CONTRADICTED = "contradicted"   # claimed done, a blocking check disagreed
 STATUS_UNGRADED = "ungraded"           # a dispatch with no verdict on record
 STATUS_VERIFIED = "verified"           # an independent checker passed it
+STATUS_ADVISORY = "advisory"           # a blocking check failed under a disarmed gate
 STATUS_UNVERIFIED = "unverified"       # an ordinary run with no checker verdict
 
 # Worst first. A container (session, tree) takes the status of the most alarming
 # thing inside it, because what the operator does next is driven by the worst row,
 # not the average one. ``ungraded`` outranks ``verified``: an absent grade is not a
 # passing grade, and it is the second most important thing on the page.
-_STATUS_RANK = (STATUS_CONTRADICTED, STATUS_UNGRADED, STATUS_VERIFIED, STATUS_UNVERIFIED)
+# ``advisory`` sits beside it: a failed check whose block was switched off is
+# closer to ungraded than to verified.
+_STATUS_RANK = (STATUS_CONTRADICTED, STATUS_UNGRADED, STATUS_ADVISORY,
+                STATUS_VERIFIED, STATUS_UNVERIFIED)
 
 
 # === Shared dispatch vocabulary ===
@@ -228,6 +233,8 @@ def _dispatch_status(dispatch: DispatchRecord | None) -> str:
         return STATUS_CONTRADICTED
     if verdict == STATE_VERIFIED:
         return STATUS_VERIFIED
+    if verdict == STATE_ADVISORY:
+        return STATUS_ADVISORY
     return STATUS_UNGRADED
 
 
@@ -505,6 +512,7 @@ def _badge(status: str) -> str:
     tone = {
         STATUS_CONTRADICTED: "bad",
         STATUS_VERIFIED: "ok",
+        STATUS_ADVISORY: "warn",
         STATUS_UNVERIFIED: "warn",
         STATUS_UNGRADED: "warn",
     }.get(status, "neutral")
@@ -845,7 +853,9 @@ def write_report(output: Path, runs: list[RunRecord] | None = None) -> Path:
 _LEGEND = """<p class='legend'><b>How to read this:</b>
 <span class='badge ok'>verified</span> an independent checker passed it &middot;
 <span class='badge bad'>contradicted</span> it claimed done and a blocking check
-disagreed &middot; <span class='badge warn'>ungraded</span> a dispatch with no
+disagreed &middot; <span class='badge warn'>advisory</span> a blocking check
+failed but that tier's gate was disarmed, so nothing blocked &middot;
+<span class='badge warn'>ungraded</span> a dispatch with no
 verdict on record at all &middot; <span class='badge warn'>unverified</span> an
 ordinary run with no checker verdict. Indented sections are runs dispatched by the
 run above them. Every section prints the on-disk record it was built from.</p>"""
@@ -914,6 +924,8 @@ _HTML_HEAD = """<!DOCTYPE html>
   /* Ungraded outranks unverified: same amber, but tinted so it does not read as
      just another run nobody happened to check. */
   section.run.ungraded {{ border-left: 5px solid #d9a441; background: #fffbf2; }}
+  section.run.advisory {{ border-left: 5px solid #d9a441; background: #fffbf2; }}
+  section.session.advisory {{ border-left: 6px solid #d9a441; }}
   section.run.dispatch {{ border-top: 1px solid #cddafc; }}
   /* One indent level per nesting depth, capped in the renderer at 5. */
   section.run.d1 {{ margin-left: 2em; }}

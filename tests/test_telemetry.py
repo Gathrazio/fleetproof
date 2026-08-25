@@ -619,3 +619,20 @@ def test_parked_after_a_contradiction_stays_contradicted(era_runs):
     record_verdict(run_id, "contradicted")
     close_dispatch(run_id, reason=REASON_PARKED_PREFIX + "unsatisfiable from this seat")
     assert derive_outcome_class(load_dispatch(run_id)) == CLASS_CONTRADICTED
+
+
+def test_class_advisory_is_its_own_class_never_verified(era_runs):
+    # A blocking failure under a disarmed gate: graded, failed, not blocked.
+    # Not verified, not contradicted, not unverifiable; not a failure record.
+    from fleetproof.telemetry import CLASS_ADVISORY
+    run_id = create_dispatch("work", tier="coordinator")
+    record_report(run_id, _report())
+    record_verdict(run_id, "advisory", detail="1/1 blocking check(s) failed (x)")
+    close_dispatch(run_id)
+    record = load_dispatch(run_id)
+    assert derive_outcome_class(record) == CLASS_ADVISORY
+    assert record.verdict == "advisory"
+    telemetry = build_telemetry(run_id, *_graded(("x",)))
+    assert telemetry["outcome.class"] == CLASS_ADVISORY
+    assert telemetry["failure.incident_id"] is None
+    assert telemetry["fleetproof.derivation_version"] == 4

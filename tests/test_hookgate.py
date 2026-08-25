@@ -2194,10 +2194,46 @@ def test_disarmed_coordinator_dispatch_fails_advisory_never_contradicted(
 
     d = list_dispatches()[0]
     assert d.state == "terminated"
-    assert d.verdict == "verified"
-    assert not any(t.get("state") == "contradicted" for t in d.transitions)
-    verdict_t = next(t for t in d.transitions if t.get("state") == "verified")
-    assert verdict_t["detail"].startswith("advisory: 1/1 blocking check(s) failed (m-widget)")
+    # A third verdict value, never "verified": a failed blocking check must
+    # not read as verified on the board however the detail is worded.
+    assert d.verdict == "advisory"
+    assert not any(t.get("state") in ("contradicted", "verified") for t in d.transitions)
+    verdict_t = next(t for t in d.transitions if t.get("state") == "advisory")
+    assert verdict_t["detail"].startswith("1/1 blocking check(s) failed (m-widget)")
+    assert "coordinator gate disarmed, failures did not block" in verdict_t["detail"]
+    # A verdict exists, so this is not a claim closed with no verdict.
+    assert d.terminated_ungraded is False
+
+
+def test_advisory_verdict_renders_on_the_board_and_classifies_advisory(
+        tmp_path, monkeypatch, capsys):
+    from fleetproof.cli import main
+    from fleetproof.hookgate import ADVISORY, set_arming, subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    from fleetproof.report import build_report
+    from fleetproof.telemetry import CLASS_ADVISORY, load_telemetry
+    _spawn_at_tier(tmp_path, monkeypatch, "coordinator", _intent_manifest(cmd_exit=1))
+    set_arming(ADVISORY, note="build phase", tier="coordinator")
+    _feed(monkeypatch, _stop_payload(message="Coordinating, mid-task."))
+    assert subagent_stop_main() == 0
+    capsys.readouterr()
+    d = list_dispatches()[0]
+
+    assert main(["fleet"]) == 0
+    row = next(line for line in capsys.readouterr().out.splitlines() if d.run_id in line)
+    assert "advisory" in row
+    assert "verified" not in row
+    assert "ungraded" not in row
+    assert "terminated ungraded" not in capsys.readouterr().out
+
+    telemetry = load_telemetry(d.run_id)
+    assert telemetry["outcome.class"] == CLASS_ADVISORY
+    assert telemetry["failure.incident_id"] is None  # not a failure record either
+
+    html = build_report(runlog.list_run_records())
+    # The row's verdict cell is the advisory badge; no cell says verified.
+    assert "<td><span class='badge warn'>advisory</span></td>" in html
+    assert "<td><span class='badge ok'>verified</span></td>" not in html
 
 
 def test_armed_coordinator_dispatch_still_blocks(tmp_path, monkeypatch, capsys):

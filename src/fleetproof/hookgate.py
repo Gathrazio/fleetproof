@@ -73,6 +73,7 @@ from .checks import (
 from .ledger import (
     CAPTURE_START,
     REASON_ABANDONED,
+    STATE_ADVISORY,
     STATE_CONTRADICTED,
     STATE_DISPATCHED,
     STATE_VERIFIED,
@@ -1033,11 +1034,12 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
        above): a dispatch at tier ``coordinator`` (or ``bridge``) while that
        tier's gate is advisory has its blocking failures demoted for the
        decision — mirroring :func:`_spec_gate` — so the verdict is recorded
-       as ``verified`` with an ``advisory:`` detail that names the failures
-       and the disarm, the failure renders in full as context under the
-       advisory marker, nothing blocks, and no ``contradicted`` transition is
-       written (so the ladder neither strikes nor resets). A lane dispatch
-       is graded identically whatever ``arming.json`` says.
+       as ``advisory`` (a third verdict value, never ``verified``) with a
+       detail naming the failures and the disarm, the failure renders in
+       full as context under the advisory marker, nothing blocks, and no
+       ``contradicted`` transition is written (so the ladder neither strikes
+       nor resets). A lane dispatch is graded identically whatever
+       ``arming.json`` says.
 
     When nothing is runnable — the tier selects no repo checks *and* the
     manifest declares none — no verdict is recorded at all: the dispatch is
@@ -1186,12 +1188,14 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
         arming=_arming_stamp(dispatch.tier, arming_state, arming_note))
     if report.blocking_failures and arming_state == ADVISORY:
         # This tier's gate is disarmed: the failure is recorded and rendered
-        # in full, and nothing blocks. The verdict line says "advisory" first
-        # so a verified-with-failures row can never be misread as clean.
+        # in full, and nothing blocks. The verdict is its own value —
+        # ``advisory`` — never ``verified`` with a note: a failed blocking
+        # check must not read as verified on the board, whatever the detail
+        # string says next to it.
         failing_ids = "; ".join(r.id for r in report.blocking_failures)
         record_verdict(
-            dispatch.run_id, STATE_VERIFIED,
-            detail=(f"advisory: {len(report.blocking_failures)}/{report.total} "
+            dispatch.run_id, STATE_ADVISORY,
+            detail=(f"{len(report.blocking_failures)}/{report.total} "
                     f"blocking check(s) failed ({failing_ids}) — {dispatch.tier} "
                     f"gate disarmed, failures did not block"),
             by=VERDICT_BY)

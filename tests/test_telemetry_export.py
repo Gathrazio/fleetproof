@@ -404,3 +404,22 @@ def test_abandoned_is_its_own_class_and_counts_as_a_failure(era_runs):
     assert (m["numerator"], m["denominator"]) == (1, 1)
     m = block["abandoned_rate"]
     assert (m["numerator"], m["denominator"]) == (1, 1)
+
+
+def test_advisory_class_counts_in_d_and_exports_as_its_own_enum(era_runs):
+    from fleetproof.telemetry import CLASS_ADVISORY
+    run_id = create_dispatch("work", tier="coordinator")
+    record_report(run_id, _report())
+    record_verdict(run_id, "advisory")
+    close_dispatch(run_id)
+    build_telemetry(run_id)
+    block = summarize()["windows"]["full"]
+    assert block["counts"][CLASS_ADVISORY] == 1
+    assert block["classifiable_dispatches"] == 1
+    assert (block["advisory_rate"]["numerator"], block["advisory_rate"]["denominator"]) == (1, 1)
+    # Not a graded claim (no false-claim denominator), not a delivery failure.
+    assert block["false_claim_rate"]["denominator"] == 0
+    assert block["delivery_failure_rate"]["numerator"] == 0
+    out = export_telemetry("partner", out_dir=era_runs.parent / "export")
+    bundle = json.loads((out / "telemetry-export.json").read_text(encoding="utf-8"))
+    assert bundle["records"][0]["outcome.class"] == CLASS_ADVISORY
