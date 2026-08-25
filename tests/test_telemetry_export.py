@@ -382,3 +382,25 @@ def test_cli_telemetry_verbs(era_runs, monkeypatch, capsys, tmp_path):
 
     assert main(["telemetry", "export", "--recipient", "acme",
                  "--since", "not-a-date"]) == 2
+
+
+def test_abandoned_is_its_own_class_and_counts_as_a_failure(era_runs):
+    # Not verified, not unverifiable, never folded into contradicted — but a
+    # delivery failure and a false claim in every rate that publishes those.
+    from fleetproof.ledger import REASON_ABANDONED
+    run_id = create_dispatch("work", tier="lane")
+    for attempt in range(3):
+        record_report(run_id, _report(f"attempt {attempt}"))
+        record_verdict(run_id, "contradicted")
+    close_dispatch(run_id, by="hook", reason=REASON_ABANDONED)
+    build_telemetry(run_id)
+
+    block = summarize()["windows"]["full"]
+    assert block["counts"]["abandoned"] == 1
+    assert block["counts"]["contradicted"] == 0  # never double-counted
+    m = block["delivery_failure_rate"]
+    assert (m["numerator"], m["denominator"]) == (1, 1)
+    m = block["false_claim_rate"]
+    assert (m["numerator"], m["denominator"]) == (1, 1)
+    m = block["abandoned_rate"]
+    assert (m["numerator"], m["denominator"]) == (1, 1)

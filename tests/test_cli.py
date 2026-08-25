@@ -566,3 +566,53 @@ def test_fleet_echoes_the_advisory_state(cli_runs, capsys):
     assert main(["fleet"]) == 0
     out = capsys.readouterr().out
     assert "ADVISORY" not in out  # armed is the default; the board stays quiet
+
+
+# === dispatch park (B3) ===
+
+def test_dispatch_park_terminates_with_the_reason(cli_runs, capsys):
+    from fleetproof.ledger import load_dispatch
+    run_id = _dispatch_new(capsys)
+    assert main(["dispatch", "park", run_id,
+                 "--reason", "blocked on operator approval"]) == 0
+    d = load_dispatch(run_id)
+    assert d.state == "terminated"
+    assert d.terminate_reason == "parked: blocked on operator approval"
+
+
+def test_dispatch_park_requires_a_reason(cli_runs, capsys):
+    run_id = _dispatch_new(capsys)
+    with pytest.raises(SystemExit):
+        main(["dispatch", "park", run_id])
+    assert main(["dispatch", "park", run_id, "--reason", "   "]) == 2
+
+
+def test_dispatch_park_refuses_a_terminated_dispatch(cli_runs, capsys):
+    run_id = _dispatch_new(capsys)
+    assert main(["dispatch", "close", run_id]) == 0
+    capsys.readouterr()
+    assert main(["dispatch", "park", run_id, "--reason", "again"]) == 1
+
+
+def test_fleet_labels_abandoned_and_parked(cli_runs, capsys):
+    from fleetproof.ledger import (
+        REASON_ABANDONED, close_dispatch, record_report, record_verdict,
+    )
+    abandoned = _dispatch_new(capsys)
+    record_report(abandoned, {"summary": "claimed done"})
+    record_verdict(abandoned, "contradicted")
+    close_dispatch(abandoned, by="hook", reason=REASON_ABANDONED)
+    parked = _dispatch_new(capsys)
+    assert main(["dispatch", "park", parked, "--reason", "waiting"]) == 0
+    capsys.readouterr()
+
+    assert main(["fleet"]) == 0
+    out = capsys.readouterr().out
+    abandoned_row = next(line for line in out.splitlines() if abandoned in line)
+    # Terminal, loud, and never mistakable for a clean "done" — and the
+    # verdict column keeps saying contradicted, never verified.
+    assert "abandoned!" in abandoned_row
+    assert "contradicted" in abandoned_row
+    parked_row = next(line for line in out.splitlines() if parked in line)
+    assert "parked" in parked_row
+    assert "ungraded" in parked_row

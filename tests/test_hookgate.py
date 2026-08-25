@@ -1388,3 +1388,121 @@ def test_flipping_arming_trips_no_drift_mechanism(tmp_path, monkeypatch):
     monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000002-bbbb02")
     second, code = stop_gate()
     assert second is None  # pass, no drift note, no advisory residue
+
+
+# === escalation ladder: a wedge must terminate, not loop (B3) ===
+
+def test_third_contradiction_abandons_instead_of_blocking(tmp_path, monkeypatch, capsys):
+    # An unsatisfiable blocking check produced an unbounded block/retry loop
+    # (19 cycles observed in a field deployment on Windows). The third
+    # contradiction is terminal: verdict recorded, dispatch abandoned, the
+    # agent allowed to stop, and the dispatcher told the work is NOT verified.
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import REASON_ABANDONED, list_dispatches
+    _setup_project(tmp_path, [_LANE_ARTIFACT], monkeypatch)
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
+
+    for attempt in (1, 2):
+        _feed(monkeypatch, _stop_payload(message=f"Shipped it (attempt {attempt})."))
+        assert subagent_stop_main() == 0
+        decision = json.loads(capsys.readouterr().out)
+        assert decision["decision"] == "block"
+
+    _feed(monkeypatch, _stop_payload(message="Shipped it (attempt 3)."))
+    assert subagent_stop_main() == 0
+    decision = json.loads(capsys.readouterr().out)
+    # No block — and no internal keys leaking into the hook output either.
+    assert set(decision) == {"hookSpecificOutput"}
+    ctx = decision["hookSpecificOutput"]["additionalContext"]
+    assert ctx.startswith("[FLEETPROOF]")
+    assert "abandoned after 3 contradicted stops" in ctx
+    assert "lane-artifact" in ctx
+    assert "NOT verified" in ctx
+    assert "Park it, fix the spec/tier, or re-dispatch." in ctx
+
+    d = list_dispatches()[0]
+    assert d.run_id in ctx
+    assert d.state == "terminated"
+    assert d.verdict == "contradicted"  # abandoned is never verified
+    assert d.terminate_reason == REASON_ABANDONED
+    assert [t["state"] for t in d.transitions] == [
+        "dispatched", "reported", "contradicted", "reported", "contradicted",
+        "reported", "contradicted", "terminated",
+    ]
+
+
+def test_a_fix_before_the_third_stop_still_verifies(tmp_path, monkeypatch, capsys):
+    # The ladder counts contradictions, not stops: two failures and then a
+    # real fix is the retry loop working exactly as designed.
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _setup_project(tmp_path, [_LANE_ARTIFACT], monkeypatch)
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
+
+    for attempt in (1, 2):
+        _feed(monkeypatch, _stop_payload(message=f"Shipped it (attempt {attempt})."))
+        subagent_stop_main()
+        capsys.readouterr()
+
+    (tmp_path / "artifact.txt").write_text("real", encoding="utf-8")
+    _feed(monkeypatch, _stop_payload(message="Really shipped it this time."))
+    assert subagent_stop_main() == 0
+    assert capsys.readouterr().out == ""
+    d = list_dispatches()[0]
+    assert d.verdict == "verified"
+    assert d.state == "terminated"
+
+
+def test_abandoned_agents_next_stop_is_an_orphan_never_a_regrade(
+        tmp_path, monkeypatch, capsys):
+    # An abandoned dispatch is terminal. If the same agent stops again, there
+    # is no non-terminal dispatch to join, so the stop falls through to the
+    # A1 orphan path — it must never re-open or re-grade the abandoned record.
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import list_dispatches, list_orphan_stops
+    _setup_project(tmp_path, [_LANE_ARTIFACT], monkeypatch)
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
+    for attempt in (1, 2, 3):
+        _feed(monkeypatch, _stop_payload(message=f"Shipped it (attempt {attempt})."))
+        subagent_stop_main()
+        capsys.readouterr()
+    d = list_dispatches()[0]
+    transitions_before = list(d.transitions)
+
+    # Even with the check now passing, the abandoned dispatch stays closed.
+    (tmp_path / "artifact.txt").write_text("real", encoding="utf-8")
+    _feed(monkeypatch, _stop_payload(message="Fourth stop after abandonment."))
+    assert subagent_stop_main() == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "orphan" in captured.err
+
+    assert len(list_orphan_stops()) == 1
+    d = list_dispatches()[0]
+    assert d.transitions == transitions_before
+    assert d.verdict == "contradicted"
+
+
+def test_abandonment_context_survives_a_stop_hook_retry(tmp_path, monkeypatch, capsys):
+    # _suppress_on_retry swallows context-only output on a forced continuation
+    # — but the abandonment notice is the loop's terminus and the dispatcher's
+    # only signal, so it must be emitted even when stop_hook_active is set.
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    _setup_project(tmp_path, [_LANE_ARTIFACT], monkeypatch)
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
+    for attempt in (1, 2):
+        _feed(monkeypatch, _stop_payload(message=f"Shipped it (attempt {attempt})."))
+        subagent_stop_main()
+        capsys.readouterr()
+
+    payload = _stop_payload(message="Shipped it (attempt 3).")
+    payload["stop_hook_active"] = True
+    _feed(monkeypatch, payload)
+    assert subagent_stop_main() == 0
+    decision = json.loads(capsys.readouterr().out)
+    assert "abandoned after 3 contradicted stops" in (
+        decision["hookSpecificOutput"]["additionalContext"])

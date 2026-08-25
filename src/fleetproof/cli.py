@@ -15,8 +15,8 @@ surface as it can. Subcommands:
     subagent-stop  SubagentStop-hook entry: the per-subagent report-and-verify gate
     arm       arm the bridge Stop gate (the default state)
     disarm    set the bridge Stop gate to advisory; requires --note
-    dispatch  ledger verbs: new / report / close a dispatch; intent writes the
-              sidecar the SubagentStart capture consumes
+    dispatch  ledger verbs: new / report / close / park a dispatch; intent
+              writes the sidecar the SubagentStart capture consumes
     fleet     the dispatch board — every dispatch, its state, and whether it reported
     telemetry summary (local-only aggregates) / export (allowlisted bundle) /
               anchor (chain head) / loss (the one raw-loss question per failure)
@@ -60,7 +60,9 @@ from .hookgate import (
     subagent_stop_main,
 )
 from .ledger import (
+    REASON_ABANDONED,
     REASON_OPERATOR_CLOSE,
+    REASON_PARKED_PREFIX,
     VALID_TERMINATE_REASONS,
     LedgerError,
     close_dispatch,
@@ -468,6 +470,38 @@ def _cmd_dispatch_close(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_dispatch_park(args: argparse.Namespace) -> int:
+    """Terminate a dispatch as parked: closed on purpose, with the reason kept.
+
+    Parking is the dispatcher's exit for work that cannot be satisfied from
+    its seat (an unsatisfiable check, a wedged or abandoned agent). The reason
+    is required and travels on the terminate transition under the ``parked:``
+    namespace; the parked dispatch is terminal, so a later stop from its agent
+    lands on the orphan path instead of re-grading it.
+    """
+    reason = (args.reason or "").strip()
+    if not reason:
+        _emit_error("bad_reason", "park needs a non-empty --reason.", args.format)
+        return 2
+    try:
+        record = close_dispatch(args.run_id, reason=REASON_PARKED_PREFIX + reason)
+    except LedgerError as e:
+        _emit_error("ledger_error", str(e), args.format)
+        return 1
+    # Same posture as dispatch close: the lifecycle just finished, so the
+    # telemetry record derives here, best-effort.
+    try:
+        build_telemetry(record.run_id)
+    except Exception as e:
+        print(f"[fleetproof] telemetry build failed for {record.run_id}: {e}",
+              file=sys.stderr)
+    if args.format == "json":
+        print(json.dumps(record.to_dict(), indent=2))
+    else:
+        print(f"{record.run_id} -> parked: {reason}")
+    return 0
+
+
 def _format_age(started_at: str | None) -> str:
     """Compact ASCII age of a dispatch: '42s', '17m', '3h05m', '2d04h', or '?'."""
     if not started_at:
@@ -604,6 +638,15 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
     print("tier! = declared, not inferred.  tier? = defaulted (no intent "
           "matched).  (stalled) = reported or graded but never closed.")
     print("ungraded = no verdict on record; an absent grade is not a passing grade.")
+    # Only explained when present, like the orphan count: these two labels are
+    # rare enough that an always-on legend line would drown the common ones.
+    labels = {state_label(r) for r in records}
+    if "abandoned!" in labels:
+        print("abandoned! = terminated after 3 contradicted stops; the work "
+              "was never verified. Park it, fix the spec/tier, or re-dispatch.")
+    if "parked" in labels:
+        print("parked = terminated on purpose with a recorded reason; not "
+              "graded further.")
     if orphans:
         print(_orphan_count_line(orphans))
     return 0
@@ -633,6 +676,7 @@ def _cmd_telemetry_summary(args: argparse.Namespace) -> int:
               f"{block['classifiable_dispatches']} classifiable")
         print(f"  outcomes: {shown if shown else 'none'}")
         for metric in ("delivery_failure_rate", "false_claim_rate",
+                       "abandoned_rate",
                        "near_miss_rate", "verifier_flake_rate",
                        "ungraded_rate", "unverifiable_rate",
                        "telemetry_missing_rate", "stop_only_fraction"):
@@ -844,13 +888,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_dclose.add_argument("run_id")
     # Defaulted, not required: the CLI is the operator's close path, so the
     # honest machine-set reason for it is operator-close. Scripted sweepers and
-    # session-teardown callers override it to say what they actually are.
+    # session-teardown callers override it to say what they actually are. The
+    # abandonment reason is excluded: it is the gate ladder's attestation of
+    # three contradicted stops, not a label an operator may pick.
     p_dclose.add_argument(
-        "--reason", choices=sorted(VALID_TERMINATE_REASONS),
+        "--reason", choices=sorted(VALID_TERMINATE_REASONS - {REASON_ABANDONED}),
         default=REASON_OPERATOR_CLOSE,
         help="Why this dispatch is being terminated (default: operator-close).")
     _add_format(p_dclose)
     p_dclose.set_defaults(func=_cmd_dispatch_close)
+
+    p_dpark = dsub.add_parser(
+        "park",
+        help="Terminate a dispatch as parked: work that cannot be satisfied "
+             "from its seat, closed on purpose with the reason kept. A parked "
+             "dispatch is terminal and is never re-graded.")
+    p_dpark.add_argument("run_id")
+    p_dpark.add_argument(
+        "--reason", required=True,
+        help="Why this dispatch is being parked (required; recorded on the "
+             "terminate transition as 'parked: <reason>').")
+    _add_format(p_dpark)
+    p_dpark.set_defaults(func=_cmd_dispatch_park)
 
     p_tel = sub.add_parser("telemetry", help="Verification-telemetry surfaces.")
     tsub = p_tel.add_subparsers(dest="telemetry_command", required=True)

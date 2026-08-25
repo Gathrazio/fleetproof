@@ -122,11 +122,30 @@ VERDICT_STATES = frozenset({STATE_VERIFIED, STATE_CONTRADICTED})
 REASON_SWEEP_IDLE = "sweep-idle"
 REASON_OPERATOR_CLOSE = "operator-close"
 REASON_SESSION_END = "session-end"
+# Machine-set by the subagent gate's escalation ladder: the third contradicted
+# stop on one dispatch is terminal — the gate stops arguing, the dispatch is
+# abandoned, and the work is on record as never verified.
+REASON_ABANDONED = "abandoned-after-3-contradictions"
 VALID_TERMINATE_REASONS = frozenset({
     REASON_SWEEP_IDLE,
     REASON_OPERATOR_CLOSE,
     REASON_SESSION_END,
+    REASON_ABANDONED,
 })
+
+# The one open-ended reason: "parked: <operator text>". Prefix-namespaced so
+# readers can classify a parked dispatch without a vocabulary entry per park,
+# while the vocabulary above stays closed for everything else. The remainder
+# must be non-blank — a reason-shaped non-reason is what --reason exists to
+# prevent.
+REASON_PARKED_PREFIX = "parked: "
+
+
+def is_parked_reason(reason: str | None) -> bool:
+    """True for a well-formed parked reason (prefix + non-blank remainder)."""
+    return (isinstance(reason, str)
+            and reason.startswith(REASON_PARKED_PREFIX)
+            and bool(reason[len(REASON_PARKED_PREFIX):].strip()))
 
 # Tier vocabulary is defined in :mod:`fleetproof.checks` (the lower-level module,
 # which a check spec's optional "tier" field also validates against) and
@@ -1156,20 +1175,23 @@ def close_dispatch(
 ) -> DispatchRecord:
     """Terminate a dispatch. Legal from any non-terminal state.
 
-    ``reason`` is one of :data:`VALID_TERMINATE_REASONS` and says *why* work
-    was terminated — which, for a dispatch that never reported, is the only
-    thing that separates an idle agent swept off the board from an operator
-    closing shop. Omitting it stays legal (older callers) and reads downstream
-    as "unclassified"; passing an out-of-vocabulary reason is an error, because
-    a free-text reason would be underivable in exactly the way the vocabulary
-    exists to prevent.
+    ``reason`` is one of :data:`VALID_TERMINATE_REASONS` — or a parked reason,
+    ``"parked: <text>"`` with a non-blank remainder — and says *why* work was
+    terminated, which, for a dispatch that never reported, is the only thing
+    that separates an idle agent swept off the board from an operator closing
+    shop. Omitting it stays legal (older callers) and reads downstream as
+    "unclassified"; passing anything else is an error, because a free-text
+    reason would be underivable in exactly the way the vocabulary exists to
+    prevent — the parked prefix is the one namespaced exception, classifiable
+    by its prefix alone.
     """
     extra: dict[str, Any] | None = None
     if reason is not None:
-        if reason not in VALID_TERMINATE_REASONS:
+        if reason not in VALID_TERMINATE_REASONS and not is_parked_reason(reason):
             raise LedgerError(
                 f"Unknown terminate reason {reason!r}; expected one of "
-                f"{sorted(VALID_TERMINATE_REASONS)} or omit it."
+                f"{sorted(VALID_TERMINATE_REASONS)}, "
+                f"'{REASON_PARKED_PREFIX}<text>', or omit it."
             )
         extra = {"reason": reason}
     return _append_transition(run_id, STATE_TERMINATED, by, extra=extra)

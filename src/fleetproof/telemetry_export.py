@@ -51,6 +51,7 @@ from .ledger import (
 )
 from .runlog import runs_dir
 from .telemetry import (
+    CLASS_ABANDONED,
     CLASS_CONTRADICTED,
     CLASS_NEAR_MISS,
     CLASS_SILENT_IDLE,
@@ -215,8 +216,12 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     # they are counted in their own first-class rate, never mixed into D.
     d = sum(counts[c] for c in OUTCOME_CLASSES)
     era_total = sum(1 for row in rows if row["era"])
+    # Abandoned dispatches were graded — three times, wrongly each time — so
+    # they sit in graded claims and in the false-claim numerator alongside
+    # contradicted, while keeping their own first-class rate below.
     graded_claims = (counts[CLASS_VERIFIED] + counts[CLASS_CONTRADICTED]
-                     + counts[CLASS_NEAR_MISS] + counts[CLASS_VERIFIER_FLAKE])
+                     + counts[CLASS_NEAR_MISS] + counts[CLASS_VERIFIER_FLAKE]
+                     + counts[CLASS_ABANDONED])
 
     events_by_source = {"hook": 0, "operator": 0}
     overrides_by_source = {"hook": 0, "operator": 0}
@@ -243,14 +248,19 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         # silent_idle and terminated_unreported ARE failures even though no
         # check ever fired on them.
         "delivery_failure_rate": _frequency(
-            counts[CLASS_CONTRADICTED] + counts[CLASS_SILENT_IDLE]
+            counts[CLASS_CONTRADICTED] + counts[CLASS_ABANDONED]
+            + counts[CLASS_SILENT_IDLE]
             + counts[CLASS_TERMINATED_UNREPORTED], d),
         # Of graded claims, how many were wrong.
-        "false_claim_rate": _rate(counts[CLASS_CONTRADICTED], graded_claims),
+        "false_claim_rate": _rate(
+            counts[CLASS_CONTRADICTED] + counts[CLASS_ABANDONED], graded_claims),
         # Published side by side: near-miss context without flake context is
         # how verifier noise gets sold as caught failures.
         "near_miss_rate": _frequency(counts[CLASS_NEAR_MISS], d),
         "verifier_flake_rate": _frequency(counts[CLASS_VERIFIER_FLAKE], d),
+        # An abandoned dispatch is a wedge the ladder terminated: the rate an
+        # operator tunes specs and tiers against, so it publishes first-class.
+        "abandoned_rate": _frequency(counts[CLASS_ABANDONED], d),
         # Integrity rates: the corpus's own health metrics, always published.
         "ungraded_rate": _frequency(counts[CLASS_UNGRADED], d),
         "telemetry_missing_rate": _rate(counts[BUCKET_TELEMETRY_MISSING], era_total),
@@ -270,7 +280,7 @@ def _severity_distribution(rows: list[dict[str, Any]]) -> dict[str, int]:
     dist = {band: 0 for band in SEVERITY_BANDS}
     dist["unanswered"] = 0
     for row in rows:
-        if row["bucket"] not in (CLASS_CONTRADICTED, CLASS_NEAR_MISS):
+        if row["bucket"] not in (CLASS_CONTRADICTED, CLASS_NEAR_MISS, CLASS_ABANDONED):
             continue
         telemetry = row["telemetry"] if isinstance(row["telemetry"], dict) else {}
         band = telemetry.get("failure.severity_band")

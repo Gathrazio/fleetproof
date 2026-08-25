@@ -64,6 +64,7 @@ from .checks import (
 )
 from .ledger import (
     CAPTURE_START,
+    REASON_ABANDONED,
     STATE_CONTRADICTED,
     STATE_DISPATCHED,
     STATE_VERIFIED,
@@ -556,6 +557,25 @@ CAPTURED_SUBAGENT_TIER = "lane"
 
 VERDICT_BY = "checker-via-hook"
 
+# How many contradicted stops one dispatch gets before the gate stops arguing.
+# An unsatisfiable blocking check produced an unbounded block/retry loop — 19
+# cycles, each a full checker run, with no exit the agent could take (observed
+# in a field deployment on Windows). The third contradiction is terminal: the
+# verdict stands, the dispatch is abandoned, and fixing the spec or the seat
+# becomes the dispatcher's move, not the wedged agent's.
+MAX_CONTRADICTIONS = 3
+
+_ABANDONED_CONTEXT = (
+    "[FLEETPROOF] dispatch {run_id} abandoned after {n} contradicted stops on "
+    "{check_ids} — the work is NOT verified. Park it, fix the spec/tier, or "
+    "re-dispatch.")
+
+# Internal marker on a decision dict whose context must reach the transcript
+# even on a stop-hook continuation: the abandonment notice is the loop's
+# terminus and the dispatcher's only signal, so _suppress_on_retry must not
+# swallow it. Popped before serialization — it never appears in hook output.
+_NEVER_SUPPRESS_KEY = "_fleetproof_never_suppress"
+
 
 def _agent_fields(payload: dict[str, Any]) -> tuple[str | None, str | None]:
     """``(agent_id, agent_type)`` from a subagent payload; None for either if absent."""
@@ -768,8 +788,14 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     4. Grade the agent's own tier of the spec, unioned with the checks declared
        on this dispatch's own manifest (blocking, expect-exit0). Blocking
        failure -> ``contradicted`` and block (the agent gets its turn back, and
-       the retry re-reports onto this same dispatch). Otherwise -> ``verified``
-       and terminate.
+       the retry re-reports onto this same dispatch) — unless this is the
+       dispatch's :data:`MAX_CONTRADICTIONS`-th contradiction, which is
+       terminal: verdict recorded, dispatch abandoned (reason
+       ``abandoned-after-3-contradictions``, never ``verified``), stop
+       allowed, and the dispatcher told in context that the work is NOT
+       verified. A wedge must terminate, not loop; a later stop from the same
+       agent finds only a terminal dispatch and lands on the orphan path.
+       Otherwise -> ``verified`` and terminate.
 
     When nothing is runnable — the tier selects no repo checks *and* the
     manifest declares none — no verdict is recorded at all: the dispatch is
@@ -898,12 +924,34 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
 
     report = run_checks(runnable, record_to_log=True, tier=dispatch.tier)
     if report.blocking_failures:
-        record_verdict(
-            dispatch.run_id,
-            STATE_CONTRADICTED,
-            detail="; ".join(r.id for r in report.blocking_failures),
-            by=VERDICT_BY,
-        )
+        failing_ids = "; ".join(r.id for r in report.blocking_failures)
+        prior_contradictions = sum(
+            1 for t in dispatch.transitions
+            if isinstance(t, dict) and t.get("state") == STATE_CONTRADICTED)
+        record_verdict(dispatch.run_id, STATE_CONTRADICTED,
+                       detail=failing_ids, by=VERDICT_BY)
+        if prior_contradictions + 1 >= MAX_CONTRADICTIONS:
+            # The ladder's top rung: this contradiction is terminal. Blocking
+            # again would be round N+1 of a loop that has already proven it
+            # cannot converge from this seat — so the verdict stands, the
+            # dispatch is abandoned (never verified), the agent may stop, and
+            # the dispatcher is told in context that the work is not done.
+            try:
+                close_dispatch(dispatch.run_id, by="hook", reason=REASON_ABANDONED)
+            except LedgerError as e:
+                sys.stderr.write(
+                    f"[fleetproof] could not abandon dispatch {dispatch.run_id}: {e}\n")
+            _try_build_telemetry(dispatch.run_id, check_report=report, checks=runnable)
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "SubagentStop",
+                    "additionalContext": _ABANDONED_CONTEXT.format(
+                        run_id=dispatch.run_id,
+                        n=prior_contradictions + 1,
+                        check_ids=failing_ids),
+                },
+                _NEVER_SUPPRESS_KEY: True,
+            }, 0
         _try_build_telemetry(dispatch.run_id, check_report=report, checks=runnable)
         return _subagent_block(_failure_reason(report), _evidence_context(report)), 0
 
@@ -931,7 +979,8 @@ def subagent_stop_main() -> int:
         # than no gate.
         sys.stderr.write(f"[fleetproof] subagent-stop gate failed open: {e}\n")
         return 0
-    if decision is not None and _suppress_on_retry(payload, decision):
+    never_suppress = bool(decision.pop(_NEVER_SUPPRESS_KEY, False)) if decision else False
+    if decision is not None and not never_suppress and _suppress_on_retry(payload, decision):
         return code
     if decision is not None:
         sys.stdout.write(json.dumps(decision))

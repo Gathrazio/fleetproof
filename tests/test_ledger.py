@@ -706,3 +706,31 @@ def test_malformed_check_map_rejected(ledger_runs):
     for bad in ("not-an-object", {"d": "not-a-list"}, {"d": [1, 2]}):
         with pytest.raises(LedgerError):
             create_dispatch("work", manifest={"check_map": bad})
+
+
+# === terminate reasons: the ladder's machine reason and the parked namespace ===
+
+def test_close_accepts_the_machine_abandoned_reason(ledger_runs):
+    from fleetproof.ledger import REASON_ABANDONED
+    run_id = create_dispatch("work", tier="lane")
+    record_report(run_id, _ok_report())
+    record_verdict(run_id, STATE_CONTRADICTED)
+    record = close_dispatch(run_id, reason=REASON_ABANDONED)
+    assert record.terminate_reason == REASON_ABANDONED
+
+
+def test_close_accepts_a_parked_reason_with_text(ledger_runs):
+    from fleetproof.ledger import REASON_PARKED_PREFIX
+    run_id = create_dispatch("work", tier="lane")
+    record = close_dispatch(run_id, reason=REASON_PARKED_PREFIX + "waiting on operator")
+    assert record.terminate_reason == "parked: waiting on operator"
+
+
+def test_close_rejects_a_blank_parked_reason(ledger_runs):
+    # The prefix namespaces the one open-ended reason; an empty remainder is
+    # a reason-shaped non-reason, and the vocabulary stays closed otherwise.
+    run_id = create_dispatch("work", tier="lane")
+    with pytest.raises(LedgerError):
+        close_dispatch(run_id, reason="parked: ")
+    with pytest.raises(LedgerError):
+        close_dispatch(run_id, reason="parked:   ")

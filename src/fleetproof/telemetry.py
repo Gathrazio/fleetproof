@@ -53,6 +53,7 @@ from .config import (
 )
 from .ledger import (
     CAPTURE_STOP_ONLY,
+    REASON_ABANDONED,
     REASON_OPERATOR_CLOSE,
     REASON_SESSION_END,
     REASON_SWEEP_IDLE,
@@ -60,6 +61,7 @@ from .ledger import (
     STATE_REPORTED,
     STATE_VERIFIED,
     DispatchRecord,
+    is_parked_reason,
     load_dispatch,
 )
 from .runlog import runs_dir
@@ -68,10 +70,14 @@ TELEMETRY_FILENAME = "telemetry.json"
 
 SCHEMA_VERSION = "fleetproof-telemetry/1.1"
 
-# The outcome-class derivation below implements the spec's nine-row table,
-# which the spec itself labels derivation_version 2 (version 1 being the
-# pre-red-team draft that lacked ungraded and the near-miss/flake split).
-DERIVATION_VERSION = 2
+# The outcome-class derivation below implements the spec's nine-row table
+# (its derivation_version 2; version 1 being the pre-red-team draft that
+# lacked ungraded and the near-miss/flake split) plus the ``abandoned`` class
+# the escalation ladder added — a tenth row, hence version 3. Purely additive:
+# no record written under version 2 can carry the abandonment terminate
+# reason, so re-deriving an older corpus under this version classes every
+# record exactly as before.
+DERIVATION_VERSION = 3
 
 # Every vocabulary a record leans on is pinned per record. The two nulls are
 # honest, not lazy: no OTel-named field carries a non-null value yet (the
@@ -94,6 +100,11 @@ CLASS_VERIFIED = "verified"
 CLASS_NEAR_MISS = "near_miss"
 CLASS_VERIFIER_FLAKE = "verifier_flake"
 CLASS_CONTRADICTED = "contradicted"
+# The escalation ladder's terminal outcome: three contradicted stops on one
+# dispatch, abandoned by the gate. Its own class — not folded into
+# contradicted (a single wrong claim and an agent that wedged for three
+# rounds are different fleet problems), and by construction never verified.
+CLASS_ABANDONED = "abandoned"
 CLASS_UNGRADED = "ungraded"
 CLASS_UNVERIFIABLE = "unverifiable"
 CLASS_SILENT_IDLE = "silent_idle"
@@ -105,6 +116,7 @@ OUTCOME_CLASSES = (
     CLASS_NEAR_MISS,
     CLASS_VERIFIER_FLAKE,
     CLASS_CONTRADICTED,
+    CLASS_ABANDONED,
     CLASS_UNGRADED,
     CLASS_UNVERIFIABLE,
     CLASS_SILENT_IDLE,
@@ -295,6 +307,12 @@ def derive_outcome_class(
         return CLASS_NEAR_MISS if contradicted_hash != verified_hash else CLASS_VERIFIER_FLAKE
 
     if final_verdict == STATE_CONTRADICTED:
+        # The abandonment terminate reason splits a wedged agent (three
+        # contradicted stops, gate gave up) from a single wrong claim. A
+        # *parked* contradicted dispatch stays contradicted: parking closes
+        # the bookkeeping, it does not soften the verdict.
+        if record.terminate_reason == REASON_ABANDONED:
+            return CLASS_ABANDONED
         return CLASS_CONTRADICTED
 
     # No verdict ever recorded.
@@ -303,11 +321,13 @@ def derive_outcome_class(
             return CLASS_UNVERIFIABLE
         return CLASS_UNGRADED
 
-    # Terminated straight from dispatched: the reason is the only derivable split.
+    # Terminated straight from dispatched: the reason is the only derivable
+    # split. A parked reason is an operator's deliberate close, so it lands
+    # beside operator-close rather than in the unclassified bucket.
     reason = record.terminate_reason
     if reason == REASON_SWEEP_IDLE:
         return CLASS_SILENT_IDLE
-    if reason in (REASON_OPERATOR_CLOSE, REASON_SESSION_END):
+    if reason in (REASON_OPERATOR_CLOSE, REASON_SESSION_END) or is_parked_reason(reason):
         return CLASS_TERMINATED_UNREPORTED
     return CLASS_TERMINATED_UNCLASSIFIED
 
@@ -579,7 +599,9 @@ def build_telemetry(
     }
 
     # Failure detail exists only where there is (or was) a failure on record.
-    is_failure = outcome_class in (CLASS_CONTRADICTED, CLASS_NEAR_MISS)
+    # Abandoned counts: three contradicted claims that never converged is a
+    # failure with a measured rework floor, not a neutral termination.
+    is_failure = outcome_class in (CLASS_CONTRADICTED, CLASS_NEAR_MISS, CLASS_ABANDONED)
     raw_loss = existing.get("failure.raw_loss")
     telemetry.update(_failure_block(record, outcome_class, is_failure, raw_loss, existing))
 

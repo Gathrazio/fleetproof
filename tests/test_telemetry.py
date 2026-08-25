@@ -583,3 +583,39 @@ def test_pre_telemetry_hook_stop_writes_no_telemetry(tmp_path, monkeypatch):
     assert decision is None and code == 0
     d = list_dispatches()[0]
     assert not (d.run_dir / "telemetry.json").exists()
+
+
+# === abandoned dispatches (B3): their own class, never verified ===
+
+def test_class_abandoned(era_runs):
+    from fleetproof.ledger import REASON_ABANDONED
+    from fleetproof.telemetry import CLASS_ABANDONED
+    run_id = create_dispatch("work", tier="lane")
+    for attempt in range(3):
+        record_report(run_id, _report(f"attempt {attempt}"))
+        record_verdict(run_id, "contradicted")
+    close_dispatch(run_id, by="hook", reason=REASON_ABANDONED)
+    assert derive_outcome_class(load_dispatch(run_id)) == CLASS_ABANDONED
+    # An abandoned dispatch is a failure on record: it gets the failure block
+    # (incident id, machine severity floor), same as a contradicted one.
+    telemetry = build_telemetry(run_id)
+    assert telemetry["outcome.class"] == CLASS_ABANDONED
+    assert telemetry["failure.incident_id"] is not None
+    assert telemetry["failure.severity_floor"] is not None
+
+
+def test_parked_before_reporting_reads_as_terminated_unreported(era_runs):
+    from fleetproof.ledger import REASON_PARKED_PREFIX
+    run_id = create_dispatch("work", tier="lane")
+    close_dispatch(run_id, reason=REASON_PARKED_PREFIX + "blocked on operator")
+    assert derive_outcome_class(load_dispatch(run_id)) == CLASS_TERMINATED_UNREPORTED
+
+
+def test_parked_after_a_contradiction_stays_contradicted(era_runs):
+    # Parking closes the bookkeeping; it must not soften the verdict.
+    from fleetproof.ledger import REASON_PARKED_PREFIX
+    run_id = create_dispatch("work", tier="lane")
+    record_report(run_id, _report())
+    record_verdict(run_id, "contradicted")
+    close_dispatch(run_id, reason=REASON_PARKED_PREFIX + "unsatisfiable from this seat")
+    assert derive_outcome_class(load_dispatch(run_id)) == CLASS_CONTRADICTED

@@ -31,6 +31,7 @@ from .ledger import (
     CAPTURE_STOP_ONLY,
     DISPATCH_FILENAME,
     DISPATCH_ROOT_TOOL,
+    REASON_ABANDONED,
     ROOT_FILENAME,
     STATE_CONTRADICTED,
     STATE_DISPATCHED,
@@ -39,6 +40,7 @@ from .ledger import (
     TIER_SOURCE_DECLARED,
     TIER_SOURCE_DEFAULTED,
     DispatchRecord,
+    is_parked_reason,
 )
 from .runlog import RunRecord, list_run_records
 
@@ -83,6 +85,14 @@ def state_label(dispatch: DispatchRecord) -> str:
     if state == STATE_DISPATCHED:
         return "in-fleet (awaiting report)"
     if state == STATE_TERMINATED:
+        reason = dispatch.terminate_reason
+        if reason == REASON_ABANDONED:
+            # Terminal after three contradicted stops. Loud on purpose: the
+            # one thing this row must never read as is a clean "done" — the
+            # work was never verified, and the dispatcher owes it a decision.
+            return "abandoned!"
+        if is_parked_reason(reason):
+            return "parked"
         return "done" if dispatch.has_report else "done (no report)"
     return f"{state} (stalled)"
 
