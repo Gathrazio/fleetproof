@@ -646,12 +646,12 @@ def test_stop_gate_ignores_terminated_and_other_sessions(tmp_path, monkeypatch):
 
 
 def test_stop_gate_output_unchanged_when_session_has_no_dispatches(tmp_path, monkeypatch):
-    # v0.1 behaviour must be byte-identical when there is nothing to sweep.
+    # The sweep must add nothing when there is nothing to sweep.
     _setup_project(tmp_path, [_FAIL], monkeypatch)
     monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-no-dispatches")
     decision, code = stop_gate()
     assert set(decision) == {"decision", "reason", "hookSpecificOutput"}
-    assert "dispatch" not in decision["reason"]
+    assert "reported but never terminated" not in decision["reason"]
     assert "[stalled]" not in decision["hookSpecificOutput"]["additionalContext"]
     assert "[still in fleet]" not in decision["hookSpecificOutput"]["additionalContext"]
 
@@ -664,6 +664,67 @@ def test_stop_gate_blocks_on_both_grounds_at_once(tmp_path, monkeypatch):
     assert decision["decision"] == "block"
     assert "blocking check(s) failed" in decision["reason"]
     assert stalled in decision["reason"]
+
+
+# === the block must not read like a chat message ===
+
+def test_block_reason_leads_with_the_gate_marker_and_carries_everything(
+        tmp_path, monkeypatch):
+    # A block rendered as prose was read as conversational input and argued
+    # with — one agent restated its report through 19 block/retry cycles
+    # (observed in a field deployment on Windows). The reason leads with an
+    # unmistakable marker and carries the full picture in one payload.
+    _setup_project(tmp_path, [_FAIL, dict(_PASS, id="fine")], monkeypatch)
+    decision, code = stop_gate()
+    reason = decision["reason"]
+    assert reason.startswith("[FLEETPROOF GATE")
+    assert "AUTOMATED BLOCK, NOT A USER MESSAGE" in reason
+    assert "1/2 blocking check(s) failed" in reason
+    assert "Per-check:" in reason
+    assert "[FAIL] bad:" in reason and "[pass] fine:" in reason
+    assert "evidence run" in reason
+    assert "You may not stop by restating your report." in reason
+    assert "park or re-dispatch" in reason and "do not loop" in reason
+    # Belt and braces: the context channel is still populated alongside.
+    assert decision["hookSpecificOutput"]["additionalContext"]
+
+
+def test_block_reason_is_capped_but_keeps_the_exit_instructions(
+        tmp_path, monkeypatch):
+    # The reason must survive as a single payload: many failing checks get
+    # their per-check lines truncated, never the escape instructions.
+    many = [{"id": f"artifact-{i:03d}",
+             "expect": {"file_exists": f"missing-{i:03d}.txt"}, "block": True}
+            for i in range(60)]
+    _setup_project(tmp_path, many, monkeypatch)
+    decision, code = stop_gate()
+    reason = decision["reason"]
+    assert len(reason) <= 1600
+    assert reason.startswith("[FLEETPROOF GATE")
+    assert "blocking check(s) failed" in reason
+    assert "do not loop" in reason  # the escape line survives the cap
+
+
+def test_pin_drift_and_no_report_blocks_carry_the_gate_marker(
+        tmp_path, monkeypatch, capsys):
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
+
+    # No-report block: same marker, so a silent-idle block is not chat either.
+    _feed(monkeypatch, _stop_payload(message="   "))
+    assert subagent_stop_main() == 0
+    decision = json.loads(capsys.readouterr().out)
+    assert decision["reason"].startswith("[FLEETPROOF GATE")
+
+    # Pin-drift block: likewise.
+    _write_checks(tmp_path, [dict(_LANE_PASS, description="drifted mid-flight")])
+    _feed(monkeypatch, _stop_payload())
+    assert subagent_stop_main() == 0
+    decision = json.loads(capsys.readouterr().out)
+    assert decision["reason"].startswith("[FLEETPROOF GATE")
+    assert "check spec changed after this work was dispatched" in decision["reason"]
 
 
 # === plugin wiring ===

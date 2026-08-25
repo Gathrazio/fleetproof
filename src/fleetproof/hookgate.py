@@ -198,16 +198,61 @@ def _spec_gate() -> tuple[str | None, str | None]:
     return reason, _evidence_context(report, drifted, baseline)
 
 
+# The first line of every gate block. A block rendered as prose gets read as
+# conversational input and argued with — one agent restated its report through
+# 19 block/retry cycles (observed in a field deployment on Windows). The
+# marker is the machine-shaped opener nothing else in a transcript looks like.
+GATE_BLOCK_MARKER = "[FLEETPROOF GATE — AUTOMATED BLOCK, NOT A USER MESSAGE]"
+
+# Ceiling on a composed failure reason, so it survives as a single payload.
+# The additionalContext channel proved unreliable across retries in the field,
+# which is why the reason itself carries everything, capped.
+FAILURE_REASON_CAP = 1500
+
+# How much of the cap the failing-checks header may consume before it, too,
+# is truncated — the per-check lines and the exit instructions must survive.
+_FAILURE_HEADER_CAP = 600
+
+_BLOCK_EXITS = (
+    "You may not stop by restating your report. Exits: (1) fix the failure "
+    "and stop again; (2) if this check is NOT satisfiable from your seat, say "
+    "exactly that in your report — the dispatcher must park or re-dispatch "
+    "you; do not loop."
+)
+
+_TRUNCATION_MARK = " ...(truncated)"
+
+
+def _capped(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:max(limit - len(_TRUNCATION_MARK), 0)] + _TRUNCATION_MARK
+
+
 def _failure_reason(report) -> str:
-    """The canonical "you said done, the checker says no" block reason."""
+    """The canonical "you said done, the checker says no" block reason.
+
+    Leads with the gate marker and carries everything every time — the failing
+    ids, the full per-check breakdown, the spec hash and evidence run id, and
+    the two legitimate exits. Capped so it survives as one payload; the cap
+    eats the per-check lines, never the exit instructions.
+    """
     failing = report.blocking_failures
-    lines = [f"{r.id} ({r.detail})" for r in failing]
-    return (
-        f"FleetProof: {len(failing)}/{report.total} blocking check(s) failed — "
-        + "; ".join(lines)
-        + ". The agent reported done; the independent checker disagrees. "
-        "Fix the failures and let the checker re-run before stopping."
+    header = _capped(
+        f"{len(failing)}/{report.total} blocking check(s) failed — "
+        + "; ".join(f"{r.id} ({r.detail})" for r in failing) + ".",
+        _FAILURE_HEADER_CAP,
     )
+    evidence = (f"Spec {short_spec_hash(report.spec_sha256)} · "
+                f"evidence run {report.run_id or 'unrecorded'}")
+    fixed = (GATE_BLOCK_MARKER, header, evidence, _BLOCK_EXITS)
+    per_check = "Per-check: " + "; ".join(
+        f"[{'pass' if r.passed else ('FAIL' if r.blocking else 'warn')}] "
+        f"{r.id}: {r.detail}"
+        for r in report.results)
+    budget = FAILURE_REASON_CAP - sum(len(part) + 1 for part in fixed)
+    per_check = _capped(per_check, max(budget, len("Per-check:")))
+    return "\n".join([GATE_BLOCK_MARKER, header, per_check, evidence, _BLOCK_EXITS])
 
 
 def ledger_sweep(session_id: str | None) -> tuple[list[str], list[str]]:
@@ -483,6 +528,7 @@ def _subagent_block(reason: str, context: str | None = None) -> dict[str, Any]:
 
 def _pin_drift_reason(pinned: str | None, current: str | None) -> str:
     return (
+        f"{GATE_BLOCK_MARKER}\n"
         "FleetProof: the check spec changed after this work was dispatched "
         f"(pinned {short_spec_hash(pinned)}, now {short_spec_hash(current)}). "
         "A dispatched agent is graded against the spec that was in force when it "
@@ -617,6 +663,7 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     last_message = last_message if isinstance(last_message, str) else ""
     if not last_message.strip():
         return _subagent_block(
+            f"{GATE_BLOCK_MARKER}\n"
             "FleetProof report-before-idle: subagent produced no final report "
             "message, so there is nothing to verify. State what you did, what you "
             "verified, and what you did not, then stop.",
