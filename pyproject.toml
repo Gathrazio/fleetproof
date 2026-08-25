@@ -35,6 +35,11 @@ fleetproof = "fleetproof.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# The shipped check library (fleetproof init --library): three argv-form
+# grader scripts and their fixtures, copied into .fleetproof/checks/lib/.
+[tool.setuptools.package-data]
+fleetproof = ["library/*.py", "library/fixtures/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

@@ -3,7 +3,8 @@
 Stdlib only (argparse) — a verification tool should add as little dependency
 surface as it can. Subcommands:
 
-    init      write a starter .fleetproof/checks.json
+    init      write a starter .fleetproof/checks.json; --library installs the
+              shipped check library under .fleetproof/checks/lib/
     check     run the independent checker, record the verdict, exit non-zero on block
     check control  record a grader control (pass/fail samples + provenance) for one check
     list      list recorded runs, newest first
@@ -174,7 +175,55 @@ def _print_liveness_line(soft_when_unknown: bool = False) -> None:
         print(_LIVENESS_WARNING, file=sys.stderr)
 
 
+def _cmd_init_library(args: argparse.Namespace) -> int:
+    """Install the shipped check library beside the spec, inside the tree pin.
+
+    Three graders a field deployment hand-wrote in a hurry — and one of
+    them demanded a field its target had never emitted (observed in a field
+    deployment on Windows). Each ships with a header saying what it asserts,
+    its source of truth, and how to capture a control sample; the fixture
+    directory holds one EXAMPLE emission and a README telling you to replace
+    it with a captured one. Existing files are never overwritten without
+    --force: once under .fleetproof/checks/ the repo owns them.
+    """
+    from .checks import checks_tree_dir
+    from .library import LIBRARY_DIRNAME, SUGGESTED_ENTRIES, install_library
+    spec_path = Path(args.path) if args.path else default_checks_path()
+    tree = checks_tree_dir(spec_path)
+    written, skipped = install_library(tree, force=args.force)
+    lib_dir = tree / LIBRARY_DIRNAME
+    if args.format == "json":
+        print(json.dumps({
+            "ok": True,
+            "library_dir": str(lib_dir),
+            "written": [str(p) for p in written],
+            "skipped": [str(p) for p in skipped],
+            "suggested_checks": SUGGESTED_ENTRIES,
+        }, indent=2))
+        return 0
+    print(f"Check library at {lib_dir}: {len(written)} file(s) written, "
+          f"{len(skipped)} left as-is" + (" (use --force to overwrite)." if skipped else "."))
+    for p in written:
+        print(f"  wrote   {p}")
+    for p in skipped:
+        print(f"  kept    {p}")
+    print("These files are inside the checks-tree pin from now on: edit them "
+          "between phases, not under pinned dispatches.")
+    print("Each script's header states what it asserts, its source of truth, "
+          "and how to capture a control sample for it; register a captured "
+          "sample with `fleetproof check control <id> --pass-sample <file> "
+          "--provenance captured`.")
+    print()
+    print("Suggested checks.json entries (edit --base, --url, --field to your repo; "
+          "quote field names from the emitter's source):")
+    for entry in SUGGESTED_ENTRIES:
+        print(json.dumps(entry))
+    return 0
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
+    if getattr(args, "library", False):
+        return _cmd_init_library(args)
     path = Path(args.path) if args.path else default_checks_path()
     if path.exists() and not args.force:
         print(f"Refusing to overwrite existing {path} (use --force).", file=sys.stderr)
@@ -1306,9 +1355,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"fleetproof {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_init = sub.add_parser("init", help="Write a starter .fleetproof/checks.json.")
-    p_init.add_argument("--path", default=None, help="Where to write the spec.")
-    p_init.add_argument("--force", action="store_true", help="Overwrite an existing spec.")
+    p_init = sub.add_parser(
+        "init",
+        help="Write a starter .fleetproof/checks.json; with --library, install the "
+             "shipped check library under .fleetproof/checks/lib/ instead.")
+    p_init.add_argument("--path", default=None,
+                        help="Where to write the spec (the library installs beside it).")
+    p_init.add_argument("--force", action="store_true",
+                        help="Overwrite an existing spec (or existing library files).")
+    p_init.add_argument("--library", action="store_true",
+                        help="Install the shipped check library (worktree_landed.py, "
+                             "py_tests_pinned.py, http_json_field.py + fixtures) under "
+                             ".fleetproof/checks/lib/ and print the suggested "
+                             "checks.json entries. Existing files are kept unless --force.")
+    _add_format(p_init)
     p_init.set_defaults(func=_cmd_init)
 
     p_check = sub.add_parser("check", help="Run the independent checker and record the verdict.")

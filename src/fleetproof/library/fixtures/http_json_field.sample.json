@@ -1,0 +1,9 @@
+{
+  "status": "ok",
+  "service": "example-daemon",
+  "sati_cert": {
+    "checked": true,
+    "days_remaining": 67.1,
+    "source": "cache_file"
+  }
+}
