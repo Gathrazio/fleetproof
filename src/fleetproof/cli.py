@@ -342,8 +342,11 @@ def _resolve_prompt(args: argparse.Namespace) -> str:
 
 
 def _load_json_file(path: str, label: str) -> dict:
+    # utf-8-sig: PowerShell redirection writes UTF-8 with a BOM, and a
+    # BOM-prefixed manifest or report must not be rejected as invalid JSON
+    # (same rationale as the spec loader's utf-8-sig read of checks.json).
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     except OSError as e:
         raise ValueError(f"Could not read {label} {path}: {e}") from e
     except json.JSONDecodeError as e:

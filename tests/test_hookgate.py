@@ -1280,6 +1280,27 @@ def test_malformed_manifest_check_entries_are_skipped_loudly(
     assert list_dispatches()[0].verdict == "verified"
 
 
+def test_bom_prefixed_intent_sidecar_is_consumed_with_its_real_prompt(
+        tmp_path, monkeypatch):
+    # An operator hand-writing a sidecar from a Windows shell gets a UTF-8 BOM
+    # for free; the consume side must read it as the intent it is, not degrade
+    # to the placeholder (same rationale as checks.json's utf-8-sig read).
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import intents_dir, list_dispatches
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    intents_dir().mkdir(parents=True, exist_ok=True)
+    (intents_dir() / "tester.json").write_bytes(
+        b"\xef\xbb\xbf" + json.dumps(
+            {"agent_type": "tester", "prompt": _INTENT_PROMPT, "tier": "lane"},
+        ).encode("utf-8"))
+    _feed(monkeypatch, _start_payload())
+
+    assert subagent_start_main() == 0
+    d = list_dispatches()[0]
+    assert d.prompt == _INTENT_PROMPT
+    assert d.tier == "lane"
+
+
 def test_manifest_check_cmd_may_be_an_argv_list(tmp_path, monkeypatch, capsys):
     # B5 reaches the manifest too: an argv-form cmd runs without a shell, and
     # its metacharacter argument arrives literally.

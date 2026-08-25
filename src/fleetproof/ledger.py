@@ -368,9 +368,15 @@ class DispatchRecord:
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
-    """Read a JSON object, or None if missing/unreadable/not an object."""
+    """Read a JSON object, or None if missing/unreadable/not an object.
+
+    utf-8-sig, not utf-8: the ledger's own files never carry a BOM, but this
+    also reads operator-supplied files (an intent sidecar written from a
+    Windows shell), and a BOM must not turn a real file into "unreadable"
+    (same rationale as the spec loader's utf-8-sig read of checks.json).
+    """
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         return None
     return data if isinstance(data, dict) else None
@@ -837,8 +843,13 @@ def consume_intent(agent_type: str | None) -> tuple[dict[str, Any] | None, list[
         return None, notes
     raw: dict[str, Any] | None = None
     if raw_bytes is not None:
+        # utf-8-sig: a sidecar hand-written from a Windows shell arrives with
+        # a BOM, which must not degrade a real intent to the placeholder
+        # capture. The recorded intent_source hash stays over the raw bytes,
+        # BOM included — attribution hashes what was on disk, not what it
+        # decoded to.
         try:
-            parsed = json.loads(raw_bytes.decode("utf-8"))
+            parsed = json.loads(raw_bytes.decode("utf-8-sig"))
             raw = parsed if isinstance(parsed, dict) else None
         except (json.JSONDecodeError, UnicodeDecodeError):
             raw = None

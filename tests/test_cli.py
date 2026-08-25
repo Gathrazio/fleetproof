@@ -142,6 +142,25 @@ def test_dispatch_new_with_manifest_file(cli_runs, tmp_path, capsys):
     assert record["manifest"]["notes"] == "n"
 
 
+def test_dispatch_new_manifest_with_a_bom_is_accepted(cli_runs, tmp_path, capsys):
+    # PowerShell redirection writes UTF-8 with a BOM; a BOM-prefixed manifest
+    # must not be rejected as invalid JSON (same rationale as the spec
+    # loader's utf-8-sig read of checks.json).
+    mf = tmp_path / "manifest.json"
+    mf.write_bytes(b"\xef\xbb\xbf" + json.dumps({"deliverables": ["a"]}).encode("utf-8"))
+    assert main(["dispatch", "new", "--prompt", "work", "--manifest", str(mf),
+                 "--format", "json"]) == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["manifest"]["deliverables"] == ["a"]
+
+
+def test_dispatch_report_with_a_bom_is_accepted(cli_runs, tmp_path, capsys):
+    run_id = _dispatch_new(capsys)
+    rf = tmp_path / "report.json"
+    rf.write_bytes(b"\xef\xbb\xbf" + json.dumps({"summary": "done"}).encode("utf-8"))
+    assert main(["dispatch", "report", run_id, "--report", str(rf)]) == 0
+
+
 def test_dispatch_new_bad_manifest_file(cli_runs, tmp_path, capsys):
     mf = tmp_path / "manifest.json"
     mf.write_text("{not json", encoding="utf-8")
