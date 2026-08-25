@@ -65,6 +65,7 @@ No language model sits in the grading path. Grading is comparison.
 | `fleetproof report` | One self-contained HTML file: per run, claimed-done vs. independently-verified. |
 | `fleetproof telemetry` | v0.3: per-dispatch outcome records, a local reliability summary, and a strict-allowlist export. |
 | `fleetproof arm` / `disarm`, `dispatch park`, `fleet --orphans` | v0.4: the fleet-operating surface — phase arming, deliberate termination, and the orphan-stop view. |
+| `dispatch intent --preflight`, `check control`, `phase advance`, `init --library` | v0.5: grader integrity — see the grader run before pinning it, record what it was controlled against, retire a check its phase has outgrown, and start from graders that carry their own source of truth. |
 
 Runtime dependencies: none (Python standard library only). A tool whose job is
 being trustworthy should add as little dependency and supply-chain surface as it can.
@@ -80,19 +81,24 @@ So v0.2 records a dispatch at launch — before any work happens — as its own 
 
 ```
 .fleetproof/runs/<run-id>/
-    _root.json      root_tool="dispatch", parent_run_id -> the dispatching run
-    dispatch.json   the prompt, the tier, the manifest, the transitions
-    report.json     what the dispatched agent claimed (written when it reports)
+    _root.json        root_tool="dispatch", parent_run_id -> the dispatching run
+    dispatch.json     the prompt, the tier, the manifest, the transitions
+    report.json       what the dispatched agent claimed (the latest report)
+    reports/NNN.json  every report, in order — a retry overwrites report.json,
+                      never this (v0.5)
+    blocks/NNN.txt    the verbatim block text the agent received, per block;
+                      NNN.meta.json beside it names the checker run (v0.5)
 ```
 
 Nothing grades itself here either. The dispatching process writes `dispatch.json`;
 the report is the dispatched agent's own claim; the `verified` / `contradicted`
-transition is appended by the checker, from a different process.
+/ `advisory` transition is appended by the checker, from a different process.
 
 ### The lifecycle
 
 ```
 dispatched -> reported -> verified ------------------> terminated
+     |            |          advisory -----------------> terminated
      |            ^          contradicted -> terminated
      |            |               |
      |            +---------------+   (the gate blocked, the agent fixed it, the
@@ -101,7 +107,11 @@ dispatched -> reported -> verified ------------------> terminated
 ```
 
 A dispatch's state is its last transition, and `terminated` is the only terminal
-one. Two things in that diagram are deliberate:
+one. There are three verdicts: `verified` (the claim survived its blocking
+checks), `contradicted` (a blocking check failed and the stop was blocked), and
+— as of 0.5.0 — `advisory` (a blocking check failed while that tier's gate was
+disarmed, so nothing blocked; see *Operating a fleet*). A dispatch with none of
+the three is `ungraded`. Two things in that diagram are deliberate:
 
 - `terminated` is reachable from everywhere, including straight from `dispatched`.
   An agent killed before it ever reported is a thing that happens; a ledger that
@@ -138,7 +148,12 @@ never inferred — it is a role you assign, not a shape that shows up in a run t
 On the board a declared tier carries a trailing `!`, so you can tell a decision
 from a guess — and a tier that is neither declared nor inferred but *defaulted*
 (a captured spawn no intent matched) renders as `lane?`, because a guess
-wearing a declared tier's clothes is how a leaf gets graded as a lane.
+wearing a declared tier's clothes is how a leaf gets graded as a lane. A fourth
+provenance, `inherited` (`lane~`), means no sidecar matched this spawn but an
+earlier dispatch of the same agent type in the same session carried a declared
+intent, and this one took its prompt, manifest, and tier from that record
+(`inherited_from` names it). The `tier_source` field on the record carries the
+word; the board carries the glyph.
 
 ### The two new hooks
 
@@ -160,11 +175,13 @@ SubagentStop is the gate. Each step is its own reason to refuse the stop:
    there is nothing to mis-grade — the drift is noted and the stop allowed,
    ungraded.
 3. That agent's tier of the spec, unioned with any checks declared on the
-   dispatch's own manifest (`{"id", "cmd"}` entries — blocking, expect-exit0).
-   A blocking failure records `contradicted` and blocks; a pass records
-   `verified` and closes the dispatch. If nothing is runnable — the tier selects
-   no repo checks and the manifest declares none — no verdict is recorded: an
-   absent grade must never read as a passing one.
+   dispatch's own manifest (the full spec-check shape with `cmd` for `run`;
+   a bare `{"id", "cmd"}` entry is blocking, expect-exit0). A blocking
+   failure records `contradicted` and blocks; a pass records `verified` and
+   closes the dispatch; a blocking failure under a disarmed coordinator gate
+   records `advisory` and closes it. If nothing is runnable — the tier
+   selects no repo checks and the manifest declares none — no verdict is
+   recorded: an absent grade must never read as a passing one.
 
 Two guardrails around the gate. A SubagentStop with no dispatch to join —
 harness-internal helper agents emit these every session — is recorded as an
@@ -193,9 +210,19 @@ fleetproof dispatch close <run-id>
 fleetproof dispatch park <run-id> --reason "..."  # terminate on purpose, reason kept
 
 fleetproof dispatch intent --agent recon --prompt-file p.md \
-    [--manifest m.json] [--tier lane] [--role tester]
+    [--manifest m.json] [--tier lane] [--role tester] \
+    [--preflight] [--strict-controls]
                                               # declare the NEXT spawn of an agent
-                                              # type; the start capture consumes it
+                                              # type; the start capture consumes it.
+                                              # --preflight runs the manifest checks
+                                              # now and records nothing (v0.5)
+fleetproof dispatch new --session-id <id> ... # or export FLEETPROOF_SESSION_ID: a
+                                              # session-less CLI dispatch can never
+                                              # be adopted by a hook stop (v0.5)
+
+fleetproof check control <check-id> --pass-sample f [--fail-sample g] \
+    --provenance captured|authored [--manifest m.json]
+                                              # the grader control ledger (v0.5)
 
 fleetproof fleet                              # the board, newest first
 fleetproof fleet --open                       # only what has not terminated
@@ -204,8 +231,12 @@ fleetproof fleet --format json                # full records, for an agent to re
 
 fleetproof check --tier lane                  # grade one rung of the spec
 
-fleetproof arm                                # bridge Stop gate blocks (the default)
-fleetproof disarm --note "why"                # bridge gate advisory; note required
+fleetproof arm [--tier coordinator]           # a gate blocks (the default)
+fleetproof disarm --note "why" [--tier ...]   # a gate goes advisory; note required
+
+fleetproof phase advance --retire <id> --note "why"   # retire a check outside
+fleetproof phase status / phase reset                 # the hashed spec (v0.5)
+fleetproof init --library                     # the shipped check library (v0.5)
 ```
 
 The board never prints a bare dash where a verdict goes. A dispatch nothing graded
@@ -250,15 +281,32 @@ reliability data an operator can actually read — and, when they choose to, sha
 Enable it per repo with `.fleetproof/config.json`:
 
 ```json
-{ "telemetry_era": "2026-08-21" }
+{ "telemetry_era": "2026-08-21", "run_context": "production" }
 ```
 
 From that date, every dispatch gains a `telemetry.json`, written on the checker/hook
 side at verdict or close time — never by the agent being measured. Runs from before
 the date read back as pre-telemetry and are never back-filled or guessed.
 
-Each finished dispatch derives one of nine **outcome classes** from its transition
-history — bookkeeping, not judgment:
+**Telemetry is off until you set the era, and the summary says so.** With no
+well-formed `telemetry_era` in the config, `fleetproof telemetry summary` prints
+first — before any number — `telemetry is OFF for this repo: no telemetry_era
+in .fleetproof/config.json — set it (YYYY-MM-DD) to begin classifying
+dispatches created from that date; pre-telemetry dispatches are never
+back-filled.` With an era set but every dispatch in a window created before
+it, the window says `all N dispatch(es) in this window predate telemetry_era
+<date>`. And over zero classifiable dispatches the severity line reads
+`severity: n/a (0 classifiable)`, never `no failures` — a fleet that was never
+measured is not a fleet with no failures (a four-lane run with a real
+`abandoned` and two real contradictions once summarised as exactly that). The
+JSON form carries `"telemetry_era"` (null when off). `run_context` defaults to
+`production` when unset: real work must not fall into a discounted bucket by
+omission, so drills and synthetic load are the cases that need declaring —
+set it alongside the era, or your control-plane traffic counts as production
+from the day telemetry turns on.
+
+Each finished dispatch derives one of eleven **outcome classes** from its
+transition history — bookkeeping, not judgment:
 
 - `verified` — the claim survived the checks.
 - `near_miss` — a gate-blocked retry whose work product *changed* before passing:
@@ -267,6 +315,11 @@ history — bookkeeping, not judgment:
   contradiction was wrong, not the work. Counted separately so flaky checks can't
   inflate the near-miss number.
 - `contradicted` — the claim did not survive.
+- `abandoned` — three contradicted stops on one dispatch; the ladder released
+  the agent. Never `verified`.
+- `advisory` — a blocking check failed while that tier's gate was disarmed, so
+  the stop was allowed on an operator's recorded switch. Graded, not verified,
+  not contradicted; published as its own rate and never counted as success.
 - `ungraded` — checks existed but no verdict ever landed. This is a control
   failure and every summary says so; it is never folded into a benign class.
 - `unverifiable` — reported, but nothing in the claim was checkable. Never counts
@@ -324,40 +377,6 @@ spawn: the row should show the real prompt and a `tier!`. A `lane?` means no
 intent matched — the dispatch is running with a placeholder prompt at a
 defaulted tier, and the capture you thought you declared didn't happen.
 
-**See the grader run before you pin it.** `fleetproof dispatch intent
---preflight` (and `dispatch new --manifest ... --preflight`) runs every
-manifest check right now, from the project root, with the runner the gate
-uses, and prints per check the exact command line as the runner sees it, the
-exit code, the expectation, PASS/FAIL, and a redacted stdout/stderr tail.
-Nothing is recorded under `runs/` and the exit code is 0 whatever the checks
-did: the work has not happened yet, most checks are expected to fail, and the
-point is to watch the command meet the real target — a grader demanding a
-field the target has never emitted is visible here, before an agent with a
-deploy path and a deadline is pointed at it. A malformed check is an error at
-this step, not a skipped line in a hook's stderr. And the line preflight
-closes with is the rule that would have caught the field's deployed mistake:
-a positive control must be a captured real emission, never authored by the
-check's author.
-
-**Every blocking check gets a grader control, and the pass sample is a
-captured emission.** `fleetproof check control <check-id> --pass-sample
-<file> [--fail-sample <file>] --provenance captured|authored [--note ...]
-[--manifest <file>]` records, under `.fleetproof/controls/<check-id>.json`,
-the sha256 and path of each sample, the provenance of the pass sample, who
-recorded it and when, and — when the check can be resolved from the manifest
-file or the repo spec — the observed exit and grade per direction. The
-sample reaches the check as the environment variable
-`FLEETPROOF_CONTROL_SAMPLE`; a controllable check reads that variable and
-grades the file it names instead of the live target. The controls directory
-is outside the hashed checks tree on purpose: a control is evidence about a
-grader, not a grader, and recording one trips no drift pin. `dispatch
-intent` and `dispatch new --manifest` then print one loud stderr warning per
-blocking manifest check that has no control or whose only pass sample is
-`authored`; `--strict-controls` turns the warning into a refusal with nothing
-written. This is the check that would have caught the field's deployed
-mistake: the grader and its sample data had one author and one belief, and
-the only party that disagreed was the running product.
-
 **Never dispatch an agent against a blocking check its seat cannot satisfy.**
 A lane gated on something only the bridge or the operator can do will fail,
 retry, and fail again — the gate is working; the dispatch was wrong. Declare
@@ -395,13 +414,19 @@ coordinator-tier dispatches in the subagent gate: a coordinator ends many
 turns per task too, and a blocking coordinator-tier check that can only pass
 at the end would otherwise wedge every mid-task stop — the field's workaround
 was authoring such checks `block: false`, which left the coordinator's own
-deliverable ungated. A disarmed coordinator's failing check is recorded
-(verdict `verified` with an `advisory:` detail naming the failures), rendered
-in full as context, never blocks, and never counts as a contradiction. Each
-tier carries its own note. **Lanes are never disarmable** — `--tier lane` is
-refused with that sentence; a lane's stop is the claim being verified. The
-ledger sweep still blocks on stalled dispatches regardless of arming, and the
-abandonment ladder neither sees nor is reset by it.
+deliverable ungated. A disarmed coordinator's failing check is recorded as
+verdict **`advisory`** — a third verdict value, never `verified` with a note,
+because a failed blocking check must not read as verified on the board — with
+a detail naming the failures and the disarm; it renders in full as context,
+never blocks, and never counts as a contradiction. Each tier carries its own
+note. **Lanes are never disarmable** — `--tier lane` is refused with that
+sentence; a lane's stop is the claim being verified. The ledger sweep still
+blocks on stalled dispatches regardless of arming, and the abandonment ladder
+neither sees nor is reset by it. One interaction worth knowing: the
+stalled-dispatch sweep and the abandonment ladder are unaware of each other —
+a lane between its second and third contradicted stop is, to the bridge's
+sweep, a dispatch that reported and never terminated, so the bridge's own stop
+is refused as "stalled" until the ladder finishes or the dispatch is parked.
 
 Every checker run a gate orders stamps the arming that governed it into its
 `output.json` — `"arming": {"tier": "bridge", "state": "advisory", "note":
@@ -442,6 +467,175 @@ arbitrary code before recording it would be false comfort about what your
 agents ran, so a secret typed on a command line is a secret in the run log,
 full stop. Never type one. And add `.fleetproof/runs/` to `.gitignore` — it
 is evidence, not source.
+
+## Operating a fleet (v0.5)
+
+v0.5 is the *confidence* release, shaped by a second field deployment on
+Windows running four lanes, a coordinator, and a deliberate probe under the
+0.4.0 gate. That run caught no false claim of done — none was made. What it
+caught instead was a grader that was confidently wrong, and an agent that
+obeyed it into a deployed product. Everything below follows from that.
+
+**A re-message is a new dispatch, and it inherits the last one's contract.**
+Intent sidecars are consumed once, so messaging a live teammate again fires a
+fresh SubagentStart with no sidecar to match. In 0.4.0 that capture defaulted
+with an empty manifest and — at a tier the repo spec leaves empty, the shape
+per-dispatch manifests encourage — its stop had nothing runnable, closed
+ungraded eight milliseconds after reporting, and the board said `done`. Now a
+clean miss looks for the newest dispatch in the same session for the same
+agent type that carried a declared intent and inherits its prompt, manifest,
+and tier: `tier_source: "inherited"`, `lane~` on the board, `inherited_from`
+naming the source, and a stderr line saying so. Only a spawn with nothing to
+inherit gets the placeholder capture. If the follow-up is *new* work under a
+different contract, write a new sidecar before the re-message.
+
+**A claim closed with no verdict is announced, not filed.** `fleetproof fleet`
+prints `N dispatch(es) terminated ungraded this session — <ids>. A claim was
+recorded and closed with no verdict; an absent grade is not a passing grade.`
+after the orphan count whenever N > 0 (counted off the ledger, so `--open`
+cannot hide it; "in the dispatches shown" when no session is known; the JSON
+form carries `terminated_ungraded_count`, `terminated_ungraded`, and a
+per-row `terminated_ungraded` flag). The bridge's Stop gate writes the same
+line to stderr on every stop while the condition holds. "Terminated ungraded"
+is precise: state `terminated`, no verdict transition ever, at least one
+`reported` transition, and not parked.
+
+**Manifest checks carry the full check shape, and point at scripts inside the
+pin.** A dispatch manifest's `checks` entries accept everything a
+`checks.json` check accepts — `expect` of every kind, `block`, `owner`,
+`redact`, `description` — with `cmd` in place of `run` (`run` is accepted as
+an alias); only `tier` and `succeeded_by` are refused, because a manifest is
+graded at its own dispatch's tier and succession is between spec checks. In
+the field every lane-grading check was a manifest check and zero spec checks
+selected at `lane`, so `owner` governed nothing that graded a lane; it does
+now, with the spec path's exact wording (`owner: operator — advisory at tier
+lane`). The rule that goes with it: **a manifest `cmd` should invoke a script
+under `.fleetproof/checks/`**, because that is what the tree hash pins — an
+inline manifest command is a grader outside the pin, and a grader outside the
+pin can be rewritten mid-dispatch with no drift signal.
+
+**Arming is per tier; lanes are never disarmable.** `arm` / `disarm --note`
+take `--tier bridge` (default) or `--tier coordinator`; `--tier lane` is
+refused with the reason. A disarmed coordinator's failing check records the
+`advisory` verdict (above), and every checker run a gate orders stamps
+`"arming": {"tier", "state", "note"}` into its `output.json` — `state` is
+`armed`, `advisory`, or `n/a` for the bare CLI — so the evidence says whether
+its failure blocked anything without `arming.json` as it was at the time.
+`fleetproof show` renders the stamp.
+
+**Every report and every block is kept.** `reports/NNN.json` holds each
+report an agent made, in order (`report.json` stays the latest);
+`blocks/NNN.txt` holds the verbatim block text the agent received, with
+`NNN.meta.json` naming the checker run whose evidence composed it. A wedge
+caused by a wrong check and one caused by wording the agent argued with are
+now distinguishable from the record.
+
+**Preflight the graders; control them; pin the intent last.** `dispatch
+intent --preflight` (and `dispatch new --manifest ... --preflight`) runs every
+manifest check now, from the project root, with the gate's runner and the
+identity environment it would set (run id empty — it does not exist yet), and
+prints per check the exact command line, the expectation, the exit code,
+PASS/FAIL, and a redacted output tail. Nothing is written under `runs/`; the
+exit code is 0 whatever the checks did. Then `check control` records, under
+`.fleetproof/controls/<check-id>.json`, the pass and fail samples a check was
+exercised against, their hashes, the provenance of the pass sample
+(`captured` — a real emission — or `authored`), who and when, and the
+observed exit per direction when the check resolves from `--manifest` or the
+spec; the sample reaches the check as `FLEETPROOF_CONTROL_SAMPLE`. `dispatch
+intent` and `dispatch new --manifest` print one loud stderr warning per
+blocking manifest check with no control or an authored-only pass sample;
+`--strict-controls` refuses with nothing written. The controls directory is
+outside the hashed tree: a control is evidence about a grader, not a grader.
+
+**A check knows which dispatch it is grading, so one spec check can branch
+per lane.** Every gate-run check sees `FLEETPROOF_RUN_ID`,
+`FLEETPROOF_AGENT_TYPE`, `FLEETPROOF_TIER`, and `FLEETPROOF_SESSION_ID` in
+its environment — each the empty string when unknown, never absent. See
+*Writing richer checks* for the pattern.
+
+**A check that has outlived its phase steps aside — without a spec edit.** A
+closeout stop was refused because a blocking check asserted on a worktree the
+merge had just removed. Two mechanisms, both outside the hashed spec and the
+checks tree so neither trips a drift pin. *Succession:* a spec check may
+declare `"succeeded_by": "<check-id>"` naming another check in the same spec
+at the same tier (validated at load — no unknown ids, no self, no cycles, no
+cross-tier). Once the successor has passed in the current session — meaning a
+persisted checker run under `.fleetproof/runs/` carrying this session id
+whose `output.json` lists that id with `passed: true`; preflight and
+`--no-record` runs are never evidence — the predecessor is not run: it is
+listed on the verdict as `[retired] <id>: retired (succeeded by <successor>)`
+and never counted as failed. The checker also retires a predecessor whose
+successor passed in the very run being graded, so the swap costs no extra
+blocked stop. *Operator retirement:* `fleetproof phase advance --retire <id>
+[--retire ...] --note "why"` records retirements in `.fleetproof/phase.json`
+(per repo state, like `arming.json`; `phase status` lists them, `phase reset`
+clears them, both attributed) and a retired check is skipped the same way,
+rendered `retired (phase advance: <note>)`. Every verdict's `output.json`
+carries `"retired": [{id, reason, succeeded_by, note, blocking}]`. A
+selection emptied by retirement renders `RETIRED - 0 run; N selected
+check(s) retired`, never `PASS`, and in the subagent gate records no verdict.
+
+**Start from graders that carry their own source of truth.** `fleetproof init
+--library` installs three stdlib-only, argv-form Python checks under
+`.fleetproof/checks/lib/` — inside the tree pin — and prints the three
+`checks.json` entries to paste: `worktree_landed.py` (`--base <ref>
+[--worktree <path>]`: tree clean and HEAD ≥ 1 commit ahead of base),
+`py_tests_pinned.py` (`python -m pytest` with `PYTHONPATH` pinned to the
+graded tree root), and `http_json_field.py` (`--url --field <dotted> [--type
+number|string|bool] [--min] [--max]`). Each script's header states what it
+asserts, its source of truth, its exit codes, and how to capture a control
+sample; all three honour `FLEETPROOF_CONTROL_SAMPLE`. `fixtures/` ships one
+*example* emission for `http_json_field` with a README saying to replace it
+with your own captured one and register it via `check control`. Existing
+files are kept unless `--force`.
+
+**Stamp the session on CLI dispatches.** `dispatch new` from a bare shell
+records `session_id: null`, and a hook stop can only adopt a dispatch whose
+session matches exactly — so the joinable dispatch you thought you made is a
+second, unjoinable row. Pass `--session-id <id>` or export
+`FLEETPROOF_SESSION_ID`; without either the verb warns on stderr and records
+it anyway.
+
+**An invented tier is rejected with the legal tiers named.** `unknown tier
+'lead' — legal tiers: bridge, coordinator, lane, leaf`, from every surface
+that validates a tier by value (intent sidecars, manifests, the library API);
+the CLI's `--tier` options list the same choices through argparse.
+
+## Grader integrity
+
+The field's headline finding was not a bug in the tool. A blocking check
+demanded a health field named `days_until_expiry`; the daemon had always
+emitted `days_remaining`. The check's author had misread a *function* name
+in the same file as the *field* name, then "validated" the check against a
+sample they wrote themselves — containing the same wrong name — and written
+the dispatch prompt from the same misreading. The lane saw two agreeing
+instructions and one disagreeing codebase, renamed a production field to
+match, and redeployed. The gate did exactly what it was told.
+
+**A wrong blocking check is not neutral.** An advisory wrong check wastes a
+cycle. A blocking wrong check has an agent, a deploy path, and a deadline
+pointed at it, and it will get its way. Independence between the grader and
+the graded is half of grader integrity; the other half is independence
+between the grader and the task it grades. Four rules, all cheap:
+
+1. **A check that asserts an existing interface cites its source of truth by
+   `file:line`** — in the script header or the check's `description`, read at
+   authoring time by opening the file, not from memory.
+2. **Identifier names in a dispatch prompt are quoted from the code**, and the
+   prompt says where it read them. A prompt and a check written by the same
+   hand in the same sitting are one opinion, not two.
+3. **A positive control is a captured real emission, never authored by the
+   check's author.** If the emission cannot be captured before the check is
+   pinned, the check is unvalidated — say so, and record it that way
+   (`check control ... --provenance authored` warns for exactly this reason).
+4. **A lane whose prompt contradicts existing code escalates before changing
+   either.** Put this sentence in the standing lane instructions; the field
+   did not have it there.
+
+`--preflight`, `check control`, `--strict-controls`, and the shipped library
+exist to make these four rules the path of least resistance. None of them can
+tell you that a field name is wrong; all of them put the real emission in
+front of you before an agent is pointed at the check.
 
 ## Install (each line is one command in Claude Code)
 
@@ -501,16 +695,20 @@ third-party parser in the runtime.
 
 Beyond `{ "id", "run", "expect", "block" }`, a check can declare a `tier`
 (which rung grades it — see the ledger section), an `owner` (which rung can
-*satisfy* it — see *Operating a fleet*), and `redact` patterns applied to its
-captured output before anything is persisted. `run` may also be a JSON array
+*satisfy* it — see *Operating a fleet*), `redact` patterns applied to its
+captured output before anything is persisted, and `succeeded_by` (the check
+that takes over from this one once it has passed this session — see *Operating
+a fleet (v0.5)*). `run` may also be a JSON array
 of argv strings, executed with `shell=False` — no shell at all, which on
 Windows means no cmd.exe quoting hazards; the string form keeps shell
 semantics for compatibility. Manifest checks — the `checks` array of a
 dispatch manifest — carry the same shape with `cmd` in place of `run` (`run`
 is accepted as an alias): `expect` of every kind, `block`, `owner`, `redact`,
-`description`. Only `tier` is refused there, because a manifest is graded at
-its own dispatch's tier. A bare `{ "id", "cmd" }` entry still means blocking,
-exit-0. Checks execute from the resolved project root, not from
+`description`. Only `tier` and `succeeded_by` are refused there, because a
+manifest is graded at its own dispatch's tier and succession is between spec
+checks. A bare `{ "id", "cmd" }` entry still means blocking, exit-0. Point a
+manifest `cmd` at a script under `.fleetproof/checks/` so the grader is inside
+the tree pin. Checks execute from the resolved project root, not from
 wherever the hook's shell happened to be `cd`'d, and every rendered verdict
 prints the cwd it ran from.
 
@@ -544,7 +742,10 @@ isn't, and let FleetProof gate on the exit code.
 ```
 
 Anything a program can decide, a check can gate: schema conformance, row
-counts, API health, diffs, wordcounts, link resolution.
+counts, API health, diffs, wordcounts, link resolution. Three ready-made
+graders ship with the package — `fleetproof init --library` installs them
+under `.fleetproof/checks/lib/` with headers that name their source of truth
+and how to capture a control sample (see *Operating a fleet (v0.5)*).
 
 **A check knows which dispatch it is grading.** Every check a gate runs sees
 four variables in its environment: `FLEETPROOF_RUN_ID` (the dispatch's run
