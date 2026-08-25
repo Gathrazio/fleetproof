@@ -5,7 +5,7 @@ The agent may author the checks; it never executes and grades its own work.
 
 from __future__ import annotations
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from .runlog import (
     RunRecord,
