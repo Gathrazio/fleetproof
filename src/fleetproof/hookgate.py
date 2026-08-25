@@ -575,9 +575,12 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     2. No final message means no report. Block without transitioning: an agent
        that went idle saying nothing has not reported, and recording it as
        ``reported`` would launder silence into a claim.
-    3. If the spec changed since this dispatch was pinned, block. At lane tier and
-       deeper the pinned spec is the contract; grading against a spec the agent
-       could have edited mid-flight is not verification.
+    3. If the spec changed since this dispatch was pinned — and this tier has
+       anything runnable to grade — block. At lane tier and deeper the pinned
+       spec is the contract; grading against a spec the agent could have edited
+       mid-flight is not verification. With nothing runnable the drift is noted
+       on stderr and the stop proceeds ungraded: blocking would wedge tiers
+       that have no stake in the edit at all.
     4. Grade the agent's own tier of the spec, unioned with the checks declared
        on this dispatch's own manifest (blocking, expect-exit0). Blocking
        failure -> ``contradicted`` and block (the agent gets its turn back, and
@@ -627,15 +630,6 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
         )
         dispatch = load_dispatch(dispatch.run_id) or dispatch
 
-    pinned = dispatch.spec_sha256_pinned
-    current = spec_hash()
-    if pinned and current and pinned != current:
-        return _subagent_block(
-            _pin_drift_reason(pinned, current),
-            f"- dispatch {dispatch.run_id} pinned spec {short_spec_hash(pinned)}\n"
-            f"- current spec              {short_spec_hash(current)}",
-        ), 0
-
     try:
         checks = load_checks()
     except CheckSpecError as e:
@@ -662,7 +656,24 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     selected_ids = {c.id for c in selected}
     runnable = selected + [c for c in _manifest_checks(dispatch)
                            if c.id not in selected_ids]
+
+    # Pin-drift is tested only once the runnable set is known. An empty set
+    # means there is nothing the drifted spec could corrupt at this tier —
+    # blocking anyway wedged every in-flight dispatch on someone else's spec
+    # edit, at tiers with nothing to grade (observed in a field deployment on
+    # Windows). The drift still gets said out loud; it just cannot gate a
+    # verdict that was never going to exist.
+    pinned = dispatch.spec_sha256_pinned
+    current = spec_hash()
+    drifted = bool(pinned and current and pinned != current)
+
     if not runnable:
+        if drifted:
+            sys.stderr.write(
+                f"[fleetproof] spec drift noted on dispatch {dispatch.run_id} "
+                f"(pinned {short_spec_hash(pinned)}, now "
+                f"{short_spec_hash(current)}) — nothing runnable at tier "
+                f"{dispatch.tier}, stop allowed ungraded\n")
         _try_close(dispatch.run_id)
         # The grading *happened* and selected nothing — recorded as an empty
         # CheckReport so the telemetry layer can tell "checked nothing on
@@ -673,6 +684,13 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
             checks=[],
         )
         return None, 0
+
+    if drifted:
+        return _subagent_block(
+            _pin_drift_reason(pinned, current),
+            f"- dispatch {dispatch.run_id} pinned spec {short_spec_hash(pinned)}\n"
+            f"- current spec              {short_spec_hash(current)}",
+        ), 0
 
     report = run_checks(runnable, record_to_log=True, tier=dispatch.tier)
     if report.blocking_failures:

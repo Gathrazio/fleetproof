@@ -528,6 +528,31 @@ def test_pin_drift_blocks_the_subagent_stop(tmp_path, monkeypatch, capsys):
     assert d.is_terminal is False
 
 
+def test_pin_drift_does_not_block_a_tier_with_nothing_to_grade(
+        tmp_path, monkeypatch, capsys):
+    # A spec edit mid-flight wedged EVERY open dispatch, including tiers whose
+    # selection is empty — unwedging one lane wedged everyone else (observed in
+    # a field deployment on Windows). With nothing runnable there is nothing
+    # the drift could corrupt: terminate ungraded as usual, note the drift.
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import list_dispatches, write_intent
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    write_intent("tester", _INTENT_PROMPT, tier="coordinator")
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
+
+    _write_checks(tmp_path, [dict(_LANE_PASS, description="edited mid-flight")])
+    _feed(monkeypatch, _stop_payload(message="Coordinated; nothing gradeable here."))
+    assert subagent_stop_main() == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""  # the stop is allowed
+    assert "drift" in captured.err  # but the drift is still said out loud
+
+    d = list_dispatches()[0]
+    assert d.state == "terminated"
+    assert d.verdict is None  # ungraded, exactly as an undrifted empty tier
+
+
 def test_subagent_gate_fails_open_but_loudly_when_it_breaks(tmp_path, monkeypatch, capsys):
     # A bug in the gate must not wedge the fleet, but must not look like a pass.
     from fleetproof import hookgate
