@@ -1028,6 +1028,7 @@ def create_dispatch(
     tier_source: str | None = None,
     by: str = "cli",
     spec_path: Path | None = None,
+    session_id: str | None = None,
 ) -> str:
     """Record a dispatch at launch and return its run id.
 
@@ -1051,6 +1052,10 @@ def create_dispatch(
     sidecar is traceable post-hoc. ``spec_path`` overrides which spec file
     gets hashed (hooks/tests); by default the project's ``.fleetproof/checks.json``
     is used, and an unreadable spec pins ``null`` rather than failing the dispatch.
+    ``session_id`` stamps the session explicitly; omitted, it is read from
+    ``FLEETPROOF_SESSION_ID`` (a hook process always has it, a bare CLI shell
+    usually does not — and a session-less dispatch is one no live session can
+    ever adopt, see :func:`find_dispatch_for_stop`).
     """
     if not isinstance(prompt, str) or not prompt.strip():
         raise LedgerError("A dispatch needs a prompt; refusing to record an empty one.")
@@ -1082,7 +1087,8 @@ def create_dispatch(
     resolved_agent = _coerce_agent(agent) if agent is not None else None
 
     run_id, run_dir = _fresh_run_dir()
-    session_id = os.environ.get(SESSION_ID_ENV) or None
+    if session_id is None:
+        session_id = os.environ.get(SESSION_ID_ENV) or None
 
     # Same shape runlog writes for a root record, so `fleetproof list`/`show` and
     # the HTML report read dispatch runs back without knowing about the ledger.

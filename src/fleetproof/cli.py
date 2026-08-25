@@ -359,6 +359,16 @@ def _load_json_file(path: str, label: str) -> dict:
     return data
 
 
+# `dispatch new` from a shell with no session id. The dispatch is still
+# recorded — the ledger records what happened — but the operator is told what
+# that record can and cannot do.
+_SESSION_LESS_WARNING = (
+    "WARNING: dispatch recorded session-less (no --session-id and no "
+    f"{SESSION_ID_ENV} in the environment). A hook stop from a live session "
+    "can never adopt it: adoption requires an exact session match. Pass "
+    f"--session-id <id> or export {SESSION_ID_ENV} before `dispatch new`.")
+
+
 def _cmd_dispatch_new(args: argparse.Namespace) -> int:
     try:
         prompt = _resolve_prompt(args)
@@ -382,16 +392,29 @@ def _cmd_dispatch_new(args: argparse.Namespace) -> int:
     # --agent-name makes the dispatch joinable: the agent block records the
     # spawn name the harness will report as agent_type, with a null agent_id
     # the first matching SubagentStop adopts (find_dispatch_for_stop). The
-    # session id rides in from FLEETPROOF_SESSION_ID via create_dispatch, so
-    # a dispatch recorded inside a hook session lands in that session.
+    # session id rides in from --session-id or FLEETPROOF_SESSION_ID, so a
+    # dispatch recorded inside a hook session lands in that session.
     agent = None
     if getattr(args, "agent_name", None):
         agent = {"agent_type": args.agent_name, "agent_id": None,
                  "capture": CAPTURE_CLI}
 
+    session_id = (getattr(args, "session_id", None) or "").strip() or None
+    if session_id is None:
+        session_id = os.environ.get(SESSION_ID_ENV) or None
+    if session_id is None:
+        # Said before the record is written, on stderr, so a json consumer
+        # still gets clean stdout. A bare CLI shell has no session id, the
+        # record stamps session_id null, and adoption needs an exact session
+        # match — so the joinable dispatch the operator thought they made is
+        # a second, unjoinable ledger row, silently (observed in a field
+        # deployment on Windows: the first CLI dispatch of a lane had to be
+        # closed and recreated with the id exported).
+        print(_SESSION_LESS_WARNING, file=sys.stderr)
+
     try:
         run_id = create_dispatch(prompt, tier=args.tier, manifest=manifest,
-                                 agent=agent)
+                                 agent=agent, session_id=session_id)
     except LedgerError as e:
         _emit_error("ledger_error", str(e), args.format)
         return 1
@@ -881,6 +904,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "first matching SubagentStop adopts it and grades "
                              "it, instead of the CLI record and the hook stop "
                              "forking into two ledgers.")
+    p_dnew.add_argument("--session-id", default=None,
+                        help="Stamp this session id on the dispatch (default: "
+                             f"{SESSION_ID_ENV} from the environment). Without "
+                             "one the dispatch is recorded session-less, which "
+                             "no hook stop can ever adopt; a warning says so.")
     _add_format(p_dnew)
     p_dnew.set_defaults(func=_cmd_dispatch_new)
 

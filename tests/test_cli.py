@@ -143,6 +143,47 @@ def test_dispatch_new_without_agent_name_writes_no_agent_block(cli_runs, capsys)
     assert record["agent"] is None
 
 
+def test_dispatch_new_without_a_session_warns_it_is_unadoptable(cli_runs, capsys):
+    # A bare CLI shell has no session id; the record stamps null, and adoption
+    # needs an exact session match — so the dispatch the operator meant to be
+    # joinable is a second, unjoinable row unless someone says so (observed in
+    # a field deployment on Windows). stdout stays the bare run id.
+    assert main(["dispatch", "new", "--prompt", "work", "--agent-name", "w"]) == 0
+    out, err = capsys.readouterr()
+    assert "session-less" in err
+    assert "can never adopt it" in err
+    assert runlog.SESSION_ID_ENV in err
+    assert "--session-id" in err
+    run_id = out.strip()
+    from fleetproof.ledger import load_dispatch
+    assert load_dispatch(run_id).session_id is None
+
+
+def test_dispatch_new_session_id_flag_stamps_the_session(cli_runs, capsys):
+    assert main(["dispatch", "new", "--prompt", "work", "--session-id", "sess-flag",
+                 "--format", "json"]) == 0
+    out, err = capsys.readouterr()
+    assert "session-less" not in err
+    assert json.loads(out)["session_id"] == "sess-flag"
+
+
+def test_dispatch_new_session_id_flag_beats_the_environment(cli_runs, capsys,
+                                                             monkeypatch):
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-env")
+    assert main(["dispatch", "new", "--prompt", "work", "--session-id", "sess-flag",
+                 "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["session_id"] == "sess-flag"
+
+
+def test_dispatch_new_env_session_id_silences_the_warning(cli_runs, capsys,
+                                                          monkeypatch):
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-env")
+    assert main(["dispatch", "new", "--prompt", "work", "--format", "json"]) == 0
+    out, err = capsys.readouterr()
+    assert "session-less" not in err
+    assert json.loads(out)["session_id"] == "sess-env"
+
+
 def test_dispatch_new_with_manifest_file(cli_runs, tmp_path, capsys):
     mf = tmp_path / "manifest.json"
     mf.write_text(json.dumps({"deliverables": ["a"], "notes": "n"}), encoding="utf-8")
