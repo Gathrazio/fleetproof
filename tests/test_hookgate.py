@@ -2091,3 +2091,70 @@ def test_manifest_check_with_a_tier_is_skipped_loudly(tmp_path, monkeypatch, cap
     assert "'tier' is not a manifest field" in err
     assert "unknown expect kind 'bogus'" in err
     assert _graded_check_ids() == ["m-ok"]
+
+
+# === dispatch identity in the check environment (C15) ===
+
+_ECHO_IDENTITY = [sys.executable, "-c",
+                  "import os; print('|'.join(os.environ.get(k, '<absent>') for k in "
+                  "('FLEETPROOF_RUN_ID', 'FLEETPROOF_AGENT_TYPE', 'FLEETPROOF_TIER', "
+                  "'FLEETPROOF_SESSION_ID')))"]
+
+
+def _echoed_identity() -> list[str]:
+    [result] = _last_verdict_checks()
+    return result["stdout_tail"].strip().split("|")
+
+
+def test_subagent_gate_checks_see_the_dispatch_identity(tmp_path, monkeypatch, capsys):
+    # A repo check selected per tier had no way to know which lane it was
+    # grading (observed in a field deployment on Windows). Under the subagent
+    # gate every check now sees the dispatch's run id, agent type, tier, and
+    # session in its environment.
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _spawn_with_intent(tmp_path, monkeypatch, _manifest_with(
+        {"id": "m-echo", "cmd": _ECHO_IDENTITY}))
+    _feed(monkeypatch, _stop_payload(message="Done."))
+    assert subagent_stop_main() == 0
+    capsys.readouterr()
+    d = list_dispatches()[0]
+    assert _echoed_identity() == [d.run_id, "tester", "lane", "sess-fleet"]
+
+
+def test_bridge_gate_checks_see_the_bridge_tier_and_empty_dispatch_fields(
+        tmp_path, monkeypatch):
+    # The bridge has no dispatch of its own: run id and agent type are the
+    # empty string (present, never absent), tier is bridge, session is set.
+    _setup_project(tmp_path, [{"id": "echo", "run": _ECHO_IDENTITY}], monkeypatch)
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-identity")
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000009-idnt01")
+    decision, code = stop_gate()
+    assert decision is None
+    assert _echoed_identity() == ["", "", "bridge", "sess-identity"]
+
+
+def test_spec_check_can_branch_per_lane_on_agent_type(tmp_path, monkeypatch, capsys):
+    # The documented pattern: one untiered spec check, graded differently per
+    # lane — passes for the lane it is written for, fails for another.
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    branch = {"id": "per-lane", "run": [
+        sys.executable, "-c",
+        "import os, sys; sys.exit(0 if os.environ['FLEETPROOF_AGENT_TYPE'] == 'docs' else 1)"]}
+    _setup_project(tmp_path, [branch], monkeypatch)
+    _feed(monkeypatch, _start_payload(agent_id="a-docs", agent_type="docs"))
+    subagent_start_main()
+    _feed(monkeypatch, _start_payload(agent_id="a-build", agent_type="build"))
+    subagent_start_main()
+
+    _feed(monkeypatch, _stop_payload(message="Docs done.", agent_id="a-docs",
+                                     agent_type="docs"))
+    assert subagent_stop_main() == 0
+    assert capsys.readouterr().out == ""  # docs lane passes
+    _feed(monkeypatch, _stop_payload(message="Build done.", agent_id="a-build",
+                                     agent_type="build"))
+    assert subagent_stop_main() == 0
+    assert json.loads(capsys.readouterr().out)["decision"] == "block"  # build lane fails
+    verdicts = {(d.agent or {}).get("agent_type"): d.verdict for d in list_dispatches()}
+    assert verdicts == {"docs": "verified", "build": "contradicted"}

@@ -48,6 +48,10 @@ from typing import Any
 from pathlib import Path
 
 from .checker import (
+    CHECK_ENV_AGENT_TYPE,
+    CHECK_ENV_RUN_ID,
+    CHECK_ENV_SESSION_ID,
+    CHECK_ENV_TIER,
     CheckReport,
     run_checks,
     select_checks,
@@ -254,7 +258,8 @@ def _spec_gate() -> tuple[str | None, str | None]:
             return reason, None
         return None, None
 
-    report = run_checks(checks, tier=TIER_BRIDGE)
+    report = run_checks(checks, tier=TIER_BRIDGE,
+                        identity=_check_identity(None, None, TIER_BRIDGE, session_id))
 
     # Spec-drift check: did the checks.json that just graded this verdict differ
     # from the one the session's first verdict was graded against? An agent is
@@ -811,6 +816,22 @@ def _try_build_telemetry(run_id: str, check_report=None, checks=None) -> None:
         sys.stderr.write(f"[fleetproof] telemetry build failed for {run_id}: {e}\n")
 
 
+def _check_identity(run_id: str | None, agent_type: str | None,
+                    tier: str | None, session_id: str | None) -> dict[str, str]:
+    """The four identity variables a gate-run check sees (empty when unknown).
+
+    The bridge gate has no dispatch of its own, so it passes empty run id and
+    agent type with the bridge tier; the subagent gate passes the graded
+    dispatch's. See :data:`fleetproof.checker.CHECK_ENV_KEYS`.
+    """
+    return {
+        CHECK_ENV_RUN_ID: run_id or "",
+        CHECK_ENV_AGENT_TYPE: agent_type or "",
+        CHECK_ENV_TIER: tier or "",
+        CHECK_ENV_SESSION_ID: session_id or "",
+    }
+
+
 def _manifest_checks(dispatch) -> list[Check]:
     """Runnable checks declared on the dispatch's own manifest, as full Checks.
 
@@ -1031,7 +1052,14 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
             f"- current check tree        {short_spec_hash(tree_current)}",
         ), 0
 
-    report = run_checks(runnable, record_to_log=True, tier=dispatch.tier)
+    # The agent type the dispatch knows beats the payload's: an adopted CLI
+    # dispatch recorded its spawn name up front, and a payload with none
+    # (harness helper) should not blank a name the ledger already has.
+    agent_type_known = (dispatch.agent or {}).get("agent_type") or agent_type
+    report = run_checks(
+        runnable, record_to_log=True, tier=dispatch.tier,
+        identity=_check_identity(dispatch.run_id, agent_type_known, dispatch.tier,
+                                 session_id))
     if report.blocking_failures:
         failing_ids = "; ".join(r.id for r in report.blocking_failures)
         prior_contradictions = sum(

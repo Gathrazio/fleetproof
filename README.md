@@ -492,7 +492,28 @@ isn't, and let FleetProof gate on the exit code.
 ```
 
 Anything a program can decide, a check can gate: schema conformance, row
-counts, API health, diffs, wordcounts, link resolution. FleetProof's claim is
+counts, API health, diffs, wordcounts, link resolution.
+
+**A check knows which dispatch it is grading.** Every check a gate runs sees
+four variables in its environment: `FLEETPROOF_RUN_ID` (the dispatch's run
+id), `FLEETPROOF_AGENT_TYPE` (the spawn name), `FLEETPROOF_TIER`, and
+`FLEETPROOF_SESSION_ID` — each the empty string when unknown, never absent.
+The bridge Stop gate has no dispatch, so its checks see an empty run id and
+agent type with tier `bridge`; the bare `fleetproof check` sets tier and
+session only. So a single spec check can branch per lane — a repo with four
+lanes no longer needs four manifests to grade them differently:
+
+```python
+# .fleetproof/checks/per-lane.py — one spec check, graded per lane
+import os, subprocess, sys
+lane = os.environ.get("FLEETPROOF_AGENT_TYPE", "")
+suite = {"docs": "tests/docs", "api": "tests/api"}.get(lane, "tests")
+sys.exit(subprocess.call([sys.executable, "-m", "pytest", suite, "-q"]))
+```
+
+Note that `FLEETPROOF_RUN_ID` is the same variable the run log uses for
+run-id propagation, on purpose: a check that itself records lands under the
+dispatch it graded. FleetProof's claim is
 never that the predicate language is rich — it's that *whatever predicate you
 choose runs outside the agent's process*.
 

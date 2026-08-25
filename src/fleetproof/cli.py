@@ -39,7 +39,13 @@ from pathlib import Path
 os.environ.setdefault("FLEETPROOF_NO_RECORD", "1")
 
 from . import __version__
-from .checker import format_report_text, run_checks, spec_drifted
+from .checker import (
+    CHECK_ENV_SESSION_ID,
+    CHECK_ENV_TIER,
+    format_report_text,
+    run_checks,
+    spec_drifted,
+)
 from .checks import (
     CheckSpecError,
     SPEC_DRIFT_NOTE,
@@ -157,9 +163,13 @@ def _cmd_check(args: argparse.Namespace) -> int:
     except CheckSpecError as e:
         _emit_error("check_spec_error", str(e), args.format)
         return 2
+    # The bare CLI has no dispatch: checks see the tier and session only
+    # (empty when unknown); run id and agent type are left as inherited.
+    identity = {CHECK_ENV_TIER: args.tier or "",
+                CHECK_ENV_SESSION_ID: os.environ.get(SESSION_ID_ENV) or ""}
     try:
         report = run_checks(checks, record_to_log=not args.no_record,
-                            spec_path=spec_path, tier=args.tier)
+                            spec_path=spec_path, tier=args.tier, identity=identity)
     except ValueError as e:  # unknown tier
         _emit_error("bad_tier", str(e), args.format)
         return 2

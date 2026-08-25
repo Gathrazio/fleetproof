@@ -465,3 +465,26 @@ def test_owned_check_that_passes_is_advisory_but_unannotated(tmp_project):
     assert report.results[0].blocking is False
     assert "owner:" not in report.results[0].detail
     assert report.all_advisory is True
+
+
+# === check_env: identity reaches the subprocess (C15) ===
+
+def test_check_env_none_inherits_and_values_are_never_absent(monkeypatch):
+    from fleetproof.checker import CHECK_ENV_KEYS, check_env
+    assert check_env(None) is None
+    monkeypatch.setenv("KEEP_ME", "1")
+    env = check_env({k: None for k in CHECK_ENV_KEYS})
+    assert env["KEEP_ME"] == "1"
+    assert all(env[k] == "" for k in CHECK_ENV_KEYS)
+    env = check_env({"FLEETPROOF_TIER": "lane"})
+    assert env["FLEETPROOF_TIER"] == "lane"
+
+
+def test_run_checks_identity_reaches_the_check_process(tmp_project):
+    from fleetproof.checker import CHECK_ENV_AGENT_TYPE, CHECK_ENV_RUN_ID
+    echo = _check("echo", run=[sys.executable, "-c",
+                               "import os; print(os.environ['FLEETPROOF_RUN_ID'], "
+                               "os.environ['FLEETPROOF_AGENT_TYPE'])"])
+    report = run_checks([echo], cwd=tmp_project, record_to_log=False,
+                        identity={CHECK_ENV_RUN_ID: "run-77", CHECK_ENV_AGENT_TYPE: "docs"})
+    assert report.results[0].stdout_tail.strip() == "run-77 docs"

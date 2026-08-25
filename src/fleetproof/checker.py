@@ -15,6 +15,7 @@ No LLM is in this path. Grading is pure comparison.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -36,6 +37,42 @@ from .runlog import list_run_records, project_root, record, runs_dir
 
 # Per-check wall-clock ceiling. A check that hangs is a failed check, not a hung fleet.
 DEFAULT_TIMEOUT_S = 600
+
+# === Dispatch identity in the check environment ===
+#
+# Repo checks are selected per tier and, until this existed, received no
+# context about WHICH dispatch they were grading — so a four-lane fleet in four
+# repos could not be gated per lane from the spec, only from manifests
+# (observed in a field deployment on Windows). Every check a gate runs now
+# sees these four variables; a spec check may branch on FLEETPROOF_AGENT_TYPE
+# and grade one lane differently from another. Values are the empty string
+# when unknown, never absent: a check can test for emptiness without first
+# testing for existence. FLEETPROOF_RUN_ID here is the *dispatch's* run id —
+# the same variable name runlog uses for run-id propagation, deliberately, so
+# a check that itself records lands under the dispatch it graded. The bare
+# CLI (``fleetproof check``) has no dispatch, so it sets tier and session only.
+CHECK_ENV_RUN_ID = "FLEETPROOF_RUN_ID"
+CHECK_ENV_AGENT_TYPE = "FLEETPROOF_AGENT_TYPE"
+CHECK_ENV_TIER = "FLEETPROOF_TIER"
+CHECK_ENV_SESSION_ID = "FLEETPROOF_SESSION_ID"
+CHECK_ENV_KEYS = (CHECK_ENV_RUN_ID, CHECK_ENV_AGENT_TYPE, CHECK_ENV_TIER,
+                  CHECK_ENV_SESSION_ID)
+
+
+def check_env(identity: dict[str, Any] | None) -> dict[str, str] | None:
+    """The subprocess environment for a check: the parent's, plus ``identity``.
+
+    ``identity`` maps a :data:`CHECK_ENV_KEYS` name to its value; a None value
+    becomes the empty string. Keys not in ``identity`` are left as inherited.
+    ``None`` in returns ``None`` out, which :func:`subprocess.run` reads as
+    "inherit" — the pre-identity behaviour, byte-identical.
+    """
+    if identity is None:
+        return None
+    env = dict(os.environ)
+    for key, value in identity.items():
+        env[key] = "" if value is None else str(value)
+    return env
 
 # Secret shapes redacted from the persisted output tails before they reach
 # output.json. Real check commands echo connection strings and tokens when
@@ -175,6 +212,7 @@ def _tail(text: str, limit: int = 2000) -> str:
 
 def _run_command(
     command: str | list[str], cwd: Path, timeout: int,
+    env: dict[str, str] | None = None,
 ) -> tuple[int | None, str, str]:
     """Execute a check command in a separate process. Returns (returncode, stdout, stderr).
 
@@ -197,6 +235,7 @@ def _run_command(
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
+            env=env,
         )
         return proc.returncode, proc.stdout or "", proc.stderr or ""
     except subprocess.TimeoutExpired as e:
@@ -264,14 +303,19 @@ def _grade(check: Check, returncode: int | None, stdout: str, stderr: str, cwd: 
     return False, f"unknown expectation kind: {kind}"
 
 
-def run_check(check: Check, cwd: Path, timeout: int = DEFAULT_TIMEOUT_S) -> CheckResult:
-    """Execute and grade a single check in its own subprocess."""
+def run_check(check: Check, cwd: Path, timeout: int = DEFAULT_TIMEOUT_S,
+              env: dict[str, str] | None = None) -> CheckResult:
+    """Execute and grade a single check in its own subprocess.
+
+    ``env`` is the full subprocess environment (see :func:`check_env`); None
+    inherits the checker's own.
+    """
     import time as _time
     started = _time.perf_counter()
     returncode: int | None = None
     stdout = stderr = ""
     if check.run is not None:
-        returncode, stdout, stderr = _run_command(check.run, cwd, timeout)
+        returncode, stdout, stderr = _run_command(check.run, cwd, timeout, env)
     passed, detail = _grade(check, returncode, stdout, stderr, cwd)
     duration_ms = (_time.perf_counter() - started) * 1000.0
     # Redact before truncating, so a secret straddling the truncation boundary
@@ -338,6 +382,7 @@ def run_checks(
     record_to_log: bool = True,
     spec_path: Path | None = None,
     tier: str | None = None,
+    identity: dict[str, Any] | None = None,
 ) -> CheckReport:
     """Run every selected check and (by default) append the verdict to the run log.
 
@@ -357,6 +402,12 @@ def run_checks(
     A tier with no matching checks yields an empty report, whose verdict is "pass"
     because nothing was declared to fail — the recorded total of 0 is what makes
     that visible rather than silent.
+
+    ``identity`` is the dispatch identity every check's subprocess sees in its
+    environment (:data:`CHECK_ENV_KEYS`; see :func:`check_env`). The gates
+    pass the graded dispatch's run id, agent type, tier, and session; the
+    bare CLI passes tier and session only; omitting it inherits the checker's
+    own environment unchanged.
     """
     if checks is None:
         checks = load_checks(spec_path)
@@ -367,17 +418,18 @@ def run_checks(
 
     report = CheckReport(spec_sha256=sha, tree_sha256=checks_tree_hash(resolved_spec),
                          tier=tier, cwd=str(work_dir))
+    env = check_env(identity)
     if not record_to_log:
         for check in checks:
             report.results.append(
-                _apply_ownership(run_check(check, work_dir, timeout), check, tier))
+                _apply_ownership(run_check(check, work_dir, timeout, env), check, tier))
         return report
 
     with record("fleetproof", "check", {"check_count": len(checks), "tier": tier}) as handle:
         report.run_id = handle.run_id
         for check in checks:
             report.results.append(
-                _apply_ownership(run_check(check, work_dir, timeout), check, tier))
+                _apply_ownership(run_check(check, work_dir, timeout, env), check, tier))
         payload = report.to_dict()
         payload["recorded_from_pid"] = _self_pid()
         handle.set_output(payload)

@@ -818,3 +818,23 @@ def test_fleet_json_carries_the_ungraded_terminations(cli_runs, capsys, monkeypa
     assert payload["terminated_ungraded_count"] == 1
     assert payload["terminated_ungraded"] == [run_id]
     assert payload["dispatches"][0]["terminated_ungraded"] is True
+
+
+# === CLI check passes tier + session identity only (C15) ===
+
+def test_check_cli_sets_tier_and_session_only(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    runlog.set_runs_dir(tmp_path / "runs")
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-cli-77")
+    monkeypatch.delenv("FLEETPROOF_AGENT_TYPE", raising=False)
+    spec = tmp_path / "checks.json"
+    spec.write_text(json.dumps({"checks": [
+        {"id": "echo", "run": [sys.executable, "-c",
+                               "import os; print(os.environ['FLEETPROOF_TIER'], "
+                               "os.environ['FLEETPROOF_SESSION_ID'], "
+                               "os.environ.get('FLEETPROOF_AGENT_TYPE', '<absent>'))"]},
+    ]}), encoding="utf-8")
+    assert main(["check", "--spec", str(spec), "--tier", "lane", "--no-record",
+                 "--format", "json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["checks"][0]["stdout_tail"].strip() == "lane sess-cli-77 <absent>"
