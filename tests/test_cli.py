@@ -1079,3 +1079,129 @@ def test_dispatch_new_preflight_shares_the_code_path(cli_runs, tmp_path, capsys)
 def test_dispatch_new_preflight_needs_a_manifest(cli_runs, capsys):
     assert main(["dispatch", "new", "--prompt", "p", "--preflight"]) == 2
     assert "--preflight needs --manifest" in capsys.readouterr().err
+
+
+# === grader control ledger at the CLI (C12) ===
+
+def _control_manifest(tmp_path: Path) -> Path:
+    grader = [sys.executable, "-c",
+              "import json, os, sys; d = json.load(open(os.environ['FLEETPROOF_CONTROL_SAMPLE']));"
+              " sys.exit(0 if 'days_remaining' in d else 5)"]
+    mf = tmp_path / "manifest.json"
+    mf.write_text(json.dumps({"manifest": {
+        "deliverables": ["health field"],
+        "checks": [{"id": "tcn-health", "cmd": grader},
+                   {"id": "advisory-note", "cmd": "echo hi", "block": False}],
+        "check_map": {"health field": ["tcn-health"]},
+    }}), encoding="utf-8")
+    return mf
+
+
+def test_check_control_records_from_a_manifest_and_still_lets_plain_check_parse(
+        cli_runs, tmp_path, capsys):
+    from fleetproof.controls import load_control
+    mf = _control_manifest(tmp_path)
+    good = tmp_path / "captured.json"
+    good.write_text(json.dumps({"days_remaining": 67.1}), encoding="utf-8")
+    bad = tmp_path / "broken.json"
+    bad.write_text(json.dumps({"days_until_expiry": 67}), encoding="utf-8")
+    assert main(["check", "control", "tcn-health", "--pass-sample", str(good),
+                 "--fail-sample", str(bad), "--provenance", "captured",
+                 "--note", "captured 2026-08-25", "--manifest", str(mf)]) == 0
+    out = capsys.readouterr().out
+    assert "control recorded for 'tcn-health' (provenance: captured)" in out
+    assert "pass_sample:" in out and "observed exit 0 -> pass (agrees)" in out
+    assert "fail_sample:" in out and "observed exit 5 -> fail (agrees)" in out
+    rec = load_control("tcn-health")
+    assert rec["check_source"] == "manifest" and rec["note"] == "captured 2026-08-25"
+
+    # The bare checker verb is untouched by the nested verb.
+    spec = tmp_path / "checks.json"
+    spec.write_text(json.dumps({"checks": [
+        {"id": "ok", "run": f'"{sys.executable}" -c "raise SystemExit(0)"'}]}),
+        encoding="utf-8")
+    assert main(["check", "--spec", str(spec), "--no-record"]) == 0
+
+
+def test_check_control_json_and_unresolvable_check(cli_runs, tmp_path, capsys):
+    good = tmp_path / "s.json"
+    good.write_text("{}", encoding="utf-8")
+    assert main(["check", "control", "nowhere", "--pass-sample", str(good),
+                 "--provenance", "authored", "--format", "json"]) == 0
+    rec = json.loads(capsys.readouterr().out)
+    assert rec["check_id"] == "nowhere" and rec["cmd"] is None
+    assert rec["pass_sample"]["observed_exit"] is None
+
+
+def test_check_control_rejects_a_bad_provenance_and_a_missing_sample(cli_runs, tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        main(["check", "control", "x", "--pass-sample", "s", "--provenance", "guessed"])
+    assert main(["check", "control", "x", "--pass-sample", str(tmp_path / "absent"),
+                 "--provenance", "captured"]) == 2
+
+
+def test_dispatch_intent_warns_per_uncontrolled_blocking_check(cli_runs, tmp_path, capsys):
+    pf = tmp_path / "prompt.md"
+    pf.write_text("work", encoding="utf-8")
+    mf = _control_manifest(tmp_path)
+    assert main(["dispatch", "intent", "--agent", "tcn", "--prompt-file", str(pf),
+                 "--manifest", str(mf)]) == 0
+    captured = capsys.readouterr()
+    assert Path(captured.out.strip()).exists()  # sidecar written: a warning, not a refusal
+    assert "WARNING: blocking check 'tcn-health' has no grader control" in captured.err
+    assert "advisory-note" not in captured.err  # advisory checks are not warned about
+    assert "fleetproof check control tcn-health --pass-sample" in captured.err
+
+
+def test_dispatch_intent_strict_controls_refuses_and_writes_nothing(cli_runs, tmp_path, capsys):
+    from fleetproof.ledger import intents_dir
+    pf = tmp_path / "prompt.md"
+    pf.write_text("work", encoding="utf-8")
+    mf = _control_manifest(tmp_path)
+    assert main(["dispatch", "intent", "--agent", "tcn", "--prompt-file", str(pf),
+                 "--manifest", str(mf), "--strict-controls"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "REFUSED: blocking check 'tcn-health' has no grader control" in captured.err
+    assert "error (uncontrolled_checks)" in captured.err
+    assert not (intents_dir() / "tcn.json").exists()
+
+
+def test_dispatch_intent_authored_only_pass_sample_warns(cli_runs, tmp_path, capsys):
+    pf = tmp_path / "prompt.md"
+    pf.write_text("work", encoding="utf-8")
+    mf = _control_manifest(tmp_path)
+    sample = tmp_path / "authored.json"
+    sample.write_text(json.dumps({"days_remaining": 1}), encoding="utf-8")
+    assert main(["check", "control", "tcn-health", "--pass-sample", str(sample),
+                 "--provenance", "authored", "--manifest", str(mf)]) == 0
+    capsys.readouterr()
+    assert main(["dispatch", "intent", "--agent", "tcn", "--prompt-file", str(pf),
+                 "--manifest", str(mf)]) == 0
+    err = capsys.readouterr().err
+    assert "WARNING: blocking check 'tcn-health': its only pass sample is authored" in err
+
+
+def test_dispatch_intent_with_a_captured_control_is_silent(cli_runs, tmp_path, capsys):
+    pf = tmp_path / "prompt.md"
+    pf.write_text("work", encoding="utf-8")
+    mf = _control_manifest(tmp_path)
+    sample = tmp_path / "captured.json"
+    sample.write_text(json.dumps({"days_remaining": 1}), encoding="utf-8")
+    assert main(["check", "control", "tcn-health", "--pass-sample", str(sample),
+                 "--provenance", "captured", "--manifest", str(mf)]) == 0
+    capsys.readouterr()
+    assert main(["dispatch", "intent", "--agent", "tcn", "--prompt-file", str(pf),
+                 "--manifest", str(mf), "--strict-controls"]) == 0
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_dispatch_new_with_a_manifest_warns_and_strict_refuses(cli_runs, tmp_path, capsys):
+    mf = _control_manifest(tmp_path)
+    assert main(["dispatch", "new", "--prompt", "p", "--manifest", str(mf),
+                 "--session-id", "s1"]) == 0
+    assert "WARNING: blocking check 'tcn-health' has no grader control" in capsys.readouterr().err
+    assert main(["dispatch", "new", "--prompt", "p", "--manifest", str(mf),
+                 "--session-id", "s1", "--strict-controls"]) == 1
+    from fleetproof.ledger import list_dispatches
+    assert len(list_dispatches()) == 1  # the strict attempt recorded nothing

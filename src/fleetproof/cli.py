@@ -5,6 +5,7 @@ surface as it can. Subcommands:
 
     init      write a starter .fleetproof/checks.json
     check     run the independent checker, record the verdict, exit non-zero on block
+    check control  record a grader control (pass/fail samples + provenance) for one check
     list      list recorded runs, newest first
     show      show one run and its sub-invocations
     report    render the self-contained HTML run report
@@ -61,6 +62,13 @@ from .checks import (
     load_checks,
     parse_manifest_check,
     short_spec_hash,
+)
+from .controls import (
+    CONTROL_SAMPLE_ENV,
+    VALID_PROVENANCE,
+    ControlError,
+    control_warnings,
+    record_control,
 )
 from .hookgate import (
     ADVISORY,
@@ -211,6 +219,79 @@ def _cmd_check(args: argparse.Namespace) -> int:
             print(SPEC_DRIFT_NOTE)
             print(f"  session baseline: {short_spec_hash(baseline)}")
     return 1 if report.verdict == "fail" else 0
+
+
+def _cmd_check_control(args: argparse.Namespace) -> int:
+    """Record a grader control: the samples a check was exercised against.
+
+    The check's command is resolved from ``--manifest`` when given (the
+    manifest checks are where lane grading lives), else from the repo spec;
+    when neither names the id the control is recorded without an observed
+    run and says so — the samples' hashes and provenance are still the
+    record that matters. See :mod:`fleetproof.controls`.
+    """
+    check = None
+    source = None
+    if args.manifest:
+        try:
+            manifest = _load_json_file(args.manifest, "manifest")
+        except ValueError as e:
+            _emit_error("bad_manifest", str(e), args.format)
+            return 2
+        inner = manifest.get("manifest")
+        if isinstance(inner, dict):
+            manifest = inner
+        try:
+            found = [c for c in _manifest_checks_strict(manifest) if c.id == args.check_id]
+        except CheckSpecError as e:
+            _emit_error("bad_manifest_check", str(e), args.format)
+            return 2
+        if found:
+            check, source = found[0], "manifest"
+    if check is None:
+        try:
+            found = [c for c in load_checks(Path(args.spec) if args.spec else None)
+                     if c.id == args.check_id]
+        except CheckSpecError:
+            found = []
+        if found:
+            check, source = found[0], "spec"
+    try:
+        record = record_control(
+            args.check_id,
+            pass_sample=Path(args.pass_sample),
+            fail_sample=Path(args.fail_sample) if args.fail_sample else None,
+            provenance=args.provenance,
+            note=(args.note or "").strip(),
+            check=check, check_source=source, cwd=project_root())
+    except ControlError as e:
+        _emit_error("control_error", str(e), args.format)
+        return 2
+    if args.format == "json":
+        print(json.dumps(record, indent=2))
+        return 0
+    print(f"control recorded for '{args.check_id}' (provenance: {record['provenance']})")
+    if check is None:
+        print(f"  check not found in a manifest or the spec; samples hashed, "
+              f"no run observed. Pass --manifest <file> to run it.")
+    for direction in ("pass_sample", "fail_sample"):
+        rec = record[direction]
+        if rec is None:
+            continue
+        line = f"  {direction}: {rec['path']} sha256 {rec['sha256'][:12]}"
+        if rec.get("observed_exit") is not None or rec.get("observed_pass") is not None:
+            verdict = "agrees" if rec.get("agrees") else "DISAGREES"
+            line += (f"; observed exit {rec['observed_exit']} -> "
+                     f"{'pass' if rec['observed_pass'] else 'fail'} ({verdict})")
+        print(line)
+    if record["provenance"] != "captured":
+        print("  WARNING: an authored pass sample shares its author's beliefs. "
+              "Replace it with a captured real emission before pinning.")
+    if record["fail_sample"] is None:
+        print("  no fail sample: the control shows the check can pass, not that it "
+              "can fail.")
+    print(f"  the sample path reaches the check as ${CONTROL_SAMPLE_ENV}.")
+    return 0
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
@@ -530,6 +611,39 @@ def _render_preflight(results: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _controls_ok(manifest: dict | None, *, strict: bool, fmt: str) -> bool:
+    """Warn — or, when ``strict``, refuse — per blocking manifest check with
+    no grader control or an authored-only pass sample.
+
+    Said on stderr before anything is written, one loud line per check, so a
+    json consumer keeps clean stdout and a human cannot miss it. Checks that
+    do not parse are not warned about here: the gate will skip them and say
+    so, and preflight refuses them. With ``strict`` the first offence ends
+    the command with nothing written: a blocking check whose grader was
+    never shown a real emission is a blocking check with an agent, a deploy
+    path, and a deadline pointed at it (observed in a field deployment on
+    Windows).
+    """
+    entries = (manifest or {}).get("checks") or []
+    parsed: list[Check] = []
+    if isinstance(entries, list):
+        for i, entry in enumerate(entries):
+            try:
+                parsed.append(parse_manifest_check(entry, f"manifest check [{i}]"))
+            except CheckSpecError:
+                continue
+    warnings = control_warnings(parsed)
+    for line in warnings:
+        print(f"{'REFUSED' if strict else 'WARNING'}: {line}", file=sys.stderr)
+    if warnings and strict:
+        _emit_error(
+            "uncontrolled_checks",
+            f"{len(warnings)} blocking manifest check(s) lack a captured grader "
+            "control; nothing written (--strict-controls).", fmt)
+        return False
+    return True
+
+
 # `dispatch new` from a shell with no session id. The dispatch is still
 # recorded — the ledger records what happened — but the operator is told what
 # that record can and cannot do.
@@ -559,6 +673,10 @@ def _cmd_dispatch_new(args: argparse.Namespace) -> int:
         inner = manifest.get("manifest")
         if isinstance(inner, dict):
             manifest = inner
+
+    if manifest is not None and not _controls_ok(
+            manifest, strict=getattr(args, "strict_controls", False), fmt=args.format):
+        return 1
 
     preflight = None
     if getattr(args, "preflight", False):
@@ -665,6 +783,9 @@ def _cmd_dispatch_intent(args: argparse.Namespace) -> int:
         except CheckSpecError as e:
             _emit_error("bad_manifest_check", str(e), args.format)
             return 2
+
+    if not _controls_ok(manifest, strict=args.strict_controls, fmt=args.format):
+        return 1
 
     try:
         path = write_intent(args.agent, prompt, manifest=manifest, tier=args.tier,
@@ -1088,6 +1209,35 @@ def build_parser() -> argparse.ArgumentParser:
                               "as bridge). Omit to run every check.")
     _add_format(p_check)
     p_check.set_defaults(func=_cmd_check)
+    # `fleetproof check` stays the checker; `fleetproof check control ...` is
+    # the one verb beneath it. The nested subparser is optional so every
+    # existing `check --spec/--tier/...` invocation parses exactly as before.
+    csub = p_check.add_subparsers(dest="check_command")
+    p_ctl = csub.add_parser(
+        "control",
+        help="Record a grader control for one check: the pass (and fail) samples "
+             "it was exercised against, their hashes, the provenance of the pass "
+             "sample, and the observed exit per direction. Written to "
+             ".fleetproof/controls/<check-id>.json, outside the hashed tree.")
+    p_ctl.add_argument("check_id")
+    p_ctl.add_argument("--pass-sample", required=True,
+                       help="A file the check must grade as PASS.")
+    p_ctl.add_argument("--fail-sample", default=None,
+                       help="A file the check must grade as FAIL.")
+    p_ctl.add_argument("--provenance", required=True, choices=list(VALID_PROVENANCE),
+                       help="Where the pass sample came from: captured (a real "
+                            "emission of the target) or authored (written by a "
+                            "person). Authored controls are warned about at "
+                            "dispatch intent.")
+    p_ctl.add_argument("--note", default=None,
+                       help="Where and when the sample was captured, for the record.")
+    p_ctl.add_argument("--manifest", default=None,
+                       help="Manifest file whose check with this id should be run "
+                            "against each sample (the sample path is passed as "
+                            f"${CONTROL_SAMPLE_ENV}). Falls back to the repo spec.")
+    p_ctl.add_argument("--spec", default=None, help="Spec to resolve the check from.")
+    _add_format(p_ctl)
+    p_ctl.set_defaults(func=_cmd_check_control)
 
     p_list = sub.add_parser("list", help="List recorded runs, newest first.")
     p_list.add_argument("--status", choices=["ok", "fail"], default=None)
@@ -1177,6 +1327,9 @@ def build_parser() -> argparse.ArgumentParser:
                              f"{SESSION_ID_ENV} from the environment). Without "
                              "one the dispatch is recorded session-less, which "
                              "no hook stop can ever adopt; a warning says so.")
+    p_dnew.add_argument("--strict-controls", action="store_true", help="Refuse (exit 1, nothing written) instead of warning when a blocking "
+                             "manifest check has no grader control or an authored-only pass "
+                             "sample (see `fleetproof check control`).")
     p_dnew.add_argument("--preflight", action="store_true",
                         help="Run every manifest check now, from the project root, exactly as the "
                              "gate would, and print the resolved command, exit code, "
@@ -1203,6 +1356,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Second match key: a spawn whose agent_type equals "
                              "this exactly consumes the intent even when the "
                              "filename does not match.")
+    p_dint.add_argument("--strict-controls", action="store_true", help="Refuse (exit 1, nothing written) instead of warning when a blocking "
+                             "manifest check has no grader control or an authored-only pass "
+                             "sample (see `fleetproof check control`).")
     p_dint.add_argument("--preflight", action="store_true",
                         help="Run every manifest check now, from the project root, exactly as the "
                              "gate would, and print the resolved command, exit code, "

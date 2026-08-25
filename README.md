@@ -339,6 +339,25 @@ closes with is the rule that would have caught the field's deployed mistake:
 a positive control must be a captured real emission, never authored by the
 check's author.
 
+**Every blocking check gets a grader control, and the pass sample is a
+captured emission.** `fleetproof check control <check-id> --pass-sample
+<file> [--fail-sample <file>] --provenance captured|authored [--note ...]
+[--manifest <file>]` records, under `.fleetproof/controls/<check-id>.json`,
+the sha256 and path of each sample, the provenance of the pass sample, who
+recorded it and when, and — when the check can be resolved from the manifest
+file or the repo spec — the observed exit and grade per direction. The
+sample reaches the check as the environment variable
+`FLEETPROOF_CONTROL_SAMPLE`; a controllable check reads that variable and
+grades the file it names instead of the live target. The controls directory
+is outside the hashed checks tree on purpose: a control is evidence about a
+grader, not a grader, and recording one trips no drift pin. `dispatch
+intent` and `dispatch new --manifest` then print one loud stderr warning per
+blocking manifest check that has no control or whose only pass sample is
+`authored`; `--strict-controls` turns the warning into a refusal with nothing
+written. This is the check that would have caught the field's deployed
+mistake: the grader and its sample data had one author and one belief, and
+the only party that disagreed was the running product.
+
 **Never dispatch an agent against a blocking check its seat cannot satisfy.**
 A lane gated on something only the bridge or the operator can do will fail,
 retry, and fail again — the gate is working; the dispatch was wrong. Declare
