@@ -7,6 +7,16 @@ records what your agents do to a durable run log, and — critically — grades 
 work with a checker that runs in a separate process from the agent that did
 it. An agent may author the checks; it never executes and grades its own work.
 
+> **Install and enable the plugin *before* the session starts.** Hooks
+> register at session start, so a mid-session install is a **silently inert
+> gate**: nothing fires, nothing blocks, and every "your stop will be gated"
+> belief is false — the exact failure mode this tool exists to prevent, in the
+> tool itself. Preflight every gated session: run one trivial tool call, then
+> confirm a `claude-tool-*` run record with a non-null session id appeared
+> under `.fleetproof/runs/`. No record means not live. The CLI backstops this:
+> `fleetproof fleet`, `check`, and `report` each warn when the current session
+> has no hook-produced record.
+
 ## Why this exists
 
 The failure mode this targets is the false "done": an agent reports a task
@@ -54,6 +64,7 @@ No language model sits in the grading path. Grading is comparison.
 | `fleetproof fleet` | The dispatch board: every dispatch, its state, its tier, and whether anything graded it. |
 | `fleetproof report` | One self-contained HTML file: per run, claimed-done vs. independently-verified. |
 | `fleetproof telemetry` | v0.3: per-dispatch outcome records, a local reliability summary, and a strict-allowlist export. |
+| `fleetproof arm` / `disarm`, `dispatch park`, `fleet --orphans` | v0.4: the fleet-operating surface — phase arming, deliberate termination, and the orphan-stop view. |
 
 Runtime dependencies: none (Python standard library only). A tool whose job is
 being trustworthy should add as little dependency and supply-chain surface as it can.
@@ -125,7 +136,9 @@ Inference reads the shape of the run tree: no parent means `bridge`, a parent th
 tops its own chain means `lane`, anything deeper means `leaf`. `coordinator` is
 never inferred — it is a role you assign, not a shape that shows up in a run tree.
 On the board a declared tier carries a trailing `!`, so you can tell a decision
-from a guess.
+from a guess — and a tier that is neither declared nor inferred but *defaulted*
+(a captured spawn no intent matched) renders as `lane?`, because a guess
+wearing a declared tier's clothes is how a leaf gets graded as a lane.
 
 ### The two new hooks
 
@@ -137,15 +150,30 @@ SubagentStop is the gate. Each step is its own reason to refuse the stop:
 1. Report-before-idle. No final message means no report: an agent that went idle
    saying nothing has not reported, and writing that down as `reported` would
    launder silence into a claim. Blocked without transitioning.
-2. Pin drift. Every dispatch pins the SHA-256 of the check spec that was in force
-   when the work was ordered. If the spec changed mid-flight, the stop is blocked
-   rather than graded against a spec the agent could have edited itself.
+2. Pin drift. Every dispatch pins the SHA-256 of the check spec that was in
+   force when the work was ordered — and, as of 0.4.0, a tree hash over the
+   check scripts under `.fleetproof/checks/`, because the graders are part of
+   the spec and a rewritten grader is drift the same as a rewritten spec. If
+   either changed mid-flight, the stop is blocked rather than graded against a
+   spec the agent could have edited itself, and the block names which one
+   drifted. The one exception: if the agent's tier selects nothing runnable,
+   there is nothing to mis-grade — the drift is noted and the stop allowed,
+   ungraded.
 3. That agent's tier of the spec, unioned with any checks declared on the
    dispatch's own manifest (`{"id", "cmd"}` entries — blocking, expect-exit0).
    A blocking failure records `contradicted` and blocks; a pass records
    `verified` and closes the dispatch. If nothing is runnable — the tier selects
    no repo checks and the manifest declares none — no verdict is recorded: an
    absent grade must never read as a passing one.
+
+Two guardrails around the gate. A SubagentStop with no dispatch to join —
+harness-internal helper agents emit these every session — is recorded as an
+**orphan**: a sighting, never a graded dispatch, because a ledger that
+manufactures dispatches out of unpaired stops manufactures verdicts too. And a
+dispatch that keeps failing the same gate does not loop forever: after three
+contradicted stops it is terminated as `abandoned` — never `verified` — and
+the dispatcher is told to park it, fix the spec or tier, or re-dispatch (see
+*Operating a fleet* below).
 
 The Stop hook keeps its v0.1 job and adds a ledger sweep. A dispatch that reported
 and then never terminated blocks the bridge from stopping: something started
@@ -157,18 +185,27 @@ it is reported and not blocked on.
 
 ```
 fleetproof dispatch new --prompt "..."        # --prompt-file for a real, long one
+fleetproof dispatch new --agent-name worker \
+    --prompt-file p.md                        # joinable: the next SubagentStop of
+                                              # that spawn name adopts this record
 fleetproof dispatch report <run-id> --report report.json
 fleetproof dispatch close <run-id>
+fleetproof dispatch park <run-id> --reason "..."  # terminate on purpose, reason kept
 
 fleetproof dispatch intent --agent recon --prompt-file p.md \
-    [--manifest m.json] [--tier lane]         # declare the NEXT spawn of an agent
+    [--manifest m.json] [--tier lane] [--role tester]
+                                              # declare the NEXT spawn of an agent
                                               # type; the start capture consumes it
 
 fleetproof fleet                              # the board, newest first
 fleetproof fleet --open                       # only what has not terminated
+fleetproof fleet --orphans                    # unpaired stops: sightings, not dispatches
 fleetproof fleet --format json                # full records, for an agent to read
 
 fleetproof check --tier lane                  # grade one rung of the spec
+
+fleetproof arm                                # bridge Stop gate blocks (the default)
+fleetproof disarm --note "why"                # bridge gate advisory; note required
 ```
 
 The board never prints a bare dash where a verdict goes. A dispatch nothing graded
@@ -185,17 +222,25 @@ transition trail, and which process wrote each transition.
   write an intent sidecar first: `fleetproof dispatch intent --agent <type>
   --prompt-file <file>` writes `.fleetproof/intents/<agent_type>.json`, and the
   next SubagentStart of that agent type consumes it — one intent, one spawn.
-- Captured subagents without a declared intent tier are recorded as `lane` tier.
-  Real nesting depth is not visible from the payload — there is no parent-agent
-  field — so declaring one beats inferring it wrongly. What that costs in
-  practice is a pilot question.
+- Captured subagents without a declared intent tier are recorded at `lane`
+  tier, marked `defaulted` — `lane?` on the board — and the miss is loud: the
+  start capture writes a stderr line naming the spawn that matched nothing and
+  listing the sidecars that were present. Real nesting depth is not visible
+  from the payload — there is no parent-agent field — so declaring a tier
+  beats inferring it wrongly.
 - An agent killed mid-turn can reach SubagentStop with an empty final message,
   which report-before-idle blocks. Blocking the stop of an agent that is already
   gone is not useful; how often it happens is under observation.
 - There is no correlation field between the Task call that spawned an agent and
-  that agent's stop, so `agent_id` plus `session_id` is the entire join key. That
-  is also why the lookup is scoped to non-terminal dispatches: an agent id can be
-  reused once a dispatch is closed out.
+  that agent's stop, so `agent_id` plus `session_id` is the primary join key.
+  A dispatch recorded from the CLI with `--agent-name` has no agent id yet; the
+  first SubagentStop in the same session whose spawn name matches it uniquely
+  adopts it (the adoption is written into the transitions). An ambiguous name
+  match — two open dispatches, same name — joins nothing: the stop lands as an
+  orphan with a stderr note naming the ambiguity, because guessing which
+  dispatch to grade is worse than grading neither. The lookup is scoped to
+  non-terminal dispatches: an agent id can be reused once a dispatch is closed
+  out.
 
 ## Verification telemetry (v0.3)
 
@@ -262,6 +307,90 @@ the rest of `.fleetproof/`, no worse — anything that can write the repo can
 write an intent, and the manifest checks it carries run as shell commands at
 the stop gate the same way repo checks do.
 
+## Operating a fleet (v0.4)
+
+v0.4 is the field-hardening release: everything in it was shaped by running a
+multi-lane fleet under the gate in a field deployment on Windows. The
+mechanics are FleetProof's; the discipline below is yours. It is what keeps a
+verification gate from decaying into either wallpaper or a wedge.
+
+**Declare intent before every spawn, and verify the capture.** Intent sidecars
+are keyed by the *exact spawn name* — the `agent_type` the harness reports —
+not by what you think of the role as. If the names in your head and your spawn
+calls drift apart, key the sidecar to the role instead with
+`dispatch intent --role`; matching is exact string equality on filename OR
+role, never a prefix guess. Then look at `fleetproof fleet` right after each
+spawn: the row should show the real prompt and a `tier!`. A `lane?` means no
+intent matched — the dispatch is running with a placeholder prompt at a
+defaulted tier, and the capture you thought you declared didn't happen.
+
+**Never dispatch an agent against a blocking check its seat cannot satisfy.**
+A lane gated on something only the bridge or the operator can do will fail,
+retry, and fail again — the gate is working; the dispatch was wrong. Declare
+`"owner"` on such checks (`leaf|lane|coordinator|bridge|operator`): at any
+other tier the check still runs and renders, but as advisory — it blocks only
+at the seat that can actually satisfy it. `operator`-owned checks are advisory
+at every agent tier; they keep a criterion visible without wedging anyone, and
+the operator closes them out of band.
+
+**Expensive checks belong where they run once.** The gate runs a tier's checks
+at every graded stop on that tier. A slow suite gated on every leaf stop taxes
+the whole fleet; tier it to the rung where it runs once, and demote what
+doesn't need to block to `block: false`.
+
+**Edit specs between phases, not under pinned dispatches.** Every dispatch
+pins the spec and the check-script tree; an edit while agents are in flight
+drift-blocks each of them at stop. Propose spec edits as text mid-phase, land
+them at the phase boundary, then dispatch. And if the temptation is to flip
+checks to `block: false` because a phase can't pass them yet, that flip is
+itself a spec edit — use arming instead.
+
+**Arming is the phase switch; disarming is an operator action.**
+`fleetproof disarm --note "why"` sets the bridge Stop gate to advisory:
+checks still run and render their failures, but the bridge can end its turn —
+for build phases whose release checks can only pass at publish.
+`fleetproof arm` turns blocking back on, and the armed state is the default —
+no file, a corrupt file, or an unknown value all read as armed. The note is
+required on disarm by design, and the file records who set it and when; the
+board echoes a disarmed gate on every render. A bridge disarming its own gate
+is therefore visible and attributed, not silent: anything that can write the
+repo can flip the switch, but it cannot flip it quietly. The ledger sweep
+still blocks on stalled dispatches regardless of arming, and subagent grading
+is never affected by it.
+
+**The graders are part of the spec.** The tree hash pins every file under
+`.fleetproof/checks/` alongside `checks.json` itself. A check whose grading
+logic lives in a script is only as trustworthy as that script's bytes, so a
+rewritten grader now trips the same drift block as a rewritten spec.
+
+**Orphans are sightings, never verdicts.** Harness-internal helper agents emit
+SubagentStops that never had a start; a parked or abandoned dispatch's agent
+may stop again after its dispatch is terminal. These land in the orphan list
+(`fleet --orphans`), not on the board, and are never graded — a stop that
+joins no dispatch must not be allowed to manufacture one, because once lane
+checks are green a manufactured dispatch grades itself `verified`.
+
+**A wedge must terminate, not loop.** The escalation ladder: a blocking
+failure blocks; the third contradicted stop on the same dispatch terminates it
+as `abandoned` instead — the agent is released, the board shows `abandoned!`
+(never `verified`), and the dispatcher is told to park, fix, or re-dispatch.
+For a dispatch you can see is wedged before the ladder runs out — or one whose
+check its seat can't satisfy — `fleetproof dispatch park <run-id> --reason`
+closes it on purpose with the reason kept. A parked dispatch is terminal; its
+agent, if it stops again, lands as an orphan.
+
+**Treat `.fleetproof/runs/` as secret-class, and keep secrets off command
+lines.** Check stdout and stderr are persisted into the run log — that is the
+point, and the risk. Builtin redactions (connection-string keys, SAS-style
+signatures, private-key blocks, JWTs, bearer tokens) plus per-check `redact`
+patterns run before anything is written, and the env snapshot is
+denylist-filtered — but redaction is a backstop, not a permission slip. The
+PostToolUse hook records `tool_input` *verbatim by design*: redacting
+arbitrary code before recording it would be false comfort about what your
+agents ran, so a secret typed on a command line is a secret in the run log,
+full stop. Never type one. And add `.fleetproof/runs/` to `.gitignore` — it
+is evidence, not source.
+
 ## Install (each line is one command in Claude Code)
 
 ```
@@ -318,6 +447,17 @@ you (or an agent, under your review) write *before* work is graded, kept in the
 repo where it is versioned and diffable. JSON, not YAML, on purpose: there is no
 third-party parser in the runtime.
 
+Beyond `{ "id", "run", "expect", "block" }`, a check can declare a `tier`
+(which rung grades it — see the ledger section), an `owner` (which rung can
+*satisfy* it — see *Operating a fleet*), and `redact` patterns applied to its
+captured output before anything is persisted. `run` may also be a JSON array
+of argv strings, executed with `shell=False` — no shell at all, which on
+Windows means no cmd.exe quoting hazards; the string form keeps shell
+semantics for compatibility. Manifest checks (`{ "id", "cmd" }`) accept the
+same array form. Checks execute from the resolved project root, not from
+wherever the hook's shell happened to be `cd`'d, and every rendered verdict
+prints the cwd it ran from.
+
 An agent is welcome to propose or edit checks. The guarantee FleetProof makes is
 narrower and firmer than "the agent verified its work": it is that *something
 other than the agent* ran the checks and recorded the result.
@@ -354,36 +494,42 @@ choose runs outside the agent's process*.
 
 Guidance that keeps the gate honest: keep blocking checks fast and
 deterministic (flaky checks flap the gate; slow ones tax every stop) and demote
-heavy suites to `block: false`. For fleets doing varied tasks in one repo,
+heavy suites to `block: false`. A spec whose selected checks are *all*
+advisory renders its verdict as `ADVISORY - 0 blocking; ...`, never the bare
+word PASS — green with nothing blocking is a fact worth labelling. For fleets doing varied tasks in one repo,
 the working convention is to have the agent author task-specific checks at task
 start — authoring is a feature — and let the spec-drift flag make any later
 revision loud. Per-task check scoping as a first-class mechanism is on the
 roadmap.
 
-## Scope and limitations (v0.1)
+## Scope and limitations
 
-This is an early release. Honest boundaries:
+Honest boundaries:
 
 - **`python` must be on `PATH`.** The plugin hooks invoke the checker via
   `python "${CLAUDE_PLUGIN_ROOT}/scripts/..."`. Environments where the interpreter
   is only reachable as `python3`, or not on `PATH`, need a shim — any wrapper on
   `PATH` named `python` works, e.g. `sudo ln -s $(which python3) /usr/local/bin/python`.
-- **Checks are shell commands.** Their portability is your responsibility — a
-  check that shells out to `grep` won't behave identically on every OS. And
-  because a repo's `checks.json` runs shell commands on the Stop event, treat a
+- **Checks are commands you chose.** Their portability is your responsibility —
+  a check that shells out to `grep` won't behave identically on every OS
+  (the argv form of `run` sidesteps the shell-quoting half of that problem).
+  And because a repo's `checks.json` runs commands on the Stop event, treat a
   cloned repo's `checks.json` with the same trust you give its `Makefile` or
   pre-commit config: it is executable code. FleetProof adds no network surface of
   its own, and first-run consent-per-spec-hash is on the roadmap.
 - **The gate is only as good as the checks.** FleetProof enforces that an
   independent process runs your checks; it cannot know whether your checks capture
   what "done" really means. Weak checks give false confidence.
-- **An agent can weaken its own checks.** Authoring `checks.json` is a feature, so
-  nothing stops an agent from editing it mid-session to slip the gate. FleetProof
-  does not (yet) forbid spec edits; instead it records the SHA-256 of the spec on
-  every verdict and flags mid-session *spec drift* loudly — in the Stop-gate
-  output, the CLI, and the report — when a verdict's spec hash differs from the
-  session's first. Drift does not by itself block a passing verdict in v0.1; spec
-  pinning and consent-on-change are on the roadmap.
+- **An agent can weaken its own checks — but not quietly.** Authoring
+  `checks.json` is a feature, so nothing forbids an agent editing it
+  mid-session to slip the gate. What stands in the way: every dispatch pins
+  the spec hash *and* the tree hash over the check scripts under
+  `.fleetproof/checks/`, and a pinned agent whose spec or graders drifted is
+  blocked at its stop rather than graded against the edited version. At the
+  session level, drift from the session's first spec is flagged loudly — in
+  the Stop-gate output, the CLI, and the report. What remains open: an agent
+  that edits the spec *before* any dispatch pins it is drift-invisible;
+  consent-on-change is on the roadmap.
 - **The local ledger is forgeable by design.** An agent with write access to the
   repo can, in principle, forge or tamper with records in its own `.fleetproof/`
   — verdicts, transitions, reports. The gates make honest mistakes loud and
@@ -396,9 +542,14 @@ This is an early release. Honest boundaries:
   rather than blocking every task. But once a spec has graded work this session
   — or a dispatch has pinned one — a missing, emptied, or unreadable spec
   *blocks*: a promised gate cannot be switched off by deleting its spec.
-- **Blocking can repeat.** If a blocking check keeps failing, the Stop hook keeps
-  blocking. That is intended (don't stop on a false done), but it means a check
-  that can never pass needs operator intervention.
+- **Blocking can repeat — but not unboundedly.** If a blocking check keeps
+  failing, the gate keeps blocking: don't stop on a false done. Two escape
+  hatches keep that from becoming a wedge. A subagent's dispatch is terminated
+  as `abandoned` after three contradicted stops — the agent is released, the
+  work is marked unverified, and the dispatcher is told. And the bridge's Stop
+  gate can be set to advisory with `fleetproof disarm --note` when a phase
+  legitimately cannot pass its checks yet — an operator decision, recorded and
+  echoed on the board.
 
 ## FleetProof for teams (coming — waitlist open)
 
