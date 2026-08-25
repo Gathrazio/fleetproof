@@ -46,6 +46,17 @@ def test_report_marks_verified_run(tmp_runs, tmp_path):
     assert "verified" in html
 
 
+def test_report_renders_an_all_advisory_verdict_as_advisory(tmp_runs, tmp_path):
+    # A verdict with zero blocking checks certifies nothing; a green 'pass'
+    # badge on it would be the vacuous PASS in HTML form.
+    run_checks([_check("a1", run=f'"{sys.executable}" -c "raise SystemExit(0)"',
+                       block=False)],
+               cwd=tmp_path, record_to_log=True)
+    html = build_report()
+    assert ">advisory</span>" in html
+    assert ">pass</span>" not in html
+
+
 def test_report_marks_unverified_run(tmp_runs):
     with record("some-tool", "do"):
         pass

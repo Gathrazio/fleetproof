@@ -82,9 +82,24 @@ class CheckReport:
         """'pass' unless a blocking check failed. Non-blocking failures do not gate."""
         return "fail" if self.blocking_failures else "pass"
 
+    @property
+    def all_advisory(self) -> bool:
+        """True when checks ran and none of them could have failed the verdict.
+
+        Such a verdict certifies nothing — 'pass' on it is vacuously true, and
+        rendering the bare word teaches operators that PASS can mean 'nothing
+        was at stake' (observed in a field deployment on Windows). The empty
+        report stays outside this: zero selected checks is an absent grade,
+        which is its own condition.
+        """
+        return self.total > 0 and not any(r.blocking for r in self.results)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "verdict": self.verdict,
+            # Sibling flag, not a third verdict value: consumers keyed on
+            # pass/fail keep working, and an all-advisory pass is markable.
+            "advisory": self.all_advisory,
             # SHA-256 of the checks.json that governed this verdict. Additive:
             # records written before this field existed simply omit it, and every
             # reader treats a missing value as None (no hash on record).
@@ -336,10 +351,18 @@ def format_report_text(report: CheckReport) -> str:
         mark = "PASS" if r.passed else ("FAIL" if r.blocking else "warn")
         lines.append(f"  [{mark}] {r.id}: {r.detail}")
     s = report.to_dict()["summary"]
-    lines.append(
-        f"{report.verdict.upper()} - {s['passed']}/{s['total']} passed, "
-        f"{s['blocking_failed']} blocking failure(s)."
-    )
+    if report.all_advisory:
+        # Never the bare word PASS here: with zero blocking checks nothing
+        # could have failed this verdict, and the line must say so.
+        lines.append(
+            f"ADVISORY - 0 blocking; {s['total']} advisory check(s), "
+            f"{s['passed']} passed."
+        )
+    else:
+        lines.append(
+            f"{report.verdict.upper()} - {s['passed']}/{s['total']} passed, "
+            f"{s['blocking_failed']} blocking failure(s)."
+        )
     lines.append(f"spec: {short_spec_hash(report.spec_sha256)}")
     # Only surfaced when scoped, so untiered (v0.1) output is byte-identical.
     if report.tier:

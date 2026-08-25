@@ -740,7 +740,14 @@ def _render_transitions(dispatch: DispatchRecord) -> str:
 def _render_verdict(v: dict[str, Any], baseline_hash: str | None = None) -> str:
     summary = v.get("summary", {})
     verdict = v.get("verdict", "?")
-    tone = "bad" if verdict == "fail" else "ok"
+    # An all-advisory pass renders as 'advisory', never a green 'pass': zero
+    # blocking checks means nothing was at stake in this verdict. The stored
+    # verdict field keeps its pass/fail vocabulary; only the badge changes.
+    advisory = bool(v.get("advisory")) and verdict == "pass"
+    if advisory:
+        verdict, tone = "advisory", "warn"
+    else:
+        tone = "bad" if verdict == "fail" else "ok"
     sha = v.get("spec_sha256")
     tier = v.get("tier")
     drifted = bool(baseline_hash and sha and sha != baseline_hash)

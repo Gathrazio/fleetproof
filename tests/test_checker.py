@@ -166,6 +166,47 @@ def _tiered_set():
     ]
 
 
+# === advisory verdict rendering ===
+
+_OK = f'"{sys.executable}" -c "raise SystemExit(0)"'
+_BAD = f'"{sys.executable}" -c "raise SystemExit(1)"'
+
+
+def test_all_advisory_report_renders_advisory_not_pass(tmp_project):
+    # 'PASS - 0/8 passed' when every check is block:false is vacuous: nothing
+    # could have failed the verdict, so the word PASS certifies nothing
+    # (observed in a field deployment on Windows). Say what it is.
+    from fleetproof.checker import format_report_text
+    report = run_checks(
+        [_check("a1", run=_OK, block=False), _check("a2", run=_BAD, block=False)],
+        cwd=tmp_project, record_to_log=False)
+    assert report.all_advisory is True
+    # JSON compatibility: the verdict field itself does not change vocabulary.
+    payload = report.to_dict()
+    assert payload["verdict"] == "pass"
+    assert payload["advisory"] is True
+    text = format_report_text(report)
+    assert "ADVISORY - 0 blocking; 2 advisory check(s), 1 passed" in text
+    assert "PASS -" not in text
+
+
+def test_report_with_any_blocking_check_is_not_advisory(tmp_project):
+    from fleetproof.checker import format_report_text
+    report = run_checks(
+        [_check("b1", run=_OK, block=True), _check("a1", run=_OK, block=False)],
+        cwd=tmp_project, record_to_log=False)
+    assert report.all_advisory is False
+    assert report.to_dict()["advisory"] is False
+    assert "PASS -" in format_report_text(report)
+
+
+def test_empty_report_is_not_advisory(tmp_project):
+    # Zero selected checks is its own condition (an absent grade), not an
+    # advisory one; the 0-total PASS line stays as the visible trace of it.
+    report = run_checks([], cwd=tmp_project, record_to_log=False)
+    assert report.all_advisory is False
+
+
 def test_no_tier_selects_everything_v01_behaviour():
     assert [c.id for c in select_checks(_tiered_set(), None)] == [
         "untiered", "leaf-check", "lane-check", "coordinator-check", "bridge-check",
