@@ -73,11 +73,13 @@ from .ledger import (
     STATE_VERIFIED,
     TIER_BRIDGE,
     TIER_SOURCE_DEFAULTED,
+    TIER_SOURCE_INHERITED,
     LedgerError,
     close_dispatch,
     consume_intent,
     create_dispatch,
     find_dispatch_for_stop,
+    find_inheritable_intent,
     intents_dir,
     list_dispatches,
     load_dispatch,
@@ -602,39 +604,78 @@ def capture_subagent_start(payload: dict[str, Any]) -> str:
     dispatch intent``), the dispatch is created with the intent's real prompt,
     manifest, and tier — the harness still does not carry the spawn prompt, so
     the sidecar is the only route it has onto the record. The intent is
-    consumed on match: one intent, one spawn, and a second spawn of the same
-    agent type gets exactly the placeholder capture a repo without sidecars
-    always got. Degradations (malformed intent, malformed manifest, bad tier)
-    are surfaced on stderr and in the manifest notes, never fatal — this runs
-    inside a hook that must not break the spawn.
+    consumed on match: one intent, one spawn.
+
+    A second spawn of the same agent type — which is what re-messaging a
+    live teammate looks like from the hook's seat — finds no sidecar. Before
+    inheritance that meant a placeholder capture with an empty manifest, and
+    at a tier the repo spec leaves empty (the configuration per-dispatch
+    manifests encourage) the stop then had nothing runnable and closed
+    ungraded while the board said done (observed in a field deployment on
+    Windows). So a clean miss now looks for the newest dispatch in the same
+    session for the same agent_type that carried a declared intent, and
+    inherits its prompt, manifest, tier, and intent attribution — recorded
+    as ``tier_source="inherited"`` with ``inherited_from`` naming the source,
+    and said on stderr. Only when there is nothing to inherit does the spawn
+    get the placeholder capture a repo without sidecars always got.
+    Degradations (malformed intent, malformed manifest, bad tier) are surfaced
+    on stderr and in the manifest notes, never fatal — this runs inside a
+    hook that must not break the spawn.
     """
     agent_id, agent_type = _agent_fields(payload)
     intent, notes = consume_intent(agent_type)
     for note in notes:
         sys.stderr.write(f"[fleetproof] {note}\n")
+    inherited_from: str | None = None
     if intent is None and not notes:
-        # A clean miss — no sidecar matched by name or role. Said loudly,
-        # because the silent version of this is a placeholder prompt and a
-        # defaulted tier that nobody notices until the verdicts are worthless
-        # (observed in a field deployment on Windows).
-        sys.stderr.write(
-            f"[fleetproof] no intent matched spawn '{agent_type or 'unknown'}' "
-            "— captured with placeholder prompt at defaulted tier "
-            f"'{CAPTURED_SUBAGENT_TIER}'. Sidecars present: "
-            f"{_sidecar_listing()}.\n")
+        source = find_inheritable_intent(os.environ.get(SESSION_ID_ENV), agent_type)
+        if source is not None:
+            inherited_from = source.run_id
+            intent = {
+                "prompt": source.prompt,
+                "manifest": source.manifest,
+                # An inherited tier is the source's tier whatever its own
+                # provenance was; the inherited record says only that it was
+                # inherited, and from where.
+                "tier": source.tier,
+                "source": source.intent_source,
+            }
+            sys.stderr.write(
+                f"[fleetproof] no intent sidecar for '{agent_type or 'unknown'}' "
+                f"— inherited intent from dispatch {source.run_id} "
+                "(re-message of a live teammate?)\n")
+        else:
+            # A clean miss — no sidecar matched by name or role, and nothing
+            # in this session to inherit. Said loudly, because the silent
+            # version of this is a placeholder prompt and a defaulted tier
+            # that nobody notices until the verdicts are worthless (observed
+            # in a field deployment on Windows).
+            sys.stderr.write(
+                f"[fleetproof] no intent matched spawn '{agent_type or 'unknown'}' "
+                "— captured with placeholder prompt at defaulted tier "
+                f"'{CAPTURED_SUBAGENT_TIER}'. Sidecars present: "
+                f"{_sidecar_listing()}.\n")
     prompt = intent["prompt"] if intent else _placeholder_prompt(agent_type)
     manifest = intent["manifest"] if intent else None
     intent_tier = intent["tier"] if intent else None
     # Only an intent-declared tier is a declaration. The lane fallback records
     # tier_source="defaulted": the one provenance field that could reveal an
-    # intent miss must not assert a declaration nobody made.
+    # intent miss must not assert a declaration nobody made. An inherited
+    # tier is "inherited" whatever the source's own provenance was.
+    if inherited_from:
+        tier_source: str | None = TIER_SOURCE_INHERITED
+    elif intent_tier:
+        tier_source = None
+    else:
+        tier_source = TIER_SOURCE_DEFAULTED
     return create_dispatch(
         prompt,
         tier=intent_tier or CAPTURED_SUBAGENT_TIER,
-        tier_source=None if intent_tier else TIER_SOURCE_DEFAULTED,
+        tier_source=tier_source,
         manifest=manifest,
         agent={"agent_id": agent_id, "agent_type": agent_type, "capture": CAPTURE_START},
         intent_source=intent["source"] if intent else None,
+        inherited_from=inherited_from,
         by="hook",
     )
 

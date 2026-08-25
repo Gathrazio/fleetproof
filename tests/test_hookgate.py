@@ -943,7 +943,11 @@ def test_subagent_start_consumes_intent_sidecar(tmp_path, monkeypatch):
     assert intent_path("tester") is not None  # the name itself stays mappable
 
 
-def test_second_spawn_after_consumption_gets_the_placeholder(tmp_path, monkeypatch):
+def test_second_spawn_after_consumption_inherits_the_first_intent(tmp_path, monkeypatch):
+    # The sidecar is consumed once (one intent, one spawn); a second spawn of
+    # the same agent type in the same session used to get the placeholder.
+    # It now inherits the first dispatch's intent — a re-message of a live
+    # teammate must not become an ungoverned dispatch.
     from fleetproof.hookgate import subagent_start_main
     from fleetproof.ledger import list_dispatches, write_intent
     _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
@@ -957,7 +961,10 @@ def test_second_spawn_after_consumption_gets_the_placeholder(tmp_path, monkeypat
     # Two spawns in the same second sort unpredictably; key on the agent id.
     by_agent = {d.agent_id: d for d in list_dispatches()}
     assert by_agent["agent-1"].prompt == _INTENT_PROMPT
-    assert "[uncaptured]" in by_agent["agent-2"].prompt
+    assert by_agent["agent-2"].prompt == _INTENT_PROMPT
+    assert by_agent["agent-2"].tier_source == "inherited"
+    assert by_agent["agent-2"].inherited_from == by_agent["agent-1"].run_id
+    assert "[uncaptured]" not in by_agent["agent-2"].prompt
     assert by_agent["agent-2"].tier == "lane"
 
 
@@ -1704,3 +1711,185 @@ def test_no_report_block_is_persisted_without_a_checker_run(
     assert len(blocks) == 1
     assert blocks[0]["text"] == decision["reason"]
     assert blocks[0]["checker_run_id"] is None
+
+
+# === intent inheritance (SubagentStart re-spawn of the same agent type) ===
+
+def _touch_manifest(tmp_path: Path, marker: str = "ran.txt"):
+    """A manifest whose one check leaves a file behind — proof it executed."""
+    target = tmp_path / marker
+    cmd = [sys.executable, "-c",
+           f"import pathlib; pathlib.Path({str(target)!r}).write_text('ran')"]
+    manifest = {
+        "deliverables": ["the follow-up"],
+        "checks": [{"id": "m-touch", "cmd": cmd}],
+        "check_map": {"the follow-up": ["m-touch"]},
+        "notes": "declared by the dispatcher",
+    }
+    return manifest, target
+
+
+def test_respawn_inherits_intent_and_the_stop_gate_runs_the_inherited_checks(
+        tmp_path, monkeypatch, capsys):
+    # (1) Same session, same agent_type, sidecar consumed by the first spawn:
+    # the second spawn inherits, and its stop RUNS the inherited manifest
+    # check — the file it writes is the proof a check executed, not a label.
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import list_dispatches, write_intent
+    manifest, target = _touch_manifest(tmp_path)
+    _setup_project(tmp_path, [_LEAF_ONLY], monkeypatch)  # nothing at lane tier
+    write_intent("tester", _INTENT_PROMPT, manifest=manifest, tier="lane")
+
+    _feed(monkeypatch, _start_payload(agent_id="agent-1"))
+    subagent_start_main()
+    _feed(monkeypatch, _stop_payload(message="first turn done", agent_id="agent-1"))
+    assert subagent_stop_main() == 0
+    capsys.readouterr()
+    assert target.exists()
+    target.unlink()
+
+    _feed(monkeypatch, _start_payload(agent_id="agent-2"))
+    subagent_start_main()
+    err = capsys.readouterr().err
+    first = next(d for d in list_dispatches() if d.agent_id == "agent-1")
+    second = next(d for d in list_dispatches() if d.agent_id == "agent-2")
+    assert second.tier_source == "inherited"
+    assert second.inherited_from == first.run_id
+    assert second.tier == "lane"
+    assert second.prompt == _INTENT_PROMPT
+    assert second.manifest["checks"] == manifest["checks"]
+    assert second.intent_source == first.intent_source
+    assert (f"no intent sidecar for 'tester' — inherited intent from dispatch "
+            f"{first.run_id} (re-message of a live teammate?)") in err
+
+    _feed(monkeypatch, _stop_payload(message="follow-up done", agent_id="agent-2"))
+    assert subagent_stop_main() == 0
+    assert capsys.readouterr().out == ""  # allowed to stop — it passed
+    assert target.exists()  # the inherited check actually ran on the second stop
+    second = next(d for d in list_dispatches() if d.agent_id == "agent-2")
+    assert second.verdict == "verified"
+    assert "1/1 checks passed" in second.transitions[-2]["detail"]
+
+
+def test_respawn_in_a_different_session_does_not_inherit(tmp_path, monkeypatch, capsys):
+    # (2) Inheritance is scoped to the session exactly. Another session's
+    # teammate of the same name is a different fleet.
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import list_dispatches, write_intent
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    write_intent("tester", _INTENT_PROMPT, manifest=_intent_manifest(), tier="leaf")
+
+    _feed(monkeypatch, _start_payload(agent_id="agent-1", session="sess-a"))
+    subagent_start_main()
+    _feed(monkeypatch, _start_payload(agent_id="agent-2", session="sess-b"))
+    subagent_start_main()
+
+    second = next(d for d in list_dispatches() if d.agent_id == "agent-2")
+    assert second.tier_source == "defaulted"
+    assert second.inherited_from is None
+    assert "[uncaptured]" in second.prompt
+    assert "no intent matched spawn 'tester'" in capsys.readouterr().err
+
+
+def test_spawn_with_no_prior_intent_is_defaulted_as_before(tmp_path, monkeypatch, capsys):
+    # (3) Nothing to inherit: a prior placeholder capture of the same type
+    # carried no contract, so the miss stays a loud, defaulted miss.
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import list_dispatches
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+
+    _feed(monkeypatch, _start_payload(agent_id="agent-1"))
+    subagent_start_main()
+    _feed(monkeypatch, _start_payload(agent_id="agent-2"))
+    subagent_start_main()
+
+    for d in list_dispatches():
+        assert d.tier_source == "defaulted"
+        assert d.inherited_from is None
+        assert "[uncaptured]" in d.prompt
+    err = capsys.readouterr().err
+    assert err.count("no intent matched spawn 'tester'") == 2
+    assert "inherited" not in err
+
+
+def test_regression_intent_miss_with_empty_lane_tier_now_grades(
+        tmp_path, monkeypatch, capsys):
+    # (4) The exact composition observed in the field: sidecar consumed by
+    # the first spawn; repo spec declares ZERO checks at lane tier; the
+    # re-spawn's manifest would have been empty -> nothing runnable -> the
+    # stop closed ungraded 8 ms after reporting while the board said done.
+    # With inheritance the follow-up is graded under the first contract.
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import list_dispatches, write_intent
+    _setup_project(tmp_path, [_LEAF_ONLY], monkeypatch)
+    _era_config(tmp_path)
+    write_intent("tester", _INTENT_PROMPT, manifest=_intent_manifest(cmd_exit=0),
+                 tier="lane")
+
+    _feed(monkeypatch, _start_payload(agent_id="agent-1"))
+    subagent_start_main()
+    _feed(monkeypatch, _stop_payload(message="done", agent_id="agent-1"))
+    subagent_stop_main()
+    capsys.readouterr()
+
+    # The re-message: a fresh SubagentStart, no sidecar left to consume.
+    _feed(monkeypatch, _start_payload(agent_id="agent-2"))
+    subagent_start_main()
+    _feed(monkeypatch, _stop_payload(
+        message="both requested actions were already completed", agent_id="agent-2"))
+    assert subagent_stop_main() == 0
+    capsys.readouterr()
+
+    second = next(d for d in list_dispatches() if d.agent_id == "agent-2")
+    assert second.state == "terminated"
+    assert second.verdict == "verified"  # previously: None (ungraded)
+    assert second.manifest["checks"]  # previously: []
+    assert second.tier_source == "inherited"
+    from fleetproof.telemetry import load_telemetry
+    assert load_telemetry(second.run_id)["outcome.class"] == "verified"
+
+
+def test_inheritance_chains_through_an_inherited_dispatch(tmp_path, monkeypatch):
+    # Third re-message inherits from the second, which inherited from the
+    # first: the inherited record keeps intent_source, so it qualifies.
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import list_dispatches, write_intent
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    write_intent("tester", _INTENT_PROMPT, manifest=_intent_manifest(), tier="leaf")
+    for agent_id in ("agent-1", "agent-2", "agent-3"):
+        _feed(monkeypatch, _start_payload(agent_id=agent_id))
+        subagent_start_main()
+    by_agent = {d.agent_id: d for d in list_dispatches()}
+    assert by_agent["agent-2"].inherited_from == by_agent["agent-1"].run_id
+    assert by_agent["agent-3"].inherited_from == by_agent["agent-2"].run_id
+    assert by_agent["agent-3"].tier == "leaf"
+    assert by_agent["agent-3"].prompt == _INTENT_PROMPT
+
+
+def test_cli_dispatch_with_a_manifest_is_an_inheritance_source(tmp_path, monkeypatch):
+    # The field case was a `dispatch new --agent-name --manifest` lane that
+    # verified, then was re-messaged. A CLI dispatch that supplied a manifest
+    # carried a contract; one with a bare prompt (derived manifest) did not.
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import CAPTURE_CLI, create_dispatch, list_dispatches
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-fleet")
+    with_manifest = create_dispatch(
+        "lane work", tier="lane", manifest=_intent_manifest(),
+        agent={"agent_type": "cli-lane", "agent_id": None, "capture": CAPTURE_CLI})
+    bare = create_dispatch(
+        "bare work", tier="lane",
+        agent={"agent_type": "cli-bare", "agent_id": None, "capture": CAPTURE_CLI})
+
+    _feed(monkeypatch, _start_payload(agent_id="agent-9", agent_type="cli-lane"))
+    subagent_start_main()
+    _feed(monkeypatch, _start_payload(agent_id="agent-8", agent_type="cli-bare"))
+    subagent_start_main()
+
+    by_agent = {d.agent_id: d for d in list_dispatches() if d.agent_id}
+    assert by_agent["agent-9"].inherited_from == with_manifest
+    assert by_agent["agent-9"].manifest["checks"] == _intent_manifest()["checks"]
+    assert by_agent["agent-8"].tier_source == "defaulted"
+    assert by_agent["agent-8"].inherited_from is None
+    assert bare  # the bare dispatch exists and was not treated as a contract
+

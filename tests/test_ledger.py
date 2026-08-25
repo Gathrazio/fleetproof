@@ -926,3 +926,23 @@ def test_old_layout_dispatch_dir_without_reports_or_blocks_still_loads(ledger_ru
     assert record.load_blocks() == []
     d = record.to_dict()
     assert d["report_count"] == 1 and d["block_count"] == 0
+
+
+# === inherited tier_source ===
+
+def test_inherited_tier_source_requires_its_source_and_vice_versa(ledger_runs):
+    from fleetproof.ledger import TIER_SOURCE_INHERITED
+    with pytest.raises(LedgerError):
+        create_dispatch("x", tier="lane", tier_source=TIER_SOURCE_INHERITED)
+    with pytest.raises(LedgerError):
+        create_dispatch("x", tier="lane", inherited_from="20260101-000000-aaaaaa")
+    source = create_dispatch("declared", tier="lane")
+    run_id = create_dispatch("x", tier="lane", tier_source=TIER_SOURCE_INHERITED,
+                             inherited_from=source)
+    record = load_dispatch(run_id)
+    assert record.tier_source == "inherited"
+    assert record.inherited_from == source
+    assert record.to_dict()["inherited_from"] == source
+    # A 0.4.0 record has no such field; it reads back as None.
+    assert load_dispatch(source).inherited_from is None
+

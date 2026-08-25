@@ -679,7 +679,9 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
     # The legend is not decoration: '!' and '(stalled)' are load-bearing and an
     # unexplained marker on an audit surface is worse than no marker.
     print("tier! = declared, not inferred.  tier? = defaulted (no intent "
-          "matched).  (stalled) = reported or graded but never closed.")
+          "matched).  tier~ = inherited from an earlier dispatch of the same "
+          "agent type this session (no sidecar matched; see inherited_from).  "
+          "(stalled) = reported or graded but never closed.")
     print("ungraded = no verdict on record; an absent grade is not a passing grade.")
     # Only explained when present, like the orphan count: these two labels are
     # rare enough that an always-on legend line would drown the common ones.

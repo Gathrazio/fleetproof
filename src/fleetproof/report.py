@@ -39,6 +39,7 @@ from .ledger import (
     STATE_VERIFIED,
     TIER_SOURCE_DECLARED,
     TIER_SOURCE_DEFAULTED,
+    TIER_SOURCE_INHERITED,
     DispatchRecord,
     is_parked_reason,
 )
@@ -98,14 +99,18 @@ def state_label(dispatch: DispatchRecord) -> str:
 
 
 def tier_label(dispatch: DispatchRecord) -> str:
-    """Tier, with a trailing '!' when declared and '?' when defaulted.
+    """Tier, with a trailing '!' when declared, '?' when defaulted, '~' when inherited.
 
     Inference is a guess off the shape of the run tree, and it degrades to ``lane``
-    when a parent record is unreadable — so which of the three produced this tier
+    when a parent record is unreadable — so which provenance produced this tier
     changes how much the tier is worth. A defaulted tier ('?') means no intent
     declared one and the capture fell back — the visible trace of a missed
     intent, which the '!' marker used to paper over by claiming a declaration.
-    One character keeps the column skimmable.
+    An inherited tier ('~') means no sidecar matched but an earlier dispatch of
+    the same agent type in the same session had one, and this dispatch is under
+    that contract — distinct from '!' because nobody declared it *for this
+    spawn*, and from '?' because it is graded. One character keeps the column
+    skimmable.
     """
     if not dispatch.tier:
         return "-"
@@ -113,6 +118,8 @@ def tier_label(dispatch: DispatchRecord) -> str:
         marker = "!"
     elif dispatch.tier_source == TIER_SOURCE_DEFAULTED:
         marker = "?"
+    elif dispatch.tier_source == TIER_SOURCE_INHERITED:
+        marker = "~"
     else:
         marker = ""
     return f"{dispatch.tier}{marker}"

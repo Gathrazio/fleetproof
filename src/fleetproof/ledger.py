@@ -57,6 +57,7 @@ Public API:
     list_dispatches(*, session_id, open_only, non_terminal_only) -> list[DispatchRecord]
     find_dispatch_by_agent(session_id, agent_id) -> DispatchRecord | None
     find_dispatch_for_stop(session_id, agent_id, agent_type) -> (record_or_None, notes)
+    find_inheritable_intent(session_id, agent_type) -> DispatchRecord | None
     derive_manifest(prompt) -> dict
     write_intent(agent_type, prompt, *, manifest, tier) -> Path
     consume_intent(agent_type) -> (fields_or_None, notes)
@@ -185,11 +186,22 @@ TIER_SOURCE_DECLARED = "declared"
 # it as declared asserted the opposite (observed in a field deployment on
 # Windows).
 TIER_SOURCE_DEFAULTED = "defaulted"
+# The fourth provenance: no sidecar matched this spawn, but an earlier dispatch
+# in the same session for the same agent_type carried a declared intent, and
+# this dispatch took its prompt, manifest, and tier from that record
+# (``inherited_from`` names it). Intent sidecars are consumed once, so
+# re-messaging a live teammate fires a fresh SubagentStart with nothing to
+# match — and a defaulted capture with an empty manifest graded NOTHING at a
+# tier the repo spec left empty, then rendered as done (observed in a field
+# deployment on Windows: dispatched, reported, terminated, 8 ms, no verdict).
+# Inheritance keeps the follow-up turn under the same contract as the first.
+TIER_SOURCE_INHERITED = "inherited"
 
 VALID_TIER_SOURCES = frozenset({
     TIER_SOURCE_INFERRED,
     TIER_SOURCE_DECLARED,
     TIER_SOURCE_DEFAULTED,
+    TIER_SOURCE_INHERITED,
 })
 
 # Evidence kinds a reported deliverable may claim, weakest last. "executed" means
@@ -297,6 +309,10 @@ class DispatchRecord:
     # dispatch record, precisely so it can never be inferred from whether some
     # later, deletable file happens to exist.
     telemetry_era: str | None = None
+    # The dispatch this one took its intent from, when ``tier_source`` is
+    # ``inherited`` (see :func:`find_inheritable_intent`). Additive: None on
+    # every record that matched its own sidecar, defaulted, or predates this.
+    inherited_from: str | None = None
 
     @property
     def state(self) -> str:
@@ -439,6 +455,7 @@ class DispatchRecord:
             "agent": self.agent,
             "intent_source": self.intent_source,
             "telemetry_era": self.telemetry_era,
+            "inherited_from": self.inherited_from,
             "state": self.state,
             "verdict": self.verdict,
             "has_report": self.has_report,
@@ -518,6 +535,7 @@ def load_dispatch(run_id: str) -> DispatchRecord | None:
         agent=agent if isinstance(agent, dict) else None,
         intent_source=intent_source if isinstance(intent_source, dict) else None,
         telemetry_era=dispatch.get("telemetry_era") or None,
+        inherited_from=str(dispatch.get("inherited_from") or "") or None,
     )
 
 
@@ -648,6 +666,52 @@ def find_dispatch_for_stop(
             f"ambiguous name-match: {len(candidates)} open dispatches await an "
             f"agent of type {agent_type!r} ({listed}) — adopting none of them"]
     return _adopt_agent(candidates[0], agent_id, by="hook"), []
+
+
+# === Intent inheritance ===
+
+def carried_declared_intent(record: DispatchRecord) -> bool:
+    """True when this dispatch's prompt/manifest came from the dispatcher, not a derivation.
+
+    Two shapes qualify: a hook capture that consumed an intent sidecar
+    (``intent_source`` is the marker — it is only ever written by a consumed
+    sidecar), and a ``dispatch new --agent-name`` record whose manifest is
+    not the derive-v1 placeholder (the CLI dispatcher supplied one, by file or
+    by fenced block). A placeholder capture, or a CLI dispatch with nothing
+    but a prompt, carried no contract worth inheriting — inheriting an empty
+    manifest would reproduce exactly the ungraded stop this exists to stop.
+    """
+    if record.intent_source is not None:
+        return True
+    agent = record.agent if isinstance(record.agent, dict) else {}
+    if agent.get("capture") != CAPTURE_CLI:
+        return False
+    notes = str((record.manifest or {}).get("notes") or "")
+    return notes not in (DERIVED_V1_NO_MANIFEST, DERIVED_V1_MALFORMED)
+
+
+def find_inheritable_intent(
+    session_id: str | None, agent_type: str | None,
+) -> DispatchRecord | None:
+    """The newest dispatch in ``session_id`` for ``agent_type`` that carried a declared intent.
+
+    Same session exactly, same ``agent.agent_type`` exactly, any state — the
+    record being inherited from is usually terminal (the teammate finished,
+    verified, and was then messaged again). A chain is fine: an inherited
+    dispatch keeps the ``intent_source`` it inherited, so the third re-message
+    inherits from the second, which inherited from the first. No session id
+    means no inheritance: a session-less spawn has no "same session" to
+    inherit within, and a cross-session guess is not a contract.
+    """
+    if not session_id or not agent_type:
+        return None
+    for record in list_dispatches(session_id=session_id):
+        agent = record.agent if isinstance(record.agent, dict) else {}
+        if agent.get("agent_type") != agent_type:
+            continue
+        if carried_declared_intent(record):
+            return record
+    return None
 
 
 # === Tier inference ===
@@ -1138,6 +1202,7 @@ def create_dispatch(
     by: str = "cli",
     spec_path: Path | None = None,
     session_id: str | None = None,
+    inherited_from: str | None = None,
 ) -> str:
     """Record a dispatch at launch and return its run id.
 
@@ -1164,7 +1229,10 @@ def create_dispatch(
     ``session_id`` stamps the session explicitly; omitted, it is read from
     ``FLEETPROOF_SESSION_ID`` (a hook process always has it, a bare CLI shell
     usually does not — and a session-less dispatch is one no live session can
-    ever adopt, see :func:`find_dispatch_for_stop`).
+    ever adopt, see :func:`find_dispatch_for_stop`). ``inherited_from`` names
+    the dispatch this one's intent was taken from and is only legal with
+    ``tier_source="inherited"`` (and vice versa) — a record must not claim
+    inheritance without naming its source, or name one without claiming it.
     """
     if not isinstance(prompt, str) or not prompt.strip():
         raise LedgerError("A dispatch needs a prompt; refusing to record an empty one.")
@@ -1184,6 +1252,11 @@ def create_dispatch(
                 f"{sorted(VALID_TIER_SOURCES)} or omit it."
             )
         resolved_tier_source = tier_source
+    if (resolved_tier_source == TIER_SOURCE_INHERITED) != bool(inherited_from):
+        raise LedgerError(
+            "tier_source 'inherited' and inherited_from go together: pass both "
+            "(naming the source dispatch) or neither."
+        )
 
     if manifest is None:
         resolved_manifest = derive_manifest(prompt)
@@ -1235,6 +1308,8 @@ def create_dispatch(
     # puts it on the record.
     if intent_source is not None:
         dispatch["intent_source"] = dict(intent_source)
+    if inherited_from:
+        dispatch["inherited_from"] = inherited_from
     _write_json(run_dir / DISPATCH_FILENAME, dispatch)
     return run_id
 

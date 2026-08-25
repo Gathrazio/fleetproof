@@ -731,3 +731,23 @@ def test_fleet_json_rows_carry_report_and_block_counts(cli_runs, capsys):
     assert row["run_id"] == run_id
     assert row["report_count"] == 1
     assert row["block_count"] == 1
+
+
+def test_fleet_board_marks_an_inherited_tier_with_a_tilde(cli_runs, capsys):
+    # '~' is neither '!' (nobody declared it for this spawn) nor '?' (it is
+    # graded): the legend says where the tier came from.
+    from fleetproof.ledger import TIER_SOURCE_INHERITED, create_dispatch
+    source = create_dispatch("declared", tier="lane")
+    create_dispatch("re-message", tier="lane", tier_source=TIER_SOURCE_INHERITED,
+                    inherited_from=source)
+    assert main(["fleet"]) == 0
+    out = capsys.readouterr().out
+    assert "lane~" in out
+    assert "tier~ = inherited from an earlier dispatch of the same agent type" in out
+    out.encode("cp1252")
+    capsys.readouterr()
+    assert main(["fleet", "--format", "json"]) == 0
+    rows = json.loads(capsys.readouterr().out)["dispatches"]
+    inherited = next(r for r in rows if r["tier_source"] == "inherited")
+    assert inherited["inherited_from"] == source
+
