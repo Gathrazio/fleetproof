@@ -319,24 +319,67 @@ def test_subagent_start_survives_a_garbage_payload(tmp_path, monkeypatch):
 
 # === subagent gate (SubagentStop) ===
 
-def test_stop_without_prior_start_creates_stop_only_dispatch(tmp_path, monkeypatch):
-    # A subagent we never saw spawn still enters the ledger — marked stop-only, so
-    # a missing start hook is visible as a capture hole rather than as nothing.
+def test_unpaired_stop_with_no_agent_type_records_an_orphan_not_a_dispatch(
+        tmp_path, monkeypatch, capsys):
+    # Harness-internal helper agents emit SubagentStop with no SubagentStart and
+    # no agent_type. Back-filling those as graded lane dispatches manufactured
+    # phantom verified verdicts (observed in a field deployment on Windows): an
+    # unpaired stop is a sighting, never a graded unit of work.
     from fleetproof.hookgate import subagent_stop_main
-    from fleetproof.ledger import list_dispatches
+    from fleetproof.ledger import list_dispatches, list_orphan_stops
     _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
-    _feed(monkeypatch, _stop_payload())
+    payload = _stop_payload()
+    payload["agent_type"] = None
+    _feed(monkeypatch, payload)
 
     assert subagent_stop_main() == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""  # the stop goes through: no block, no grading
+    assert "orphan" in captured.err
 
-    dispatches = list_dispatches()
-    assert len(dispatches) == 1
-    d = dispatches[0]
-    assert d.agent["capture"] == "stop-only"
-    assert d.state == "terminated"
-    assert d.verdict == "verified"
-    assert d.load_report()["summary"] == "I did the thing."
-    assert d.load_report()["source"] == "last_assistant_message"
+    assert list_dispatches() == []
+    orphans = list_orphan_stops()
+    assert len(orphans) == 1
+    assert orphans[0]["agent_id"] == "agent-1"
+    assert orphans[0]["agent_type"] is None
+    assert orphans[0]["session_id"] == "sess-fleet"
+    assert orphans[0]["last_assistant_message"] == "I did the thing."
+
+
+def test_unpaired_stop_with_a_real_agent_type_is_still_an_orphan(
+        tmp_path, monkeypatch, capsys):
+    # Same rule when the agent_type looks legitimate: without a start (or a
+    # dispatch to join), there is no contract to grade against, and a verdict
+    # on a manufactured record is exactly the phantom A1 exists to prevent.
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_dispatches, list_orphan_stops
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    _feed(monkeypatch, _stop_payload(message="x" * 500))
+
+    assert subagent_stop_main() == 0
+    assert capsys.readouterr().out == ""
+
+    assert list_dispatches() == []
+    orphans = list_orphan_stops()
+    assert len(orphans) == 1
+    assert orphans[0]["agent_type"] == "tester"
+    # Only the first 200 chars of the message are kept: an orphan is a pointer
+    # for the operator, not a transcript store.
+    assert orphans[0]["last_assistant_message"] == "x" * 200
+
+
+def test_orphan_stops_filter_by_session(tmp_path, monkeypatch):
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_orphan_stops
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    _feed(monkeypatch, _stop_payload(session="sess-one"))
+    subagent_stop_main()
+    _feed(monkeypatch, _stop_payload(session="sess-two"))
+    subagent_stop_main()
+
+    assert len(list_orphan_stops()) == 2
+    assert len(list_orphan_stops(session_id="sess-one")) == 1
+    assert list_orphan_stops(session_id="sess-one")[0]["session_id"] == "sess-one"
 
 
 def test_stop_reuses_the_dispatch_its_start_created(tmp_path, monkeypatch):
@@ -440,13 +483,15 @@ def test_empty_tier_selection_terminates_without_a_verdict(tmp_path, monkeypatch
 
 
 def test_no_spec_terminates_without_a_verdict(tmp_path, monkeypatch):
-    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
     from fleetproof.ledger import list_dispatches
     marker = tmp_path / ".fleetproof"
     marker.mkdir()
     monkeypatch.chdir(tmp_path)
     runlog.set_runs_dir(marker / "runs")
 
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
     _feed(monkeypatch, _stop_payload())
     assert subagent_stop_main() == 0
     d = list_dispatches()[0]

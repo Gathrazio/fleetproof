@@ -60,6 +60,7 @@ from .ledger import (
     close_dispatch,
     create_dispatch,
     list_dispatches,
+    list_orphan_stops,
     load_dispatch,
     record_report,
     write_intent,
@@ -445,17 +446,49 @@ def _truncate(value: str, width: int) -> str:
     return value if len(value) <= width else value[:width - 3] + "..."
 
 
+def _cmd_fleet_orphans(args: argparse.Namespace) -> int:
+    """The orphan-stop view: unpaired stops, which are sightings, not dispatches."""
+    orphans = list_orphan_stops(session_id=args.session)
+    if args.format == "json":
+        print(json.dumps({"orphans": orphans}, indent=2))
+        return 0
+    if not orphans:
+        print("No orphan stops recorded.")
+        return 0
+    print(f"{'at':<20} {'agent_type':<18} {'agent_id':<18} {'session':<14} message")
+    for o in orphans:
+        print(f"{str(o.get('at') or '-')[:19]:<20} "
+              f"{_truncate(str(o.get('agent_type') or '-'), 18):<18} "
+              f"{_truncate(str(o.get('agent_id') or '-'), 18):<18} "
+              f"{_short_session(o.get('session_id')):<14} "
+              f"{_truncate(str(o.get('last_assistant_message') or ''), 60)}")
+    print(f"{len(orphans)} orphan stop(s): a SubagentStop with no dispatch to "
+          "join. Not graded, not counted as dispatches.")
+    return 0
+
+
+def _orphan_count_line(orphans: list[dict]) -> str:
+    return (f"{len(orphans)} orphan stop(s) this session — not graded "
+            "(view: fleetproof fleet --orphans).")
+
+
 def _cmd_fleet(args: argparse.Namespace) -> int:
+    if args.orphans:
+        return _cmd_fleet_orphans(args)
     records = list_dispatches(session_id=args.session, non_terminal_only=args.open)
+    orphans = list_orphan_stops(session_id=args.session)
     if args.format == "json":
         print(json.dumps({
             "dispatches": [
                 dict(r.to_dict(), age=_format_age(r.started_at)) for r in records
-            ]
+            ],
+            "orphan_stop_count": len(orphans),
         }, indent=2))
         return 0
     if not records:
         print("No dispatches found.")
+        if orphans:
+            print(_orphan_count_line(orphans))
         return 0
     print(f"{'run_id':<24} {'state':<26} {'tier':<12} {'agent':<18} "
           f"{'verdict':<13} {'age':>7} {'session':<14}")
@@ -472,6 +505,8 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
     print("tier! = declared, not inferred.  (stalled) = reported or graded but "
           "never closed.")
     print("ungraded = no verdict on record; an absent grade is not a passing grade.")
+    if orphans:
+        print(_orphan_count_line(orphans))
     return 0
 
 
@@ -734,6 +769,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_fleet.add_argument("--open", action="store_true",
                          help="Only dispatches that have not terminated.")
     p_fleet.add_argument("--session", default=None, help="Filter to one session id.")
+    p_fleet.add_argument("--orphans", action="store_true",
+                         help="List orphan stops (unpaired SubagentStops; "
+                              "sightings, never graded) instead of dispatches.")
     _add_format(p_fleet)
     p_fleet.set_defaults(func=_cmd_fleet)
 

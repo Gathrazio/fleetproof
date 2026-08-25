@@ -60,7 +60,6 @@ from .checks import (
 )
 from .ledger import (
     CAPTURE_START,
-    CAPTURE_STOP_ONLY,
     STATE_CONTRADICTED,
     STATE_DISPATCHED,
     STATE_VERIFIED,
@@ -72,6 +71,7 @@ from .ledger import (
     find_dispatch_by_agent,
     list_dispatches,
     load_dispatch,
+    record_orphan_stop,
     record_report,
     record_verdict,
 )
@@ -540,8 +540,12 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
 
     Order matters, and each step is a separate reason to refuse the stop:
 
-    1. Find (or back-fill) this agent's dispatch — a subagent we never saw start
-       still gets a record, marked ``stop-only``.
+    1. Find this agent's dispatch. An unpaired stop — no dispatch to join —
+       records an orphan and terminates ungraded: harness-internal helper
+       agents (summaries, titles) emit SubagentStop with no SubagentStart and
+       no agent_type, and back-filling those as graded dispatches manufactured
+       phantom verified verdicts (observed in a field deployment on Windows).
+       Nobody ordered that work, so there is no claim to hold it to.
     2. No final message means no report. Block without transitioning: an agent
        that went idle saying nothing has not reported, and recording it as
        ``reported`` would launder silence into a claim.
@@ -565,16 +569,18 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
 
     dispatch = find_dispatch_by_agent(session_id, agent_id)
     if dispatch is None:
-        run_id = create_dispatch(
-            _placeholder_prompt(agent_type),
-            tier=CAPTURED_SUBAGENT_TIER,
-            agent={"agent_id": agent_id, "agent_type": agent_type,
-                   "capture": CAPTURE_STOP_ONLY},
-            by="hook",
+        orphan_message = payload.get("last_assistant_message")
+        record_orphan_stop(
+            agent_id=agent_id,
+            agent_type=agent_type,
+            session_id=session_id,
+            last_assistant_message=(
+                orphan_message if isinstance(orphan_message, str) else ""),
         )
-        dispatch = load_dispatch(run_id)
-        if dispatch is None:  # pragma: no cover - would mean the write vanished
-            raise LedgerError(f"back-filled dispatch {run_id} did not read back")
+        sys.stderr.write(
+            f"[fleetproof] unpaired subagent stop "
+            f"(agent_type={agent_type!r}) recorded as an orphan — not graded\n")
+        return None, 0
 
     last_message = payload.get("last_assistant_message")
     last_message = last_message if isinstance(last_message, str) else ""

@@ -320,6 +320,40 @@ def test_fleet_empty_and_json_and_session_filter(cli_runs, monkeypatch, capsys):
     assert theirs != mine
 
 
+def test_fleet_counts_orphans_without_listing_them_as_dispatches(cli_runs, capsys):
+    # An orphan stop is a sighting, not a dispatch: the default board mentions
+    # the count only, and no orphan row appears among the dispatch rows.
+    from fleetproof.ledger import record_orphan_stop
+    record_orphan_stop(agent_id="a-1", agent_type=None, session_id="sess-x",
+                       last_assistant_message="a helper agent's summary")
+    assert main(["fleet"]) == 0
+    out = capsys.readouterr().out
+    assert "No dispatches found." in out
+    assert "1 orphan stop(s)" in out
+    assert "not graded" in out
+    out.encode("cp1252")
+
+
+def test_fleet_orphans_flag_lists_the_orphans(cli_runs, capsys):
+    from fleetproof.ledger import record_orphan_stop
+    record_orphan_stop(agent_id="a-1", agent_type="helper", session_id="sess-x",
+                       last_assistant_message="orphaned summary text")
+    assert main(["fleet", "--orphans"]) == 0
+    out = capsys.readouterr().out
+    assert "helper" in out and "orphaned summary text" in out
+    out.encode("cp1252")
+
+    assert main(["fleet", "--orphans", "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload["orphans"]) == 1
+    assert payload["orphans"][0]["agent_id"] == "a-1"
+
+    # Session filter applies to the orphan view the same way it does the board.
+    assert main(["fleet", "--orphans", "--session", "sess-other",
+                 "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["orphans"] == []
+
+
 # === hook entry subcommands + tier-scoped check ===
 
 def test_subagent_hook_subcommands_are_wired(cli_runs, monkeypatch, capsys):

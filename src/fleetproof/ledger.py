@@ -54,6 +54,8 @@ Public API:
     derive_manifest(prompt) -> dict
     write_intent(agent_type, prompt, *, manifest, tier) -> Path
     consume_intent(agent_type) -> (fields_or_None, notes)
+    record_orphan_stop(*, agent_id, agent_type, session_id, ...) -> Path
+    list_orphan_stops(session_id) -> list[dict]
 """
 
 from __future__ import annotations
@@ -181,6 +183,19 @@ INTENT_MANIFEST_MALFORMED = (
 # a hook gets walked out of its own directory, so anything that is not a plain
 # name gets no sidecar lookup at all.
 _INTENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+# Where orphan-stop records live, beside the runs directory. An orphan is a
+# SubagentStop with no dispatch to join — harness-internal helper agents emit
+# stops with no SubagentStart and no agent_type. It is deliberately NOT a
+# dispatch: back-filling one manufactures a graded record for work nobody
+# ordered, and once its tier's checks happen to pass, a phantom "verified"
+# verdict (observed in a field deployment on Windows). An orphan is a
+# sighting, kept out of every dispatch count and verdict tally.
+ORPHANS_DIRNAME = "orphans"
+
+# How much of an orphan's last message is kept: enough to identify what the
+# agent was, not a transcript store.
+ORPHAN_MESSAGE_LIMIT = 200
 
 
 class LedgerError(Exception):
@@ -683,6 +698,59 @@ def consume_intent(agent_type: str | None) -> tuple[dict[str, Any] | None, list[
                 "using the captured-subagent default"
             )
     return fields, notes
+
+
+# === Orphan stops ===
+
+def orphans_dir() -> Path:
+    """The ``.fleetproof/orphans/`` directory, resolved beside the runs dir."""
+    return runs_dir().parent / ORPHANS_DIRNAME
+
+
+def record_orphan_stop(
+    *,
+    agent_id: str | None,
+    agent_type: str | None,
+    session_id: str | None,
+    last_assistant_message: str = "",
+) -> Path:
+    """Record an unpaired SubagentStop sighting. Returns the file written.
+
+    Never creates a dispatch: there is no contract to grade an unpaired stop
+    against, and a verdict on a manufactured record reads back as a real one.
+    The record keeps just enough to identify the agent post-hoc — ids, session,
+    and the head of its last message.
+    """
+    orphans_dir().mkdir(parents=True, exist_ok=True)
+    entry: dict[str, Any] = {
+        "agent_id": agent_id,
+        "agent_type": agent_type,
+        "session_id": session_id,
+        "last_assistant_message": (last_assistant_message or "")[:ORPHAN_MESSAGE_LIMIT],
+        "at": _now_iso(),
+    }
+    for _ in range(_RUN_ID_ATTEMPTS):
+        path = orphans_dir() / f"{_generate_run_id()}.json"
+        if not path.exists():
+            _write_json(path, entry)
+            return path
+    raise LedgerError("Could not allocate a unique orphan-stop file name.")
+
+
+def list_orphan_stops(session_id: str | None = None) -> list[dict[str, Any]]:
+    """Every recorded orphan stop, newest first; unreadable files are skipped."""
+    directory = orphans_dir()
+    if not directory.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    for path in sorted(directory.glob("*.json"), reverse=True):
+        raw = _read_json(path)
+        if raw is None:
+            continue
+        if session_id is not None and (raw.get("session_id") or None) != session_id:
+            continue
+        out.append(raw)
+    return out
 
 
 # === Creating a dispatch ===
