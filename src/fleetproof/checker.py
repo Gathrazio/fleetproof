@@ -25,6 +25,7 @@ from typing import Any
 from .checks import (
     VALID_TIERS,
     Check,
+    checks_tree_hash,
     default_checks_path,
     load_checks,
     short_spec_hash,
@@ -57,6 +58,10 @@ class CheckReport:
     results: list[CheckResult] = field(default_factory=list)
     run_id: str | None = None
     spec_sha256: str | None = None
+    # Hash of the whole checks tree (spec bytes + scripts under
+    # .fleetproof/checks/) that governed this verdict. Additive: None on older
+    # records, and a None is never drift-tested.
+    tree_sha256: str | None = None
     # Which tier's checks this verdict covers; None means "every check in the
     # spec" (the v0.1 behaviour). Additive — older records omit it entirely.
     tier: str | None = None
@@ -109,6 +114,7 @@ class CheckReport:
             # records written before this field existed simply omit it, and every
             # reader treats a missing value as None (no hash on record).
             "spec_sha256": self.spec_sha256,
+            "tree_sha256": self.tree_sha256,
             "tier": self.tier,
             "cwd": self.cwd,
             "summary": {
@@ -291,7 +297,8 @@ def run_checks(
     resolved_spec = Path(spec_path) if spec_path is not None else default_checks_path(work_dir)
     sha = spec_hash(resolved_spec)
 
-    report = CheckReport(spec_sha256=sha, tier=tier, cwd=str(work_dir))
+    report = CheckReport(spec_sha256=sha, tree_sha256=checks_tree_hash(resolved_spec),
+                         tier=tier, cwd=str(work_dir))
     if not record_to_log:
         for check in checks:
             report.results.append(run_check(check, work_dir, timeout))
@@ -307,15 +314,13 @@ def run_checks(
     return report
 
 
-def session_spec_baseline(session_id: str | None) -> str | None:
-    """The spec hash of the EARLIEST recorded checker verdict in ``session_id``.
+def _session_baseline(session_id: str | None, key: str) -> str | None:
+    """The ``key`` hash of the EARLIEST recorded checker verdict in ``session_id``.
 
-    This is the baseline every later verdict in the same session is compared
-    against: if a verdict's own spec hash differs from this, the checks.json was
-    edited mid-session (spec drift). Legacy verdicts with no hash on record are
-    skipped, so the baseline is the earliest verdict that actually carries one.
-    Returns None when there is no session context or no hashed verdict yet — in
-    which case there is nothing to drift *from*, so callers treat it as no drift.
+    Legacy verdicts with no hash under ``key`` are skipped, so the baseline is
+    the earliest verdict that actually carries one. Returns None when there is
+    no session context or no hashed verdict yet — in which case there is
+    nothing to drift *from*, so callers treat it as no drift.
     """
     if not session_id:
         return None
@@ -329,7 +334,7 @@ def session_spec_baseline(session_id: str | None) -> str | None:
             payload = sub.load_output()
             if not isinstance(payload, dict):
                 continue
-            sha = payload.get("spec_sha256")
+            sha = payload.get(key)
             if sha:
                 order_key = sub.started_at or run.started_at or ""
                 hashed.append((order_key, sha))
@@ -339,6 +344,21 @@ def session_spec_baseline(session_id: str | None) -> str | None:
     return hashed[0][1]
 
 
+def session_spec_baseline(session_id: str | None) -> str | None:
+    """The spec hash every later verdict in the same session is compared
+    against: if a verdict's own spec hash differs from this, the checks.json
+    was edited mid-session (spec drift)."""
+    return _session_baseline(session_id, "spec_sha256")
+
+
+def session_tree_baseline(session_id: str | None) -> str | None:
+    """The checks-tree sibling of :func:`session_spec_baseline`: catches a
+    check *script* rewritten mid-session even when checks.json itself is
+    byte-identical. Verdicts recorded before the tree hash existed carry none
+    and are skipped — an old session is not retroactively drift-tested."""
+    return _session_baseline(session_id, "tree_sha256")
+
+
 def spec_drifted(current_hash: str | None, session_id: str | None) -> tuple[bool, str | None]:
     """Return ``(drifted, baseline_hash)`` for a verdict's hash within a session.
 
@@ -346,6 +366,18 @@ def spec_drifted(current_hash: str | None, session_id: str | None) -> tuple[bool
     differs from it — a v0.1 pass-with-drift still passes, this just flags it.
     """
     baseline = session_spec_baseline(session_id)
+    drifted = bool(baseline and current_hash and baseline != current_hash)
+    return drifted, baseline
+
+
+def tree_drifted(current_hash: str | None, session_id: str | None) -> tuple[bool, str | None]:
+    """Return ``(drifted, baseline_hash)`` for a verdict's checks-tree hash.
+
+    Same posture as :func:`spec_drifted`: True only when a session tree
+    baseline exists and the current hash differs — either hash absent (legacy
+    records, unreadable tree) means no drift verdict can honestly be made.
+    """
+    baseline = session_tree_baseline(session_id)
     drifted = bool(baseline and current_hash and baseline != current_hash)
     return drifted, baseline
 

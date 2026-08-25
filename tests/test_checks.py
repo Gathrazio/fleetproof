@@ -105,3 +105,68 @@ def test_non_string_tier_raises(tmp_path):
     p = _write(tmp_path, {"checks": [{"id": "a", "run": "x", "tier": 3}]})
     with pytest.raises(CheckSpecError):
         load_checks(p)
+
+
+# === checks-tree hash (B1: the graders are part of the spec) ===
+
+def test_tree_hash_without_a_scripts_dir_differs_from_the_spec_hash(tmp_path):
+    from fleetproof.checks import checks_tree_hash, spec_hash
+    p = _write(tmp_path, STARTER_SPEC)
+    tree = checks_tree_hash(p)
+    assert tree is not None
+    # Domain-separated on purpose: a repo with no checks/ directory must not
+    # produce a tree hash that collides with the plain spec hash, or a reader
+    # could mistake one pin for the other.
+    assert tree != spec_hash(p)
+
+
+def test_tree_hash_changes_when_a_check_script_changes(tmp_path):
+    from fleetproof.checks import checks_tree_hash
+    p = _write(tmp_path, STARTER_SPEC)
+    scripts = tmp_path / "checks"
+    scripts.mkdir()
+    (scripts / "verify.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    before = checks_tree_hash(p)
+    (scripts / "verify.py").write_text("raise SystemExit(0)  # weakened\n",
+                                       encoding="utf-8")
+    assert checks_tree_hash(p) != before
+
+
+def test_tree_hash_changes_when_a_script_appears_at_all(tmp_path):
+    from fleetproof.checks import checks_tree_hash
+    p = _write(tmp_path, STARTER_SPEC)
+    before = checks_tree_hash(p)
+    scripts = tmp_path / "checks"
+    scripts.mkdir()
+    (scripts / "new-grader.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    assert checks_tree_hash(p) != before
+
+
+def test_tree_hash_covers_file_names_not_just_bytes(tmp_path):
+    from fleetproof.checks import checks_tree_hash
+    p = _write(tmp_path, STARTER_SPEC)
+    scripts = tmp_path / "checks"
+    scripts.mkdir()
+    (scripts / "a.py").write_text("same bytes\n", encoding="utf-8")
+    before = checks_tree_hash(p)
+    (scripts / "a.py").rename(scripts / "b.py")
+    # Same content under a different name is a different tree: which file a
+    # spec's run line resolves to is part of what the pin vouches for.
+    assert checks_tree_hash(p) != before
+
+
+def test_tree_hash_is_recursive_and_deterministic(tmp_path):
+    from fleetproof.checks import checks_tree_hash
+    p = _write(tmp_path, STARTER_SPEC)
+    scripts = tmp_path / "checks"
+    (scripts / "nested").mkdir(parents=True)
+    flat_only = checks_tree_hash(p)
+    (scripts / "nested" / "deep.py").write_text("x = 1\n", encoding="utf-8")
+    with_nested = checks_tree_hash(p)
+    assert with_nested != flat_only
+    assert checks_tree_hash(p) == with_nested  # stable across reads
+
+
+def test_tree_hash_none_when_spec_unreadable(tmp_path):
+    from fleetproof.checks import checks_tree_hash
+    assert checks_tree_hash(tmp_path / "absent.json") is None

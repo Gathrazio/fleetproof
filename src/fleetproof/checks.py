@@ -64,6 +64,18 @@ SPEC_DRIFT_NOTE = (
     "(spec drift). Review the diff before trusting this verdict."
 )
 
+# The tree-drift sibling: the spec file itself is unchanged, but the check
+# scripts it invokes are not. One canonical string, same rationale as above.
+TREE_DRIFT_NOTE = (
+    "NOTE: check scripts under .fleetproof/checks/ were modified during this "
+    "session (check-tree drift). Review the diff before trusting this verdict."
+)
+
+# Where the check scripts live, next to checks.json. Anything under it is part
+# of the checks tree: the spec names the commands, these files are what the
+# commands run, and a pin that covers only the spec is a filename check.
+CHECKS_TREE_DIRNAME = "checks"
+
 
 class CheckSpecError(Exception):
     """Raised when a check spec is missing or malformed."""
@@ -113,6 +125,58 @@ def spec_hash(path: Path | None = None) -> str | None:
         return hashlib.sha256(spec_path.read_bytes()).hexdigest()
     except OSError:
         return None
+
+
+# Domain separator seeding the tree hash, so a repo with no checks/ directory
+# can never produce a tree hash equal to its plain spec hash — a reader who
+# confuses the two pins would silently compare apples to oranges.
+_TREE_HASH_PREFIX = b"fleetproof-checks-tree/1\x00"
+
+
+def checks_tree_dir(spec_path: Path | None = None) -> Path:
+    """The check-scripts directory for the spec at ``spec_path`` (its sibling)."""
+    base = Path(spec_path) if spec_path is not None else default_checks_path()
+    return base.parent / CHECKS_TREE_DIRNAME
+
+
+def checks_tree_hash(path: Path | None = None) -> str | None:
+    """SHA-256 (hex) over the whole checks tree: spec bytes plus every script.
+
+    The spec pin (:func:`spec_hash`) notices an edited ``checks.json``; it says
+    nothing about the check *scripts* the spec's commands invoke, which were
+    rewritten mid-dispatch — including by the graded agent itself — with zero
+    drift signal (observed in a field deployment on Windows). This hash covers
+    both: the spec bytes, then every file under the sibling ``checks/``
+    directory (recursive, files only, sorted by posix-relative name), each as
+    UTF-8 name bytes + file bytes. An absent directory hashes the spec bytes
+    alone under the domain prefix, so old repos get a stable value without
+    creating anything. Returns None when the spec — or any script — cannot be
+    read: a tree we could not fully see is a tree we cannot vouch for, and a
+    missing pin degrades to "not drift-tested" rather than a false attestation.
+    """
+    spec_path = Path(path) if path is not None else default_checks_path()
+    try:
+        spec_bytes = spec_path.read_bytes()
+    except OSError:
+        return None
+    digest = hashlib.sha256(_TREE_HASH_PREFIX)
+    digest.update(spec_bytes)
+    tree = checks_tree_dir(spec_path)
+    entries: list[tuple[str, Path]] = []
+    try:
+        for file in tree.rglob("*"):
+            if file.is_file():
+                entries.append((file.relative_to(tree).as_posix(), file))
+    except OSError:
+        return None
+    for name, file in sorted(entries):
+        try:
+            file_bytes = file.read_bytes()
+        except OSError:
+            return None
+        digest.update(name.encode("utf-8"))
+        digest.update(file_bytes)
+    return digest.hexdigest()
 
 
 def short_spec_hash(full: str | None, length: int = 12) -> str:

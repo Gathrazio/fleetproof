@@ -49,11 +49,14 @@ from .checker import (
     select_checks,
     session_spec_baseline,
     spec_drifted,
+    tree_drifted,
 )
 from .checks import (
     SPEC_DRIFT_NOTE,
+    TREE_DRIFT_NOTE,
     Check,
     CheckSpecError,
+    checks_tree_hash,
     load_checks,
     short_spec_hash,
     spec_hash,
@@ -166,7 +169,24 @@ def _spec_gate() -> tuple[str | None, str | None]:
     # from the one the session's first verdict was graded against? An agent is
     # allowed to author checks.json, so a failing agent could quietly weaken it to
     # slip this gate. We don't block on drift alone (v0.1 policy) — we make it loud.
+    # The checks-tree hash rides alongside, additively: a rewritten check script
+    # under .fleetproof/checks/ with a byte-identical checks.json is the same
+    # quiet weakening. Spec drift subsumes tree drift (the tree hash covers the
+    # spec bytes), so the tree is consulted only when the spec is unchanged and
+    # the note names the actual culprit.
     drifted, baseline = spec_drifted(report.spec_sha256, session_id)
+    tree_drift, tree_baseline = (False, None)
+    if not drifted:
+        tree_drift, tree_baseline = tree_drifted(report.tree_sha256, session_id)
+    any_drift = drifted or tree_drift
+    drift_note = SPEC_DRIFT_NOTE if drifted else TREE_DRIFT_NOTE
+    if drifted:
+        drift_ctx = _drift_context(report.spec_sha256, baseline)
+    elif tree_drift:
+        drift_ctx = _drift_context(report.tree_sha256, tree_baseline,
+                                   note=TREE_DRIFT_NOTE, what="check-tree")
+    else:
+        drift_ctx = None
 
     if report.total == 0 and any(c.block for c in checks):
         # The spec has blocking checks, yet none governs the bridge tier — every
@@ -178,9 +198,9 @@ def _spec_gate() -> tuple[str | None, str | None]:
             "session's own work would go ungraded. Add a bridge-tier or untiered "
             "check (or correct the tiers) before stopping."
         )
-        if drifted:
-            reason += " " + SPEC_DRIFT_NOTE
-        return reason, (_drift_context(report.spec_sha256, baseline) if drifted else None)
+        if any_drift:
+            reason += " " + drift_note
+        return reason, drift_ctx
 
     if report.verdict == "pass":
         # A pass with drift still passes, but must not pass *silently*. Said once
@@ -188,14 +208,20 @@ def _spec_gate() -> tuple[str | None, str | None]:
         # spec edit announces it for review; repeating the same note on every
         # later stop turns a review prompt into a nag the harness re-engages the
         # agent over (observed live: nine forced continuations in one session).
-        if drifted and _drift_unnoted(session_id, baseline, report.spec_sha256):
-            return None, _drift_context(report.spec_sha256, baseline)
+        if any_drift and _drift_unnoted(
+                session_id,
+                baseline if drifted else tree_baseline,
+                report.spec_sha256 if drifted else report.tree_sha256):
+            return None, drift_ctx
         return None, None
 
     reason = _failure_reason(report)
-    if drifted:
-        reason += " " + SPEC_DRIFT_NOTE
-    return reason, _evidence_context(report, drifted, baseline)
+    if any_drift:
+        reason += " " + drift_note
+    context = _evidence_context(report)
+    if drift_ctx:
+        context = drift_ctx + "\n" + context
+    return reason, context
 
 
 # The first line of every gate block. A block rendered as prose gets read as
@@ -337,11 +363,20 @@ def stop_gate() -> tuple[dict[str, Any] | None, int]:
     return decision, 0
 
 
-def _drift_context(current_hash: str | None, baseline_hash: str | None) -> str:
-    """The unmissable drift annotation, with both hashes for a reviewer to diff."""
+def _drift_context(
+    current_hash: str | None,
+    baseline_hash: str | None,
+    note: str = SPEC_DRIFT_NOTE,
+    what: str = "spec",
+) -> str:
+    """The unmissable drift annotation, with both hashes for a reviewer to diff.
+
+    ``note``/``what`` select which drift is being annotated: the spec file
+    itself, or the check-tree (scripts under ``.fleetproof/checks/``).
+    """
     return (
-        f"{SPEC_DRIFT_NOTE}\n"
-        f"- current spec hash:  {short_spec_hash(current_hash)}\n"
+        f"{note}\n"
+        f"- current {what} hash:  {short_spec_hash(current_hash)}\n"
         f"- session baseline:   {short_spec_hash(baseline_hash)}"
     )
 
@@ -375,10 +410,8 @@ def _drift_unnoted(session_id: str | None, baseline: str | None, current: str | 
     return True
 
 
-def _evidence_context(report, drifted: bool = False, baseline_hash: str | None = None) -> str:
+def _evidence_context(report) -> str:
     parts = []
-    if drifted:
-        parts.append(_drift_context(report.spec_sha256, baseline_hash))
     for r in report.results:
         status = "pass" if r.passed else ("FAIL" if r.blocking else "warn")
         parts.append(f"- [{status}] {r.id}: {r.detail}")
@@ -526,14 +559,23 @@ def _subagent_block(reason: str, context: str | None = None) -> dict[str, Any]:
     return decision
 
 
-def _pin_drift_reason(pinned: str | None, current: str | None) -> str:
+def _pin_drift_reason(
+    what: str, pinned: str | None, current: str | None, note: str,
+) -> str:
+    """The pin-drift block, naming WHICH pin drifted.
+
+    ``what`` is "check spec" (checks.json itself changed) or "check scripts
+    under .fleetproof/checks/" (spec byte-identical, graders rewritten) — the
+    operator unwedging a fleet needs to know where to look, and one word
+    covering both would send them diffing the wrong file.
+    """
     return (
         f"{GATE_BLOCK_MARKER}\n"
-        "FleetProof: the check spec changed after this work was dispatched "
+        f"FleetProof: the {what} changed after this work was dispatched "
         f"(pinned {short_spec_hash(pinned)}, now {short_spec_hash(current)}). "
         "A dispatched agent is graded against the spec that was in force when it "
         "was dispatched, so this stop is blocked until the spec is restored or the "
-        "work is re-dispatched against the new one. " + SPEC_DRIFT_NOTE
+        "work is re-dispatched against the new one. " + note
     )
 
 
@@ -623,12 +665,14 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     2. No final message means no report. Block without transitioning: an agent
        that went idle saying nothing has not reported, and recording it as
        ``reported`` would launder silence into a claim.
-    3. If the spec changed since this dispatch was pinned — and this tier has
-       anything runnable to grade — block. At lane tier and deeper the pinned
-       spec is the contract; grading against a spec the agent could have edited
-       mid-flight is not verification. With nothing runnable the drift is noted
-       on stderr and the stop proceeds ungraded: blocking would wedge tiers
-       that have no stake in the edit at all.
+    3. If the spec — or any check script under ``.fleetproof/checks/`` —
+       changed since this dispatch was pinned, and this tier has anything
+       runnable to grade: block, naming which pin drifted. At lane tier and
+       deeper the pinned checks tree is the contract; grading against a spec
+       or a grader the agent could have edited mid-flight is not verification.
+       With nothing runnable the drift is noted on stderr and the stop
+       proceeds ungraded: blocking would wedge tiers that have no stake in
+       the edit at all.
     4. Grade the agent's own tier of the spec, unioned with the checks declared
        on this dispatch's own manifest (blocking, expect-exit0). Blocking
        failure -> ``contradicted`` and block (the agent gets its turn back, and
@@ -711,17 +755,29 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     # blocking anyway wedged every in-flight dispatch on someone else's spec
     # edit, at tiers with nothing to grade (observed in a field deployment on
     # Windows). The drift still gets said out loud; it just cannot gate a
-    # verdict that was never going to exist.
+    # verdict that was never going to exist. Both pins are compared: the spec
+    # bytes and the checks tree (spec + scripts under .fleetproof/checks/).
+    # Spec drift subsumes tree drift, so the tree pin adds signal exactly when
+    # checks.json is byte-identical and a grader script is not. A record with
+    # no tree pin (written before the tree hash existed) is not tree-tested.
     pinned = dispatch.spec_sha256_pinned
     current = spec_hash()
-    drifted = bool(pinned and current and pinned != current)
+    spec_pin_drift = bool(pinned and current and pinned != current)
+    tree_pinned = dispatch.tree_sha256_pinned
+    tree_current = checks_tree_hash()
+    tree_pin_drift = (not spec_pin_drift) and bool(
+        tree_pinned and tree_current and tree_pinned != tree_current)
+    drifted = spec_pin_drift or tree_pin_drift
 
     if not runnable:
         if drifted:
+            what = "spec" if spec_pin_drift else "check-script"
+            shown_pinned = pinned if spec_pin_drift else tree_pinned
+            shown_current = current if spec_pin_drift else tree_current
             sys.stderr.write(
-                f"[fleetproof] spec drift noted on dispatch {dispatch.run_id} "
-                f"(pinned {short_spec_hash(pinned)}, now "
-                f"{short_spec_hash(current)}) — nothing runnable at tier "
+                f"[fleetproof] {what} drift noted on dispatch {dispatch.run_id} "
+                f"(pinned {short_spec_hash(shown_pinned)}, now "
+                f"{short_spec_hash(shown_current)}) — nothing runnable at tier "
                 f"{dispatch.tier}, stop allowed ungraded\n")
         _try_close(dispatch.run_id)
         # The grading *happened* and selected nothing — recorded as an empty
@@ -734,11 +790,18 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
         )
         return None, 0
 
-    if drifted:
+    if spec_pin_drift:
         return _subagent_block(
-            _pin_drift_reason(pinned, current),
+            _pin_drift_reason("check spec", pinned, current, SPEC_DRIFT_NOTE),
             f"- dispatch {dispatch.run_id} pinned spec {short_spec_hash(pinned)}\n"
             f"- current spec              {short_spec_hash(current)}",
+        ), 0
+    if tree_pin_drift:
+        return _subagent_block(
+            _pin_drift_reason("check scripts under .fleetproof/checks/",
+                              tree_pinned, tree_current, TREE_DRIFT_NOTE),
+            f"- dispatch {dispatch.run_id} pinned check tree {short_spec_hash(tree_pinned)}\n"
+            f"- current check tree        {short_spec_hash(tree_current)}",
         ), 0
 
     report = run_checks(runnable, record_to_log=True, tier=dispatch.tier)

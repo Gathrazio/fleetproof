@@ -553,6 +553,128 @@ def test_pin_drift_does_not_block_a_tier_with_nothing_to_grade(
     assert d.verdict is None  # ungraded, exactly as an undrifted empty tier
 
 
+def _write_check_script(tmp_path: Path, body: str) -> Path:
+    scripts = tmp_path / ".fleetproof" / "checks"
+    scripts.mkdir(parents=True, exist_ok=True)
+    path = scripts / "verify.py"
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_check_script_rewrite_mid_dispatch_blocks_naming_the_scripts(
+        tmp_path, monkeypatch, capsys):
+    # The spec pin covered checks.json alone, so the check *scripts* could be
+    # rewritten mid-dispatch — including by the graded lane itself — with zero
+    # drift signal (observed in a field deployment on Windows). The tree pin
+    # closes that: the graders are part of the spec.
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    script = _write_check_script(tmp_path, "raise SystemExit(0)\n")
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
+    d = list_dispatches()[0]
+    assert d.tree_sha256_pinned is not None
+    assert d.spec_sha256_pinned is not None
+
+    script.write_text("raise SystemExit(0)  # weakened mid-flight\n", encoding="utf-8")
+    _feed(monkeypatch, _stop_payload())
+    assert subagent_stop_main() == 0
+    decision = json.loads(capsys.readouterr().out)
+    assert decision["decision"] == "block"
+    assert decision["reason"].startswith("[FLEETPROOF GATE")
+    # The block names WHICH pin drifted: the spec file did not change, the
+    # scripts did, and an operator unwedging this needs to know where to look.
+    assert "check scripts under .fleetproof/checks/" in decision["reason"]
+    assert "check spec changed" not in decision["reason"]
+
+    d = list_dispatches()[0]
+    assert d.state == "reported"  # the claim is on record; the grade is not
+    assert d.verdict is None
+
+
+def test_spec_drift_block_names_the_spec_not_the_scripts(tmp_path, monkeypatch, capsys):
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    _write_check_script(tmp_path, "raise SystemExit(0)\n")
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
+
+    _write_checks(tmp_path, [dict(_LANE_PASS, description="weakened after dispatch")])
+    _feed(monkeypatch, _stop_payload())
+    assert subagent_stop_main() == 0
+    decision = json.loads(capsys.readouterr().out)
+    assert decision["decision"] == "block"
+    assert "check spec changed after this work was dispatched" in decision["reason"]
+    assert "check scripts under .fleetproof/checks/" not in decision["reason"]
+
+
+def test_record_without_a_tree_pin_is_not_tree_tested(tmp_path, monkeypatch, capsys):
+    # Additive compatibility: a dispatch written before the tree pin existed
+    # carries no tree_sha256_pinned, and must not start failing drift tests it
+    # never agreed to.
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    script = _write_check_script(tmp_path, "raise SystemExit(0)\n")
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
+
+    d = list_dispatches()[0]
+    raw = json.loads((d.run_dir / "dispatch.json").read_text(encoding="utf-8"))
+    del raw["tree_sha256_pinned"]
+    (d.run_dir / "dispatch.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    script.write_text("raise SystemExit(0)  # changed\n", encoding="utf-8")
+    _feed(monkeypatch, _stop_payload())
+    assert subagent_stop_main() == 0
+    assert capsys.readouterr().out == ""  # graded normally, no drift block
+    assert list_dispatches()[0].verdict == "verified"
+
+
+def test_tree_drift_with_nothing_runnable_allows_the_stop_ungraded(
+        tmp_path, monkeypatch, capsys):
+    # Same A5 rule for the tree pin: with nothing runnable at this tier there
+    # is nothing the rewritten scripts could corrupt — note it, do not wedge.
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import list_dispatches, write_intent
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    script = _write_check_script(tmp_path, "raise SystemExit(0)\n")
+    write_intent("tester", _INTENT_PROMPT, tier="coordinator")
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
+
+    script.write_text("raise SystemExit(0)  # changed\n", encoding="utf-8")
+    _feed(monkeypatch, _stop_payload(message="Coordinated; nothing gradeable here."))
+    assert subagent_stop_main() == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "drift" in captured.err
+
+    d = list_dispatches()[0]
+    assert d.state == "terminated"
+    assert d.verdict is None
+
+
+def test_stop_gate_pass_annotates_check_script_drift(tmp_path, monkeypatch):
+    # Session-baseline drift on the bridge Stop gate gains the tree hash too:
+    # a script rewritten mid-session is announced, exactly like a spec edit.
+    from fleetproof.checks import TREE_DRIFT_NOTE
+    _setup_project(tmp_path, [_PASS], monkeypatch)
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-tree-drift")
+
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000001-aaaa01")
+    first, code = stop_gate()
+    assert first is None  # first verdict is the baseline
+
+    _write_check_script(tmp_path, "raise SystemExit(0)\n")
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000002-aaaa02")
+    second, code = stop_gate()
+    assert second is not None
+    assert second.get("decision") != "block"  # a pass with drift still passes
+    assert TREE_DRIFT_NOTE in second["hookSpecificOutput"]["additionalContext"]
+
+
 def test_subagent_gate_fails_open_but_loudly_when_it_breaks(tmp_path, monkeypatch, capsys):
     # A bug in the gate must not wedge the fleet, but must not look like a pass.
     from fleetproof import hookgate

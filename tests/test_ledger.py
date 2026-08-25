@@ -368,6 +368,26 @@ def test_missing_spec_pins_null(ledger_runs, tmp_path):
     assert load_dispatch(run_id).spec_sha256_pinned is None
 
 
+def test_tree_hash_pinned_at_dispatch(ledger_runs, tmp_path):
+    # The graders are part of the spec: the pin covers the check scripts too,
+    # or a rewritten grader mid-dispatch leaves zero drift signal.
+    from fleetproof.checks import checks_tree_hash
+    spec = tmp_path / "checks.json"
+    spec.write_text(json.dumps({"checks": [{"id": "ok", "run": "true"}]}), encoding="utf-8")
+    scripts = tmp_path / "checks"
+    scripts.mkdir()
+    (scripts / "verify.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    run_id = create_dispatch("work", spec_path=spec)
+    record = load_dispatch(run_id)
+    assert record.tree_sha256_pinned == checks_tree_hash(spec)
+    assert record.tree_sha256_pinned != record.spec_sha256_pinned
+
+
+def test_missing_spec_pins_null_tree_hash(ledger_runs, tmp_path):
+    run_id = create_dispatch("work", spec_path=tmp_path / "absent.json")
+    assert load_dispatch(run_id).tree_sha256_pinned is None
+
+
 # === listing and filters ===
 
 def test_list_dispatches_newest_first_and_filters(ledger_runs, monkeypatch):

@@ -70,7 +70,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .checks import VALID_TIERS, spec_hash
+from .checks import VALID_TIERS, checks_tree_hash, spec_hash
 from .config import telemetry_era_stamp
 from .runlog import (
     PARENT_RUN_ID_ENV,
@@ -228,6 +228,11 @@ class DispatchRecord:
     tier_source: str | None
     manifest: dict[str, Any] = field(default_factory=dict)
     spec_sha256_pinned: str | None = None
+    # The checks-tree pin: spec bytes plus every script under
+    # ``.fleetproof/checks/`` (see :func:`fleetproof.checks.checks_tree_hash`).
+    # Additive: absent on records written before the tree pin existed, reading
+    # back as None — and a None pin is never drift-tested.
+    tree_sha256_pinned: str | None = None
     transitions: list[dict[str, Any]] = field(default_factory=list)
     started_at: str | None = None
     # The harness subagent this dispatch stands for, when one is known. Additive:
@@ -324,6 +329,7 @@ class DispatchRecord:
             "tier_source": self.tier_source,
             "manifest": self.manifest,
             "spec_sha256_pinned": self.spec_sha256_pinned,
+            "tree_sha256_pinned": self.tree_sha256_pinned,
             "transitions": self.transitions,
             "started_at": self.started_at,
             "agent": self.agent,
@@ -369,6 +375,7 @@ def load_dispatch(run_id: str) -> DispatchRecord | None:
         tier_source=dispatch.get("tier_source"),
         manifest=manifest if isinstance(manifest, dict) else {},
         spec_sha256_pinned=dispatch.get("spec_sha256_pinned"),
+        tree_sha256_pinned=dispatch.get("tree_sha256_pinned"),
         transitions=transitions if isinstance(transitions, list) else [],
         started_at=root.get("started_at"),
         agent=agent if isinstance(agent, dict) else None,
@@ -915,9 +922,11 @@ def create_dispatch(
 
     Creates a new top-level run directory with a ``_root.json`` whose
     ``parent_run_id`` points at the dispatching run, plus the ``dispatch.json``
-    that makes it a dispatch. The current check spec's hash is pinned onto the
-    record so a later verdict can be told whether it was graded against the spec
-    that was in force when the work was ordered.
+    that makes it a dispatch. The current check spec is pinned onto the record
+    twice — the spec bytes (``spec_sha256_pinned``) and the whole checks tree
+    including the scripts under ``.fleetproof/checks/`` (``tree_sha256_pinned``)
+    — so a later verdict can be told whether it was graded against the spec,
+    and the graders, that were in force when the work was ordered.
 
     ``tier`` omitted means infer it (recorded as ``tier_source="inferred"``);
     passing one records ``"declared"`` — unless ``tier_source`` overrides the
@@ -982,6 +991,7 @@ def create_dispatch(
         "tier_source": resolved_tier_source,
         "manifest": resolved_manifest,
         "spec_sha256_pinned": spec_hash(spec_path),
+        "tree_sha256_pinned": checks_tree_hash(spec_path),
         "transitions": [_transition(STATE_DISPATCHED, by)],
     }
     # Telemetry-era membership is stamped at creation from deployment config —
