@@ -11,7 +11,11 @@ top-level run:
     <runs-dir>/<run-id>/
         _root.json      root_tool="dispatch", parent_run_id -> the dispatching run
         dispatch.json   the prompt, the tier, the manifest, the transitions
-        report.json     what the dispatched agent claimed (written on report)
+        report.json     what the dispatched agent claimed (latest report)
+        reports/NNN.json  every report, in order — a retry overwrites
+                          report.json but never this
+        blocks/NNN.txt    the verbatim block text the agent received, per block;
+                          NNN.meta.json beside it names the checker run
 
 Two properties matter more than convenience:
 
@@ -46,6 +50,7 @@ Public API:
     create_dispatch(prompt, *, tier, manifest, parent_run_id, agent, by) -> run_id
     infer_tier(parent_run_id) -> str
     record_report(run_id, report, by=...)
+    record_block(run_id, text, checker_run_id=...) -> Path
     record_verdict(run_id, verdict, detail=..., by=...)
     close_dispatch(run_id, by=..., reason=...)
     load_dispatch(run_id) -> DispatchRecord | None
@@ -86,6 +91,21 @@ from .runlog import (
 DISPATCH_FILENAME = "dispatch.json"
 REPORT_FILENAME = "report.json"
 ROOT_FILENAME = "_root.json"
+
+# Per-attempt history beside the latest-wins files. report.json held only the
+# newest claim, so an agent that reported three times under the gate left
+# three report hashes in its transitions and one body on disk — the other two
+# were gone; and the verbatim block text an agent was handed existed nowhere
+# in the ledger at all, reconstructible only from the checker run plus the
+# template (both observed in a field deployment on Windows). For a tool whose
+# product is an auditable record of what was claimed and what was said back,
+# both are kept now, numbered in the order they happened. Additive: a dispatch
+# dir without these directories is an older record and still loads.
+REPORTS_DIRNAME = "reports"
+BLOCKS_DIRNAME = "blocks"
+BLOCK_TEXT_SUFFIX = ".txt"
+BLOCK_META_SUFFIX = ".meta.json"
+_SEQUENCE_WIDTH = 3
 
 # The root_tool every dispatch run carries, so runlog readers (list/show/report)
 # can tell a dispatch apart from an ordinary recorded invocation.
@@ -342,8 +362,66 @@ class DispatchRecord:
         return (self.run_dir / REPORT_FILENAME).exists()
 
     def load_report(self) -> dict[str, Any] | None:
-        """Load report.json, or None when absent/unreadable."""
+        """Load report.json (the latest report), or None when absent/unreadable."""
         return _read_json(self.run_dir / REPORT_FILENAME)
+
+    @property
+    def report_count(self) -> int:
+        """How many reports this dispatch has received, counting every attempt.
+
+        Read off ``reports/``; an older dispatch dir (no ``reports/``) counts
+        its single ``report.json`` as one, so the count never reads lower
+        than what is visibly on disk.
+        """
+        listed = _sequence_files(self.run_dir / REPORTS_DIRNAME, ".json")
+        if listed:
+            return len(listed)
+        return 1 if self.has_report else 0
+
+    def load_reports(self) -> list[dict[str, Any]]:
+        """Every report in the order received (``reports/NNN.json``).
+
+        Falls back to the single ``report.json`` for an older dispatch dir.
+        Unreadable entries are skipped, never invented.
+        """
+        paths = _sequence_files(self.run_dir / REPORTS_DIRNAME, ".json")
+        if not paths:
+            single = self.load_report()
+            return [single] if single is not None else []
+        out = []
+        for path in paths:
+            raw = _read_json(path)
+            if raw is not None:
+                out.append(raw)
+        return out
+
+    @property
+    def block_count(self) -> int:
+        """How many times the gate blocked this dispatch's stop (``blocks/``)."""
+        return len(_sequence_files(self.run_dir / BLOCKS_DIRNAME, BLOCK_TEXT_SUFFIX))
+
+    def load_blocks(self) -> list[dict[str, Any]]:
+        """Every block the agent received, in order: ``{seq, text, at, checker_run_id}``.
+
+        ``text`` is the verbatim reason the harness handed the agent; the
+        meta sidecar (optional, may be missing on a partially written block)
+        supplies ``at`` and the checker run whose evidence composed it.
+        """
+        out: list[dict[str, Any]] = []
+        for path in _sequence_files(self.run_dir / BLOCKS_DIRNAME, BLOCK_TEXT_SUFFIX):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            seq = path.name[: -len(BLOCK_TEXT_SUFFIX)]
+            meta = _read_json(path.with_name(seq + BLOCK_META_SUFFIX)) or {}
+            out.append({
+                "seq": seq,
+                "text": text,
+                "at": meta.get("at"),
+                "checker_run_id": meta.get("checker_run_id"),
+            })
+        return out
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -364,6 +442,8 @@ class DispatchRecord:
             "state": self.state,
             "verdict": self.verdict,
             "has_report": self.has_report,
+            "report_count": self.report_count,
+            "block_count": self.block_count,
         }
 
 
@@ -384,6 +464,31 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _sequence_files(directory: Path, suffix: str) -> list[Path]:
+    """The ``NNN<suffix>`` files in ``directory``, in sequence order; [] if absent."""
+    if not directory.is_dir():
+        return []
+    out = []
+    for path in directory.iterdir():
+        stem = path.name[: -len(suffix)] if path.name.endswith(suffix) else None
+        if stem and stem.isdigit() and path.is_file():
+            out.append(path)
+    return sorted(out, key=lambda p: p.name)
+
+
+def _next_sequence_name(directory: Path, suffix: str) -> str:
+    """The next zero-padded sequence stem for ``directory`` (001, 002, ...).
+
+    Derived from the highest existing stem, not the file count, so a gap left
+    by an unreadable or deleted entry can never make two attempts share a
+    number.
+    """
+    highest = 0
+    for path in _sequence_files(directory, suffix):
+        highest = max(highest, int(path.name[: -len(suffix)]))
+    return f"{highest + 1:0{_SEQUENCE_WIDTH}d}"
 
 
 def load_dispatch(run_id: str) -> DispatchRecord | None:
@@ -1231,10 +1336,11 @@ def record_report(run_id: str, report: dict[str, Any], by: str = "cli") -> Dispa
     point of keeping it is being able to diff a claim against a verdict later.
 
     Legal from ``dispatched`` and from ``contradicted`` (the gate-blocked retry).
-    A retry overwrites ``report.json`` with the newer claim; the transition list
-    keeps the history of how many attempts it took — including, per attempt, the
-    hash of what was claimed, since report.json itself only ever holds the
-    latest claim.
+    A retry overwrites ``report.json`` with the newer claim and *appends* the
+    same payload as ``reports/NNN.json``, so every attempt's body survives —
+    the transition list keeps the per-attempt hash, and the numbered file is
+    the body that hash is of. (Before this, two of an agent's three reports
+    were gone from disk — observed in a field deployment on Windows.)
     """
     record = _require_dispatch(run_id)
     validated = _validate_report(report)
@@ -1248,10 +1354,39 @@ def record_report(run_id: str, report: dict[str, Any], by: str = "cli") -> Dispa
             f"dispatch {run_id}; legal next states: {sorted(allowed) or 'none (terminal)'}."
         )
     _write_json(record.run_dir / REPORT_FILENAME, validated)
+    reports = record.run_dir / REPORTS_DIRNAME
+    reports.mkdir(exist_ok=True)
+    _write_json(reports / (_next_sequence_name(reports, ".json") + ".json"), validated)
     return _append_transition(
         run_id, STATE_REPORTED, by,
         extra={"report_sha256": report_content_hash(validated)},
     )
+
+
+def record_block(
+    run_id: str, text: str, checker_run_id: str | None = None,
+) -> Path:
+    """Persist the verbatim block text an agent was handed. Returns the .txt path.
+
+    Not a transition: a block is the gate *refusing* a stop, and the state it
+    refuses from (``contradicted``, or unchanged for a no-report block) is
+    already on the transitions. What was missing was the message itself —
+    the exact text the agent read, which decides whether a wedged agent was
+    wedged by a bad check or by bad wording. ``checker_run_id`` names the
+    evidence run the text was composed from, when there was one (a pin-drift
+    or no-report block runs no checker).
+    """
+    record = _require_dispatch(run_id)
+    blocks = record.run_dir / BLOCKS_DIRNAME
+    blocks.mkdir(exist_ok=True)
+    seq = _next_sequence_name(blocks, BLOCK_TEXT_SUFFIX)
+    path = blocks / (seq + BLOCK_TEXT_SUFFIX)
+    path.write_text(text, encoding="utf-8")
+    _write_json(blocks / (seq + BLOCK_META_SUFFIX), {
+        "at": _now_iso(),
+        "checker_run_id": checker_run_id,
+    })
+    return path
 
 
 def record_verdict(

@@ -716,3 +716,18 @@ def test_fleet_labels_abandoned_and_parked(cli_runs, capsys):
     parked_row = next(line for line in out.splitlines() if parked in line)
     assert "parked" in parked_row
     assert "ungraded" in parked_row
+
+
+def test_fleet_json_rows_carry_report_and_block_counts(cli_runs, capsys):
+    # There is no `dispatch show` verb; the machine-readable board row is
+    # where the per-dispatch report and block counts surface.
+    from fleetproof.ledger import record_block, record_report
+    run_id = _dispatch_new(capsys)
+    record_report(run_id, {"summary": "one"})
+    record_block(run_id, "blocked once")
+    capsys.readouterr()
+    assert main(["fleet", "--format", "json"]) == 0
+    row = json.loads(capsys.readouterr().out)["dispatches"][0]
+    assert row["run_id"] == run_id
+    assert row["report_count"] == 1
+    assert row["block_count"] == 1

@@ -81,6 +81,7 @@ from .ledger import (
     intents_dir,
     list_dispatches,
     load_dispatch,
+    record_block,
     record_orphan_stop,
     record_report,
     record_verdict,
@@ -674,6 +675,25 @@ def _subagent_block(reason: str, context: str | None = None) -> dict[str, Any]:
     return decision
 
 
+def _block_dispatch(
+    run_id: str, reason: str, context: str | None = None,
+    checker_run_id: str | None = None,
+) -> dict[str, Any]:
+    """A subagent block that is also written to the dispatch (``blocks/NNN.txt``).
+
+    The reason is what the agent reads; persisting it verbatim is what lets an
+    operator later tell a wedge caused by a wrong check from one caused by
+    wording the agent argued with. Best-effort: a ledger write failure is
+    said on stderr and the block still goes out — the gate's decision must
+    not depend on its own bookkeeping.
+    """
+    try:
+        record_block(run_id, reason, checker_run_id=checker_run_id)
+    except (LedgerError, OSError) as e:
+        sys.stderr.write(f"[fleetproof] could not record block on {run_id}: {e}\n")
+    return _subagent_block(reason, context)
+
+
 def _pin_drift_reason(
     what: str, pinned: str | None, current: str | None, note: str,
 ) -> str:
@@ -861,7 +881,8 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     last_message = payload.get("last_assistant_message")
     last_message = last_message if isinstance(last_message, str) else ""
     if not last_message.strip():
-        return _subagent_block(
+        return _block_dispatch(
+            dispatch.run_id,
             f"{GATE_BLOCK_MARKER}\n"
             "FleetProof report-before-idle: subagent produced no final report "
             "message, so there is nothing to verify. State what you did, what you "
@@ -885,7 +906,8 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
             # A pin proves a spec existed when this work was ordered. Fail closed
             # (finding C3): grading "nothing to check" against a promise is how a
             # gate gets switched off by deleting its spec.
-            return _subagent_block(
+            return _block_dispatch(
+                dispatch.run_id,
                 "FleetProof: this dispatch pinned check spec "
                 f"{short_spec_hash(dispatch.spec_sha256_pinned)}, but the spec is "
                 f"now missing or unreadable ({e}). Restore .fleetproof/checks.json "
@@ -946,13 +968,15 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
         return None, 0
 
     if spec_pin_drift:
-        return _subagent_block(
+        return _block_dispatch(
+            dispatch.run_id,
             _pin_drift_reason("check spec", pinned, current, SPEC_DRIFT_NOTE),
             f"- dispatch {dispatch.run_id} pinned spec {short_spec_hash(pinned)}\n"
             f"- current spec              {short_spec_hash(current)}",
         ), 0
     if tree_pin_drift:
-        return _subagent_block(
+        return _block_dispatch(
+            dispatch.run_id,
             _pin_drift_reason("check scripts under .fleetproof/checks/",
                               tree_pinned, tree_current, TREE_DRIFT_NOTE),
             f"- dispatch {dispatch.run_id} pinned check tree {short_spec_hash(tree_pinned)}\n"
@@ -990,7 +1014,9 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
                 _NEVER_SUPPRESS_KEY: True,
             }, 0
         _try_build_telemetry(dispatch.run_id, check_report=report, checks=runnable)
-        return _subagent_block(_failure_reason(report), _evidence_context(report)), 0
+        return _block_dispatch(
+            dispatch.run_id, _failure_reason(report), _evidence_context(report),
+            checker_run_id=report.run_id), 0
 
     record_verdict(
         dispatch.run_id,

@@ -1649,3 +1649,58 @@ def test_owner_advisory_failure_never_contradicts_the_dispatch(
     assert d.verdict == "verified"
     assert d.state == "terminated"
     assert not any(t.get("state") == "contradicted" for t in d.transitions)
+
+
+# === every block the gate hands an agent is kept on the dispatch ===
+
+def test_gate_block_text_is_persisted_verbatim_with_the_checker_run(
+        tmp_path, monkeypatch, capsys):
+    # The verbatim block text an agent received existed nowhere in the ledger
+    # (observed in a field deployment on Windows); now blocks/001.txt holds
+    # exactly what went out, and the meta names the evidence run.
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _spawn_with_intent(tmp_path, monkeypatch, _intent_manifest(cmd_exit=1))
+
+    _feed(monkeypatch, _stop_payload(message="done, honest"))
+    assert subagent_stop_main() == 0
+    decision = json.loads(capsys.readouterr().out)
+    assert decision["decision"] == "block"
+
+    d = list_dispatches()[0]
+    assert d.block_count == 1
+    block = d.load_blocks()[0]
+    assert block["text"] == decision["reason"]
+    assert block["checker_run_id"]
+    assert block["checker_run_id"] in decision["reason"]  # the evidence run id
+    assert d.report_count == 1
+
+    # The retry: a second report, a second block, both kept.
+    _feed(monkeypatch, _stop_payload(message="done again, still honest"))
+    assert subagent_stop_main() == 0
+    capsys.readouterr()
+    d = list_dispatches()[0]
+    assert d.report_count == 2
+    assert d.block_count == 2
+    assert [r["summary"] for r in d.load_reports()] == [
+        "done, honest", "done again, still honest"]
+
+
+def test_no_report_block_is_persisted_without_a_checker_run(
+        tmp_path, monkeypatch, capsys):
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    _feed(monkeypatch, _start_payload())
+    subagent_start_main()
+
+    _feed(monkeypatch, _stop_payload(message="   "))
+    assert subagent_stop_main() == 0
+    decision = json.loads(capsys.readouterr().out)
+
+    d = list_dispatches()[0]
+    assert d.report_count == 0
+    blocks = d.load_blocks()
+    assert len(blocks) == 1
+    assert blocks[0]["text"] == decision["reason"]
+    assert blocks[0]["checker_run_id"] is None

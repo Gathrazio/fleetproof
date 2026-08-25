@@ -849,3 +849,80 @@ def test_invented_tier_in_a_sidecar_note_names_the_legal_tiers(ledger_runs, tmp_
                and "legal tiers: bridge, coordinator, lane, leaf" in n
                for n in notes)
 
+
+# === every report and every block is kept ===
+
+def test_every_report_is_kept_as_a_numbered_file(ledger_runs):
+    # report.json is latest-wins; a retry used to erase the prior claim's
+    # body (two of three gone — observed in a field deployment on Windows).
+    from fleetproof.ledger import record_block
+    run_id = create_dispatch("work", tier="lane")
+    record_report(run_id, _ok_report("first claim"))
+    record_verdict(run_id, STATE_CONTRADICTED, detail="x")
+    record_report(run_id, _ok_report("second claim"))
+    record_verdict(run_id, STATE_CONTRADICTED, detail="x")
+    record_report(run_id, _ok_report("third claim"))
+
+    record = load_dispatch(run_id)
+    reports_dir = record.run_dir / "reports"
+    assert sorted(p.name for p in reports_dir.iterdir()) == [
+        "001.json", "002.json", "003.json"]
+    assert record.report_count == 3
+    assert [r["summary"] for r in record.load_reports()] == [
+        "first claim", "second claim", "third claim"]
+    # report.json still holds the latest, byte-for-byte the same payload.
+    assert record.load_report() == json.loads((reports_dir / "003.json").read_text())
+    assert record.to_dict()["report_count"] == 3
+    assert record.to_dict()["block_count"] == 0
+
+
+def test_record_block_keeps_the_verbatim_text_and_the_checker_run(ledger_runs):
+    from fleetproof.ledger import record_block
+    run_id = create_dispatch("work", tier="lane")
+    text = "[GATE]\nline two: exact bytes, with a trailing newline\n"
+    path = record_block(run_id, text, checker_run_id="20260825-000000-abcdef")
+    record_block(run_id, "second block", checker_run_id=None)
+
+    record = load_dispatch(run_id)
+    assert path.name == "001.txt"
+    assert path.read_text(encoding="utf-8") == text
+    assert record.block_count == 2
+    blocks = record.load_blocks()
+    assert [b["seq"] for b in blocks] == ["001", "002"]
+    assert blocks[0]["text"] == text
+    assert blocks[0]["checker_run_id"] == "20260825-000000-abcdef"
+    assert blocks[0]["at"]
+    assert blocks[1]["checker_run_id"] is None
+
+
+def test_sequence_numbers_skip_over_a_gap(ledger_runs):
+    # Derived from the highest stem, not the count: a deleted 001 must not
+    # let a later attempt be written as a second 002.
+    from fleetproof.ledger import record_block
+    run_id = create_dispatch("work", tier="lane")
+    record_block(run_id, "a")
+    record_block(run_id, "b")
+    (load_dispatch(run_id).run_dir / "blocks" / "001.txt").unlink()
+    path = record_block(run_id, "c")
+    assert path.name == "003.txt"
+
+
+def test_old_layout_dispatch_dir_without_reports_or_blocks_still_loads(ledger_runs):
+    # A 0.4.0 dispatch dir: report.json alone, no reports/ and no blocks/.
+    run_id = create_dispatch("work", tier="lane")
+    record_report(run_id, _ok_report("only claim"))
+    run_dir = load_dispatch(run_id).run_dir
+    import shutil
+    shutil.rmtree(run_dir / "reports")
+    assert not (run_dir / "reports").exists()
+    assert not (run_dir / "blocks").exists()
+
+    record = load_dispatch(run_id)
+    assert record is not None
+    assert record.has_report
+    assert record.report_count == 1
+    assert record.load_reports() == [record.load_report()]
+    assert record.block_count == 0
+    assert record.load_blocks() == []
+    d = record.to_dict()
+    assert d["report_count"] == 1 and d["block_count"] == 0
