@@ -330,3 +330,59 @@ def test_parse_manifest_check_file_exists_needs_no_cmd():
     from fleetproof.checks import parse_manifest_check
     c = parse_manifest_check({"id": "x", "expect": {"file_exists": "out.txt"}}, "m[0]")
     assert c.run is None and c.expect == {"kind": "file_exists", "path": "out.txt"}
+
+
+# === phase succession: succeeded_by (C13) ===
+
+def _succ(tmp_path, checks):
+    return load_checks(_write(tmp_path, {"checks": checks}))
+
+
+def test_succeeded_by_parses_and_reads_back_none_when_absent(tmp_path):
+    checks = _succ(tmp_path, [
+        {"id": "worktree-ahead", "run": "x", "succeeded_by": "merge-landed"},
+        {"id": "merge-landed", "run": "y"},
+    ])
+    assert checks[0].succeeded_by == "merge-landed"
+    assert checks[1].succeeded_by is None
+
+
+def test_succeeded_by_must_name_a_check_in_the_spec(tmp_path):
+    with pytest.raises(CheckSpecError, match="not a check in this spec"):
+        _succ(tmp_path, [{"id": "a", "run": "x", "succeeded_by": "ghost"}])
+
+
+def test_succeeded_by_cannot_name_itself(tmp_path):
+    with pytest.raises(CheckSpecError, match="must name a different check"):
+        _succ(tmp_path, [{"id": "a", "run": "x", "succeeded_by": "a"}])
+
+
+def test_succeeded_by_chain_cannot_cycle(tmp_path):
+    with pytest.raises(CheckSpecError, match="chain cycles: a -> b -> a"):
+        _succ(tmp_path, [
+            {"id": "a", "run": "x", "succeeded_by": "b"},
+            {"id": "b", "run": "y", "succeeded_by": "a"},
+        ])
+
+
+def test_succeeded_by_must_share_the_predecessors_tier(tmp_path):
+    with pytest.raises(CheckSpecError, match="must be selected wherever its predecessor is"):
+        _succ(tmp_path, [
+            {"id": "a", "run": "x", "tier": "bridge", "succeeded_by": "b"},
+            {"id": "b", "run": "y", "tier": "lane"},
+        ])
+    # Untiered -> untiered is the same tier (None == None).
+    checks = _succ(tmp_path, [
+        {"id": "a", "run": "x", "succeeded_by": "b"}, {"id": "b", "run": "y"}])
+    assert checks[0].succeeded_by == "b"
+
+
+def test_succeeded_by_must_be_a_non_blank_string(tmp_path):
+    with pytest.raises(CheckSpecError, match="'succeeded_by' must be a check id string"):
+        _succ(tmp_path, [{"id": "a", "run": "x", "succeeded_by": ""}, {"id": "b", "run": "y"}])
+
+
+def test_manifest_check_refuses_succeeded_by():
+    from fleetproof.checks import parse_manifest_check
+    with pytest.raises(CheckSpecError, match="'succeeded_by' is not a manifest field"):
+        parse_manifest_check({"id": "m", "cmd": "x", "succeeded_by": "n"}, "manifest check [0]")

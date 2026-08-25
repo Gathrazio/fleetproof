@@ -157,6 +157,13 @@ class CheckReport:
     # a field deployment on Windows). ``state: "n/a"`` is the bare CLI: no
     # gate, so no arming governed anything. Additive: None on older records.
     arming: dict[str, Any] | None = None
+    # Checks that were selected for this tier but retired instead of run —
+    # succeeded by a check that passed (this session, or this very run), or
+    # retired by an operator's `phase advance`. Each entry: {"id", "reason",
+    # "succeeded_by", "note", "blocking"}. Never in ``results``, so never in
+    # ``total``, ``failed``, or ``blocking_failures``: a retired check is not
+    # a failed one. Additive: [] on older records. See :mod:`fleetproof.phase`.
+    retired: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -205,6 +212,7 @@ class CheckReport:
             "tier": self.tier,
             "cwd": self.cwd,
             "arming": self.arming,
+            "retired": list(self.retired),
             "summary": {
                 "total": self.total,
                 "passed": self.passed,
@@ -395,6 +403,7 @@ def run_checks(
     tier: str | None = None,
     identity: dict[str, Any] | None = None,
     arming: dict[str, Any] | None = None,
+    retired: list[dict[str, Any]] | None = None,
 ) -> CheckReport:
     """Run every selected check and (by default) append the verdict to the run log.
 
@@ -426,6 +435,13 @@ def run_checks(
     tier's arming governed the verdict and whether it was armed or advisory,
     so the evidence record is interpretable without the arming file as it
     was at the time.
+
+    ``retired`` is what the caller already retired before running (see
+    :func:`fleetproof.phase.apply_phase`): stamped onto the report so the
+    verdict lists them. On top of that, a check whose ``succeeded_by``
+    successor PASSED in this very run is retired here after grading — its
+    result moves out of ``results`` into ``retired`` — so the phase swap
+    costs no extra blocked stop while the session evidence catches up.
     """
     if checks is None:
         checks = load_checks(spec_path)
@@ -435,12 +451,14 @@ def run_checks(
     sha = spec_hash(resolved_spec)
 
     report = CheckReport(spec_sha256=sha, tree_sha256=checks_tree_hash(resolved_spec),
-                         tier=tier, cwd=str(work_dir), arming=arming)
+                         tier=tier, cwd=str(work_dir), arming=arming,
+                         retired=list(retired or []))
     env = check_env(identity)
     if not record_to_log:
         for check in checks:
             report.results.append(
                 _apply_ownership(run_check(check, work_dir, timeout, env), check, tier))
+        _retire_succeeded_this_run(report, checks)
         return report
 
     with record("fleetproof", "check", {"check_count": len(checks), "tier": tier}) as handle:
@@ -448,10 +466,49 @@ def run_checks(
         for check in checks:
             report.results.append(
                 _apply_ownership(run_check(check, work_dir, timeout, env), check, tier))
+        _retire_succeeded_this_run(report, checks)
         payload = report.to_dict()
         payload["recorded_from_pid"] = _self_pid()
         handle.set_output(payload)
     return report
+
+
+def _retire_succeeded_this_run(report: CheckReport, checks: list[Check]) -> None:
+    """Move a predecessor's result into ``retired`` when its successor passed
+    in this report. Transitive, like :func:`fleetproof.phase.apply_phase`:
+    A -> B -> C with C passed retires B and then A. A successor that merely
+    ran and failed retires nothing — the predecessor's own result stands."""
+    by_id = {c.id: c for c in checks}
+    passed = {r.id for r in report.results if r.passed}
+    succeeded: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for check in checks:
+            successor = check.succeeded_by
+            if not successor or check.id in succeeded:
+                continue
+            if successor not in by_id:
+                continue
+            if successor in passed or successor in succeeded:
+                succeeded.add(check.id)
+                changed = True
+    if not succeeded:
+        return
+    kept = []
+    for result in report.results:
+        if result.id in succeeded:
+            successor = by_id[result.id].succeeded_by
+            report.retired.append({
+                "id": result.id,
+                "reason": f"succeeded by {successor} (passed this run)",
+                "succeeded_by": successor,
+                "note": None,
+                "blocking": result.blocking,
+            })
+        else:
+            kept.append(result)
+    report.results = kept
 
 
 def _session_baseline(session_id: str | None, key: str) -> str | None:
@@ -533,8 +590,16 @@ def format_report_text(report: CheckReport) -> str:
     for r in report.results:
         mark = "PASS" if r.passed else ("FAIL" if r.blocking else "warn")
         lines.append(f"  [{mark}] {r.id}: {r.detail}")
+    # Retired checks render, and render as retired — a check that stepped
+    # aside must be visible on the verdict and never look like a failure.
+    for entry in report.retired:
+        lines.append(f"  [retired] {entry.get('id')}: retired ({entry.get('reason')})")
     s = report.to_dict()["summary"]
-    if report.all_advisory:
+    if report.total == 0 and report.retired:
+        lines.append(
+            f"RETIRED - 0 run; {len(report.retired)} selected check(s) retired "
+            "(see [retired] lines).")
+    elif report.all_advisory:
         # Never the bare word PASS here: with zero blocking checks nothing
         # could have failed this verdict, and the line must say so.
         lines.append(

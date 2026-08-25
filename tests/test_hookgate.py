@@ -2374,3 +2374,165 @@ def test_lane_run_stamps_armed_whatever_the_file_says(tmp_path, monkeypatch, cap
     capsys.readouterr()
     assert _last_verdict_payload()["arming"] == {"tier": "lane", "state": "armed",
                                                  "note": None}
+
+
+# === phase succession in the gates (C13) ===
+
+_WORKTREE_AHEAD = {"id": "worktree-ahead", "run": f'"{sys.executable}" -c "raise SystemExit(1)"',
+                   "expect": "exit0", "tier": "bridge", "succeeded_by": "merge-landed"}
+_MERGE_LANDED = {"id": "merge-landed", "run": f'"{sys.executable}" -c "raise SystemExit(0)"',
+                 "expect": "exit0", "tier": "bridge"}
+_MERGE_NOT_YET = dict(_MERGE_LANDED, run=f'"{sys.executable}" -c "raise SystemExit(1)"')
+
+
+def _verdict_payloads() -> list[dict]:
+    """Every persisted checker verdict, newest first by started_at (run ids
+    written in the same second sort by hash, not by time)."""
+    out = []
+    for run in runlog.list_run_records():
+        for sub in run.sub_invocations:
+            if sub.tool == "fleetproof" and sub.subcmd == "check":
+                payload = sub.load_output()
+                if isinstance(payload, dict):
+                    out.append((sub.started_at or run.started_at or "", payload))
+    out.sort(key=lambda item: item[0], reverse=True)
+    return [payload for _, payload in out]
+
+
+def test_bridge_predecessor_is_retired_once_its_successor_passes(tmp_path, monkeypatch):
+    # The field shape: a "worktree is ahead" check fails the moment the merge
+    # lands; the "merge landed" check passes. No spec edit, no drift, no
+    # blocked closeout: the predecessor is retired, never counted as failed.
+    _setup_project(tmp_path, [_WORKTREE_AHEAD, _MERGE_LANDED], monkeypatch)
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-phase")
+    decision, code = stop_gate()
+    assert decision is None and code == 0
+    payload = _verdict_payloads()[0]
+    assert payload["verdict"] == "pass"
+    assert [c["id"] for c in payload["checks"]] == ["merge-landed"]
+    assert payload["retired"][0]["id"] == "worktree-ahead"
+    assert payload["retired"][0]["reason"] == "succeeded by merge-landed (passed this run)"
+    assert payload["summary"]["blocking_failed"] == 0
+
+    # Second stop: the successor's pass is now session evidence, so the
+    # predecessor is retired BEFORE running — it is not executed at all.
+    decision, code = stop_gate()
+    assert decision is None
+    latest = _verdict_payloads()[0]
+    assert latest["retired"][0]["reason"] == "succeeded by merge-landed"
+    assert [c["id"] for c in latest["checks"]] == ["merge-landed"]
+
+
+def test_bridge_predecessor_still_blocks_while_its_successor_fails(tmp_path, monkeypatch):
+    _setup_project(tmp_path, [_WORKTREE_AHEAD, _MERGE_NOT_YET], monkeypatch)
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-phase")
+    decision, code = stop_gate()
+    assert decision["decision"] == "block"
+    assert "worktree-ahead" in decision["reason"]
+    assert "retired" not in decision["reason"]
+
+
+def test_phase_advance_retires_without_moving_either_pin(tmp_path, monkeypatch):
+    from fleetproof.checks import checks_tree_hash, spec_hash
+    from fleetproof.phase import retire_checks
+    _setup_project(tmp_path, [_WORKTREE_AHEAD, _MERGE_NOT_YET], monkeypatch)
+    (tmp_path / ".fleetproof" / "checks").mkdir()
+    (tmp_path / ".fleetproof" / "checks" / "grader.py").write_text("print(1)", encoding="utf-8")
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-phase")
+    spec_before, tree_before = spec_hash(), checks_tree_hash()
+    decision, _ = stop_gate()
+    assert decision["decision"] == "block"
+
+    retire_checks(["worktree-ahead"], "worktree merged and removed", by="bridge")
+    assert spec_hash() == spec_before
+    assert checks_tree_hash() == tree_before
+    decision, _ = stop_gate()
+    # merge-landed still fails, so the stop still blocks on IT — but the
+    # retired check is rendered as retired, not failed, and the persisted
+    # verdict carries both pins unchanged.
+    assert decision["decision"] == "block"
+    assert "worktree-ahead (" not in decision["reason"].split("Per-check")[0]
+    ctx = decision["hookSpecificOutput"]["additionalContext"]
+    assert "[retired] worktree-ahead: retired (phase advance: worktree merged and removed)" in ctx
+    latest = _verdict_payloads()[0]
+    assert latest["spec_sha256"] == spec_before
+    assert latest["tree_sha256"] == tree_before
+    assert [c["id"] for c in latest["checks"]] == ["merge-landed"]
+    assert latest["retired"][0]["note"] == "worktree merged and removed"
+
+
+def test_bridge_selection_emptied_by_retirement_is_not_the_zero_check_block(
+        tmp_path, monkeypatch):
+    from fleetproof.phase import retire_checks
+    _setup_project(tmp_path, [_FAIL], monkeypatch)
+    retire_checks(["bad"], "phase over", by="bridge")
+    decision, code = stop_gate()
+    assert decision is None and code == 0
+    latest = _verdict_payloads()[0]
+    assert latest["checks"] == [] and latest["retired"][0]["id"] == "bad"
+
+
+def test_subagent_predecessor_retired_by_session_evidence_before_grading(
+        tmp_path, monkeypatch, capsys):
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    from fleetproof.checker import run_checks
+    from fleetproof.checks import load_checks
+    lane_pred = dict(_WORKTREE_AHEAD, tier="lane")
+    lane_succ = dict(_MERGE_LANDED, tier="lane")
+    _spawn_with_intent(tmp_path, monkeypatch, None, spec=[lane_pred, lane_succ])
+    # The successor passed earlier this session, on record: the predecessor
+    # is retired before the gate runs anything, the successor runs and
+    # passes, and the verdict is a plain verified over the one check run.
+    run_checks([c for c in load_checks() if c.id == "merge-landed"], tier="lane")
+    _feed(monkeypatch, _stop_payload(message="Landed."))
+    assert subagent_stop_main() == 0
+    capsys.readouterr()
+    d = list_dispatches()[0]
+    assert d.verdict == "verified"
+    verdict_t = next(t for t in d.transitions if t.get("state") == "verified")
+    assert verdict_t["detail"] == "1/1 checks passed at tier lane"
+    assert _verdict_payloads()[0]["retired"][0]["id"] == "worktree-ahead"
+
+
+def test_subagent_selection_emptied_by_phase_advance_is_ungraded_not_verified(
+        tmp_path, monkeypatch, capsys):
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    from fleetproof.phase import retire_checks
+    _spawn_with_intent(tmp_path, monkeypatch, _intent_manifest(cmd_exit=1))
+    retire_checks(["m-widget"], "phase over", by="ops")
+    _feed(monkeypatch, _stop_payload(message="Done."))
+    assert subagent_stop_main() == 0
+    err = capsys.readouterr().err
+    assert "is retired (m-widget (phase advance: phase over))" in err
+    assert "stop allowed ungraded" in err
+    d = list_dispatches()[0]
+    assert d.state == "terminated"
+    assert d.verdict is None
+    assert d.terminated_ungraded is True
+
+
+def test_subagent_selection_emptied_by_mixed_retirement_is_ungraded(
+        tmp_path, monkeypatch, capsys):
+    # The predecessor is succeeded by evidence and the successor is retired
+    # by the operator after it passed: nothing is left to run, and the gate
+    # records no verdict — retirement is never manufactured into verified.
+    from fleetproof.checker import run_checks
+    from fleetproof.checks import load_checks
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    from fleetproof.phase import retire_checks
+    lane_pred = dict(_WORKTREE_AHEAD, tier="lane")
+    lane_succ = dict(_MERGE_LANDED, tier="lane")
+    _spawn_with_intent(tmp_path, monkeypatch, None, spec=[lane_pred, lane_succ])
+    run_checks([c for c in load_checks() if c.id == "merge-landed"], tier="lane")
+    retire_checks(["merge-landed"], "done with it", by="ops")
+    _feed(monkeypatch, _stop_payload(message="Landed."))
+    assert subagent_stop_main() == 0
+    err = capsys.readouterr().err
+    assert "worktree-ahead (succeeded by merge-landed)" in err
+    assert "merge-landed (phase advance: done with it)" in err
+    d = list_dispatches()[0]
+    assert d.verdict is None
+    assert d.terminated_ungraded is True

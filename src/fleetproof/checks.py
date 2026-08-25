@@ -134,6 +134,16 @@ class Check:
     # first failed to compile inside the checker would silently skip the
     # redaction it promised.
     redact: tuple[str, ...] = ()
+    # Phase succession: the id of another check in the same spec, at the same
+    # tier, that takes over from this one. Once the successor has passed in
+    # the current session, this check is retired — listed on the verdict as
+    # retired, never counted as failed — so a "worktree is ahead" check can
+    # hand off to a "merge landed on main" check without a spec edit at the
+    # moment the worktree disappears (observed in a field deployment on
+    # Windows). Validated at spec load: the target must exist, must not be
+    # this check, must share its tier, and the chain must not cycle. See
+    # :mod:`fleetproof.phase`. Additive: absent reads as None.
+    succeeded_by: str | None = None
 
     def describe_run(self) -> str | None:
         """The command for display: string form verbatim, argv form joined
@@ -277,7 +287,41 @@ def load_checks(path: Path | None = None) -> list[Check]:
             raise CheckSpecError(f"Duplicate check id: {check.id!r}")
         seen_ids.add(check.id)
         checks.append(check)
+    _validate_succession(checks)
     return checks
+
+
+def _validate_succession(checks: list[Check]) -> None:
+    """Every ``succeeded_by`` names another check in this spec, at the same
+    tier, and no chain of successors cycles. Raised here, at load, where the
+    error still has someone to land on — a dangling successor discovered in
+    a gate would either retire nothing (silently wrong) or crash the gate."""
+    by_id = {c.id: c for c in checks}
+    for check in checks:
+        target = check.succeeded_by
+        if target is None:
+            continue
+        if target == check.id:
+            raise CheckSpecError(
+                f"check {check.id!r}: 'succeeded_by' must name a different check.")
+        if target not in by_id:
+            raise CheckSpecError(
+                f"check {check.id!r}: 'succeeded_by' names {target!r}, which is "
+                "not a check in this spec.")
+        if by_id[target].tier != check.tier:
+            raise CheckSpecError(
+                f"check {check.id!r}: 'succeeded_by' {target!r} is at tier "
+                f"{by_id[target].tier!r}, not this check's tier {check.tier!r} — "
+                "a successor must be selected wherever its predecessor is.")
+    for check in checks:
+        seen = [check.id]
+        cursor = check.succeeded_by
+        while cursor is not None:
+            if cursor in seen:
+                raise CheckSpecError(
+                    "'succeeded_by' chain cycles: " + " -> ".join(seen + [cursor]) + ".")
+            seen.append(cursor)
+            cursor = by_id[cursor].succeeded_by
 
 
 # The key a dispatch manifest uses for its command. A manifest predates the
@@ -313,6 +357,11 @@ def parse_manifest_check(entry: Any, where: str) -> Check:
         raise CheckSpecError(
             f"{where}: 'tier' is not a manifest field — a manifest is graded at "
             "its own dispatch's tier.")
+    if "succeeded_by" in entry:
+        raise CheckSpecError(
+            f"{where}: 'succeeded_by' is not a manifest field — succession is "
+            "between checks of the repo spec; retire a manifest check with "
+            "`fleetproof phase advance --retire <id>` instead.")
     normalized = dict(entry)
     cmd = normalized.pop(MANIFEST_CMD_KEY, None)
     if cmd is None:
@@ -403,6 +452,12 @@ def _parse_check(entry: Any, index: int, *, where: str | None = None,
             raise CheckSpecError(
                 f"{where} ({cid}): 'redact'[{j}] is not a valid regex: {e}") from e
 
+    succeeded_by = entry.get("succeeded_by")
+    if succeeded_by is not None and (
+            not isinstance(succeeded_by, str) or not succeeded_by.strip()):
+        raise CheckSpecError(
+            f"{where} ({cid}): 'succeeded_by' must be a check id string or omitted.")
+
     expect = _normalize_expect(entry.get("expect", "exit0"), cid, where)
 
     # A file_exists check may have no command; every other kind needs one.
@@ -412,7 +467,8 @@ def _parse_check(entry: Any, index: int, *, where: str | None = None,
         )
 
     return Check(id=cid, run=run, expect=expect, block=block, description=description,
-                 tier=tier, owner=owner, redact=tuple(redact_raw))
+                 tier=tier, owner=owner, redact=tuple(redact_raw),
+                 succeeded_by=succeeded_by.strip() if succeeded_by else None)
 
 
 def _normalize_expect(expect: Any, cid: str, where: str) -> dict[str, Any]:

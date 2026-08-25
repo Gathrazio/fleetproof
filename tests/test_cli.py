@@ -1276,3 +1276,53 @@ def test_telemetry_summary_with_classifiable_rows_prints_neither_line(cli_runs, 
     assert "severity: no failures" in out  # the existing wording, unchanged
     assert main(["telemetry", "summary", "--format", "json"]) == 0
     assert json.loads(capsys.readouterr().out)["telemetry_era"] == "2026-01-01"
+
+
+# === phase verbs (C13) ===
+
+def test_phase_advance_status_reset(cli_runs, capsys):
+    assert main(["phase", "status"]) == 0
+    assert capsys.readouterr().out.strip() == "phase: nothing retired."
+    assert main(["phase", "advance", "--retire", "a", "--retire", "b", "--note", "over"]) == 0
+    out = capsys.readouterr().out
+    assert "phase advanced: retired a, b — over" in out
+    assert "trips no drift pin" in out
+    assert (cli_runs.parent / "phase.json").exists()
+    assert main(["phase", "status", "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert set(payload["retired"]) == {"a", "b"}
+    assert payload["retired"]["a"]["note"] == "over"
+    assert payload["in_spec"] == []  # no spec here
+    assert main(["phase", "status"]) == 0
+    out = capsys.readouterr().out
+    assert "2 retired check(s)" in out and "not in the current spec" in out
+    assert main(["phase", "reset"]) == 0
+    assert "phase reset: nothing retired" in capsys.readouterr().out
+    assert main(["phase", "status", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["retired"] == {}
+
+
+def test_phase_advance_requires_a_note(cli_runs, capsys):
+    with pytest.raises(SystemExit):
+        main(["phase", "advance", "--retire", "a"])
+    assert main(["phase", "advance", "--retire", "a", "--note", "  "]) == 2
+    assert "non-empty --note" in capsys.readouterr().err
+
+
+def test_check_cli_lists_a_retired_check_as_retired(cli_runs, tmp_path, capsys):
+    spec = tmp_path / "checks.json"
+    spec.write_text(json.dumps({"checks": [
+        {"id": "bad", "run": f'"{sys.executable}" -c "raise SystemExit(1)"'},
+        {"id": "ok", "run": f'"{sys.executable}" -c "raise SystemExit(0)"'},
+    ]}), encoding="utf-8")
+    assert main(["check", "--spec", str(spec)]) == 1
+    capsys.readouterr()
+    assert main(["phase", "advance", "--retire", "bad", "--note", "over"]) == 0
+    capsys.readouterr()
+    assert main(["check", "--spec", str(spec)]) == 0
+    out = capsys.readouterr().out
+    assert "[retired] bad: retired (phase advance: over)" in out
+    assert "[FAIL]" not in out
+    assert main(["check", "--spec", str(spec), "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verdict"] == "pass" and payload["retired"][0]["id"] == "bad"

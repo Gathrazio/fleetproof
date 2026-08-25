@@ -16,6 +16,7 @@ surface as it can. Subcommands:
     subagent-stop  SubagentStop-hook entry: the per-subagent report-and-verify gate
     arm       arm a gate (the default state); --tier bridge|coordinator
     disarm    set a gate to advisory; requires --note; --tier bridge|coordinator
+    phase     advance (retire checks, outside the hashed spec) / status / reset
     dispatch  ledger verbs: new / report / close / park a dispatch; intent
               writes the sidecar the SubagentStart capture consumes
     fleet     the dispatch board — every dispatch, its state, and whether it reported
@@ -84,6 +85,13 @@ from .hookgate import (
     stop_gate_main,
     subagent_start_main,
     subagent_stop_main,
+)
+from .phase import (
+    apply_phase,
+    load_phase,
+    phase_path,
+    reset_phase,
+    retire_checks,
 )
 from .ledger import (
     CAPTURE_CLI,
@@ -193,10 +201,14 @@ def _cmd_check(args: argparse.Namespace) -> int:
     # No gate ordered this run, so no arming governed it: state "n/a" on the
     # record, distinct from both "armed" and "advisory".
     arming = {"tier": args.tier, "state": ARMING_NOT_APPLICABLE, "note": None}
+    session_id = os.environ.get(SESSION_ID_ENV)
     try:
-        report = run_checks(checks, record_to_log=not args.no_record,
+        # Same phase rules as the gates: retired checks are listed, not run.
+        from .checker import select_checks
+        active, retired = apply_phase(select_checks(checks, args.tier), session_id)
+        report = run_checks(active, record_to_log=not args.no_record,
                             spec_path=spec_path, tier=args.tier, identity=identity,
-                            arming=arming)
+                            arming=arming, retired=retired)
     except ValueError as e:  # unknown tier
         _emit_error("bad_tier", str(e), args.format)
         return 2
@@ -204,7 +216,6 @@ def _cmd_check(args: argparse.Namespace) -> int:
     # Best-effort drift note: a bare CLI run usually has no session context (so
     # baseline is unresolvable and nothing is flagged), but when it runs inside a
     # Claude Code session the env carries the id and we can flag drift here too.
-    session_id = os.environ.get(SESSION_ID_ENV)
     drifted, baseline = spec_drifted(report.spec_sha256, session_id)
 
     if args.format == "json":
@@ -960,6 +971,72 @@ def _cmd_disarm(args: argparse.Namespace) -> int:
     return 0
 
 
+# === Phase succession verbs ===
+#
+# A closeout stop refused because a blocking check asserted on a worktree the
+# merge had just removed: the check outlived its phase the moment the work
+# landed, and swapping it was a spec edit — drift under every pinned dispatch
+# (observed in a field deployment on Windows). `phase advance` retires checks
+# in .fleetproof/phase.json, outside the hashed spec and the checks tree,
+# exactly like arming.json; `succeeded_by` in the spec does the same thing on
+# evidence instead of by hand. See fleetproof.phase.
+
+def _cmd_phase_advance(args: argparse.Namespace) -> int:
+    try:
+        path = retire_checks(list(args.retire or []), args.note or "")
+    except ValueError as e:
+        _emit_error("bad_phase", str(e), args.format)
+        return 2
+    state = load_phase()
+    if args.format == "json":
+        print(json.dumps({"ok": True, "retired": state["retired"], "path": str(path)},
+                         indent=2))
+        return 0
+    ids = ", ".join(args.retire)
+    print(f"phase advanced: retired {ids} — {(args.note or '').strip()}")
+    print(f"  recorded in {path} (outside the hashed spec and checks tree; "
+          "trips no drift pin).")
+    print("  a retired check is listed on every verdict as retired and never run; "
+          "`fleetproof phase reset` clears it.")
+    return 0
+
+
+def _cmd_phase_status(args: argparse.Namespace) -> int:
+    state = load_phase()
+    in_spec: set[str] = set()
+    try:
+        in_spec = {c.id for c in load_checks(Path(args.spec) if args.spec else None)}
+    except CheckSpecError:
+        pass
+    if args.format == "json":
+        payload = dict(state)
+        payload["path"] = str(phase_path())
+        payload["in_spec"] = sorted(cid for cid in state["retired"] if cid in in_spec)
+        print(json.dumps(payload, indent=2))
+        return 0
+    if not state["retired"]:
+        print("phase: nothing retired.")
+        return 0
+    print(f"phase: {len(state['retired'])} retired check(s) "
+          f"[{phase_path()}; last set {str(state.get('set_at') or '?')[:19]} "
+          f"by {state.get('by') or '?'}]")
+    for cid, meta in state["retired"].items():
+        where = "in spec" if cid in in_spec else "not in the current spec"
+        print(f"  {cid}: {meta.get('note') or 'no note'} "
+              f"[set {str(meta.get('at') or '?')[:19]} by {meta.get('by') or '?'}; {where}]")
+    print("re-activate all: fleetproof phase reset")
+    return 0
+
+
+def _cmd_phase_reset(args: argparse.Namespace) -> int:
+    path = reset_phase()
+    if args.format == "json":
+        print(json.dumps({"ok": True, "retired": {}, "path": str(path)}))
+    else:
+        print(f"phase reset: nothing retired ({path}).")
+    return 0
+
+
 def _arming_board_lines(arming: dict) -> list[str]:
     """The fleet board's echo of every disarmed gate — one line per tier,
     each with its own note. The armed default stays quiet."""
@@ -1337,6 +1414,32 @@ def build_parser() -> argparse.ArgumentParser:
                           metavar="{bridge,coordinator}", help=tier_help)
     _add_format(p_disarm)
     p_disarm.set_defaults(func=_cmd_disarm)
+
+    p_phase = sub.add_parser(
+        "phase",
+        help="Phase succession: retire checks outside the hashed spec "
+             "(advance), list retirements (status), clear them (reset).")
+    psub = p_phase.add_subparsers(dest="phase_command", required=True)
+    p_padv = psub.add_parser(
+        "advance",
+        help="Retire one or more checks: listed on every verdict as retired, "
+             "never run, never failed. Recorded in .fleetproof/phase.json — "
+             "outside the hashed spec and checks tree, so it trips no drift "
+             "pin. Requires --note.")
+    p_padv.add_argument("--retire", action="append", required=True, metavar="CHECK_ID",
+                        help="A check id to retire (repeatable).")
+    p_padv.add_argument("--note", required=True,
+                        help="Why this phase is over for these checks (required; "
+                             "recorded with who and when).")
+    _add_format(p_padv)
+    p_padv.set_defaults(func=_cmd_phase_advance)
+    p_pst = psub.add_parser("status", help="List the retired checks and their notes.")
+    p_pst.add_argument("--spec", default=None, help="Spec to compare against.")
+    _add_format(p_pst)
+    p_pst.set_defaults(func=_cmd_phase_status)
+    p_prs = psub.add_parser("reset", help="Clear every retirement (attributed, dated).")
+    _add_format(p_prs)
+    p_prs.set_defaults(func=_cmd_phase_reset)
 
     p_dispatch = sub.add_parser("dispatch", help="Dispatch-ledger verbs.")
     dsub = p_dispatch.add_subparsers(dest="dispatch_command", required=True)

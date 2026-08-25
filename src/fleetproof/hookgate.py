@@ -97,6 +97,7 @@ from .ledger import (
     record_verdict,
     ungraded_termination_line,
 )
+from .phase import apply_phase, format_retired_lines
 from .runlog import SESSION_ID_ENV, record, runs_dir
 from .telemetry import build_telemetry
 
@@ -370,9 +371,16 @@ def _spec_gate() -> tuple[str | None, str | None]:
             return reason, None
         return None, None
 
-    report = run_checks(checks, tier=TIER_BRIDGE,
+    # Phase succession (see fleetproof.phase): a bridge check whose successor
+    # has passed this session, or that an operator retired with `phase
+    # advance`, is listed as retired and not run. Applied to the selection,
+    # outside the hashed spec, so it trips no drift pin.
+    selected = select_checks(checks, TIER_BRIDGE)
+    active, retired = apply_phase(selected, session_id)
+    report = run_checks(active, tier=TIER_BRIDGE,
                         identity=_check_identity(None, None, TIER_BRIDGE, session_id),
-                        arming=_arming_stamp(TIER_BRIDGE, arming_state, advisory_note))
+                        arming=_arming_stamp(TIER_BRIDGE, arming_state, advisory_note),
+                        retired=retired)
 
     # Spec-drift check: did the checks.json that just graded this verdict differ
     # from the one the session's first verdict was graded against? An agent is
@@ -397,10 +405,13 @@ def _spec_gate() -> tuple[str | None, str | None]:
     else:
         drift_ctx = None
 
-    if report.total == 0 and any(c.block for c in checks):
+    if report.total == 0 and any(c.block for c in checks) and not report.retired:
         # The spec has blocking checks, yet none governs the bridge tier — every
         # check was tiered to a lower rung (finding C4: one word per check
-        # disables the gate). An absent grade is not a passing grade.
+        # disables the gate). An absent grade is not a passing grade. (A
+        # selection emptied by retirement is a different thing: every
+        # retirement is attributed on the persisted verdict, and the
+        # bridge's own checks did govern it — they stepped aside on record.)
         reason = (
             "FleetProof: no check in .fleetproof/checks.json governs the bridge "
             "tier — every blocking check is tiered to a lower rung, so this "
@@ -659,6 +670,8 @@ def _evidence_context(report) -> str:
     for r in report.results:
         status = "pass" if r.passed else ("FAIL" if r.blocking else "warn")
         parts.append(f"- [{status}] {r.id}: {r.detail}")
+    for line in format_retired_lines(getattr(report, "retired", None)):
+        parts.append("- " + line.strip())
     parts.append(f"Spec hash: {short_spec_hash(report.spec_sha256)}")
     if getattr(report, "cwd", None):
         parts.append(f"cwd: {report.cwd}")
@@ -1181,11 +1194,35 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     # (harness helper) should not blank a name the ledger already has.
     agent_type_known = (dispatch.agent or {}).get("agent_type") or agent_type
     arming_state, arming_note = tier_arming(load_arming(), dispatch.tier)
+
+    # Phase succession, after the drift decision (a retired check is still
+    # part of the pinned spec) and before grading: retired checks are listed,
+    # never run, never failed. A selection emptied by retirement records no
+    # verdict — terminated ungraded, said on stderr with every retirement
+    # named. (Succession alone can never empty it: a successor is selected
+    # wherever its predecessor is, so at least the successor runs; only an
+    # operator's phase advance can retire the last runnable check, and an
+    # absent grade is not a passing grade.)
+    active, retired = apply_phase(runnable, session_id)
+    if not active and retired:
+        listed = "; ".join(f"{e['id']} ({e['reason']})" for e in retired)
+        sys.stderr.write(
+            f"[fleetproof] every check selected for dispatch {dispatch.run_id} is "
+            f"retired ({listed}) — nothing runnable, stop allowed ungraded\n")
+        _try_close(dispatch.run_id)
+        _try_build_telemetry(
+            dispatch.run_id,
+            check_report=CheckReport(spec_sha256=spec_hash(), tier=dispatch.tier,
+                                     retired=retired),
+            checks=[])
+        return None, 0
+
     report = run_checks(
-        runnable, record_to_log=True, tier=dispatch.tier,
+        active, record_to_log=True, tier=dispatch.tier,
         identity=_check_identity(dispatch.run_id, agent_type_known, dispatch.tier,
                                  session_id),
-        arming=_arming_stamp(dispatch.tier, arming_state, arming_note))
+        arming=_arming_stamp(dispatch.tier, arming_state, arming_note),
+        retired=retired)
     if report.blocking_failures and arming_state == ADVISORY:
         # This tier's gate is disarmed: the failure is recorded and rendered
         # in full, and nothing blocks. The verdict is its own value —
