@@ -297,6 +297,16 @@ def set_arming(state: str, note: str = "", by: str | None = None,
     return path
 
 
+def _arming_stamp(tier: str | None, state: str, note: str) -> dict[str, Any]:
+    """The arming record a gate stamps onto the checker run it orders.
+
+    Persisted with the verdict so the evidence is self-contained: which
+    tier's arming governed it, armed or advisory, and the disarm note if any
+    (None when armed — an empty note is not a note).
+    """
+    return {"tier": tier, "state": state, "note": note or None}
+
+
 def _advisory_context(note: str, body: str, tier: str = TIER_BRIDGE) -> str:
     return (ADVISORY_MARKER_TEMPLATE.format(tier=tier, note=note or "no note recorded")
             + "\n" + body)
@@ -360,7 +370,8 @@ def _spec_gate() -> tuple[str | None, str | None]:
         return None, None
 
     report = run_checks(checks, tier=TIER_BRIDGE,
-                        identity=_check_identity(None, None, TIER_BRIDGE, session_id))
+                        identity=_check_identity(None, None, TIER_BRIDGE, session_id),
+                        arming=_arming_stamp(TIER_BRIDGE, arming_state, advisory_note))
 
     # Spec-drift check: did the checks.json that just graded this verdict differ
     # from the one the session's first verdict was graded against? An agent is
@@ -1171,7 +1182,8 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     report = run_checks(
         runnable, record_to_log=True, tier=dispatch.tier,
         identity=_check_identity(dispatch.run_id, agent_type_known, dispatch.tier,
-                                 session_id))
+                                 session_id),
+        arming=_arming_stamp(dispatch.tier, arming_state, arming_note))
     if report.blocking_failures and arming_state == ADVISORY:
         # This tier's gate is disarmed: the failure is recorded and rendered
         # in full, and nothing blocks. The verdict line says "advisory" first

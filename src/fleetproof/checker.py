@@ -147,6 +147,16 @@ class CheckReport:
     # produces a wall of false reds that is undiagnosable without it. Additive:
     # None on older records and on reports built without running.
     cwd: str | None = None
+    # The arming state that governed this verdict, stamped by the gate that
+    # ran it: {"tier": <tier graded>, "state": "armed"|"advisory"|"n/a",
+    # "note": <disarm note or None>}. Every bridge run in the field wrote
+    # ``advisory: false`` while the bridge gate was disarmed, because arming
+    # was applied in the gate and never persisted — six months on, ``verdict:
+    # fail, blocking_failed: 3`` in output.json reads as a gate that fired,
+    # and only a mutable, history-less arming.json knew otherwise (observed in
+    # a field deployment on Windows). ``state: "n/a"`` is the bare CLI: no
+    # gate, so no arming governed anything. Additive: None on older records.
+    arming: dict[str, Any] | None = None
 
     @property
     def total(self) -> int:
@@ -194,6 +204,7 @@ class CheckReport:
             "tree_sha256": self.tree_sha256,
             "tier": self.tier,
             "cwd": self.cwd,
+            "arming": self.arming,
             "summary": {
                 "total": self.total,
                 "passed": self.passed,
@@ -383,6 +394,7 @@ def run_checks(
     spec_path: Path | None = None,
     tier: str | None = None,
     identity: dict[str, Any] | None = None,
+    arming: dict[str, Any] | None = None,
 ) -> CheckReport:
     """Run every selected check and (by default) append the verdict to the run log.
 
@@ -408,6 +420,12 @@ def run_checks(
     pass the graded dispatch's run id, agent type, tier, and session; the
     bare CLI passes tier and session only; omitting it inherits the checker's
     own environment unchanged.
+
+    ``arming`` is stamped verbatim onto the persisted record (see
+    :attr:`CheckReport.arming`): the gate that ran the checks says which
+    tier's arming governed the verdict and whether it was armed or advisory,
+    so the evidence record is interpretable without the arming file as it
+    was at the time.
     """
     if checks is None:
         checks = load_checks(spec_path)
@@ -417,7 +435,7 @@ def run_checks(
     sha = spec_hash(resolved_spec)
 
     report = CheckReport(spec_sha256=sha, tree_sha256=checks_tree_hash(resolved_spec),
-                         tier=tier, cwd=str(work_dir))
+                         tier=tier, cwd=str(work_dir), arming=arming)
     env = check_env(identity)
     if not record_to_log:
         for check in checks:
@@ -536,7 +554,28 @@ def format_report_text(report: CheckReport) -> str:
     # Only surfaced when scoped, so untiered (v0.1) output is byte-identical.
     if report.tier:
         lines.append(f"tier: {report.tier}")
+    # Only surfaced when a gate disarmed it: an armed gate is the default and
+    # the bare CLI has no gate, so neither adds a line.
+    stamp = format_arming_stamp(report.arming)
+    if stamp and (report.arming or {}).get("state") == "advisory":
+        lines.append(stamp)
     return "\n".join(lines)
+
+
+def format_arming_stamp(arming: Any) -> str | None:
+    """One line rendering a persisted arming stamp, or None when absent.
+
+    Tolerates a non-dict (a poisoned record must not crash the reader).
+    """
+    if not isinstance(arming, dict):
+        return None
+    tier = arming.get("tier") or "?"
+    state = arming.get("state") or "?"
+    note = arming.get("note")
+    line = f"arming: {tier} gate {state}"
+    if note:
+        line += f" ({note})"
+    return line
 
 
 if __name__ == "__main__":  # pragma: no cover - manual smoke entry

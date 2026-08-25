@@ -369,6 +369,13 @@ refused with that sentence; a lane's stop is the claim being verified. The
 ledger sweep still blocks on stalled dispatches regardless of arming, and the
 abandonment ladder neither sees nor is reset by it.
 
+Every checker run a gate orders stamps the arming that governed it into its
+`output.json` — `"arming": {"tier": "bridge", "state": "advisory", "note":
+"publish phase"}` — and `fleetproof show <run>` renders it, so a `verdict:
+fail` in the evidence is readable as blocked-or-not without the arming file as
+it was at the time. A bare `fleetproof check` has no gate and records
+`"state": "n/a"`.
+
 **The graders are part of the spec.** The tree hash pins every file under
 `.fleetproof/checks/` alongside `checks.json` itself. A check whose grading
 logic lives in a script is only as trustworthy as that script's bytes, so a

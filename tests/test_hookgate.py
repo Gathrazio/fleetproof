@@ -2279,3 +2279,62 @@ def test_unknown_coordinator_value_arms_the_coordinator_alone(tmp_path, monkeypa
     arming = load_arming()
     assert arming["bridge"] == "advisory"
     assert arming["coordinator"] == "armed"
+
+
+# === the arming state is stamped into the persisted check record (C6) ===
+
+def _last_verdict_payload() -> dict:
+    for run in runlog.list_run_records():
+        for sub in run.sub_invocations:
+            if sub.tool == "fleetproof" and sub.subcmd == "check":
+                payload = sub.load_output()
+                if isinstance(payload, dict):
+                    return payload
+    return {}
+
+
+def test_disarmed_bridge_run_stamps_advisory_and_the_note(tmp_path, monkeypatch):
+    # Every bridge run in the field wrote advisory:false while the gate was
+    # disarmed (observed in a field deployment on Windows); the record now
+    # says which gate's arming governed it, and why it was down.
+    from fleetproof.hookgate import ADVISORY, set_arming
+    _setup_project(tmp_path, [_FAIL], monkeypatch)
+    set_arming(ADVISORY, note="publish phase")
+    decision, code = stop_gate()
+    assert "decision" not in decision
+    payload = _last_verdict_payload()
+    assert payload["verdict"] == "fail"
+    assert payload["arming"] == {"tier": "bridge", "state": "advisory",
+                                 "note": "publish phase"}
+
+
+def test_armed_bridge_run_stamps_armed(tmp_path, monkeypatch):
+    _setup_project(tmp_path, [_FAIL], monkeypatch)
+    decision, code = stop_gate()
+    assert decision["decision"] == "block"
+    assert _last_verdict_payload()["arming"] == {"tier": "bridge", "state": "armed",
+                                                 "note": None}
+
+
+def test_subagent_run_stamps_its_own_tier_arming(tmp_path, monkeypatch, capsys):
+    from fleetproof.hookgate import ADVISORY, set_arming, subagent_stop_main
+    _spawn_at_tier(tmp_path, monkeypatch, "coordinator", _intent_manifest(cmd_exit=1))
+    set_arming(ADVISORY, note="build phase", tier="coordinator")
+    set_arming(ADVISORY, note="publish phase", tier="bridge")  # not this run's gate
+    _feed(monkeypatch, _stop_payload(message="Coordinating."))
+    assert subagent_stop_main() == 0
+    capsys.readouterr()
+    assert _last_verdict_payload()["arming"] == {"tier": "coordinator", "state": "advisory",
+                                                 "note": "build phase"}
+
+
+def test_lane_run_stamps_armed_whatever_the_file_says(tmp_path, monkeypatch, capsys):
+    from fleetproof.hookgate import ADVISORY, set_arming, subagent_stop_main
+    _spawn_at_tier(tmp_path, monkeypatch, "lane", _intent_manifest(cmd_exit=0))
+    set_arming(ADVISORY, note="publish phase", tier="bridge")
+    set_arming(ADVISORY, note="build phase", tier="coordinator")
+    _feed(monkeypatch, _stop_payload(message="Lane done."))
+    assert subagent_stop_main() == 0
+    capsys.readouterr()
+    assert _last_verdict_payload()["arming"] == {"tier": "lane", "state": "armed",
+                                                 "note": None}

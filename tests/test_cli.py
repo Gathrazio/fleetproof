@@ -900,3 +900,59 @@ def test_fleet_json_carries_the_full_arming_when_any_tier_is_advisory(cli_runs, 
     payload = json.loads(capsys.readouterr().out)
     assert payload["arming"]["coordinator"] == "advisory"
     assert payload["arming"]["bridge"] == "armed"
+
+
+# === the CLI check records arming n/a; show renders the stamp (C6) ===
+
+def test_check_cli_records_arming_not_applicable_and_show_renders_it(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    runlog.set_runs_dir(tmp_path / "runs")
+    monkeypatch.delenv(runlog.RUN_ID_ENV, raising=False)
+    spec = tmp_path / "checks.json"
+    spec.write_text(json.dumps({"checks": [
+        {"id": "ok", "run": f'"{sys.executable}" -c "raise SystemExit(0)"'},
+    ]}), encoding="utf-8")
+    assert main(["check", "--spec", str(spec), "--tier", "lane", "--format", "json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["arming"] == {"tier": "lane", "state": "n/a", "note": None}
+
+    assert main(["show", out["run_id"]]) == 0
+    text = capsys.readouterr().out
+    assert "arming: lane gate n/a" in text
+    assert main(["show", out["run_id"], "--format", "json"]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["sub_invocations"][0]["arming"]["state"] == "n/a"
+
+
+def test_show_renders_a_disarmed_gate_run_with_its_note(tmp_path, monkeypatch, capsys):
+    from fleetproof.hookgate import ADVISORY, set_arming, stop_gate
+    monkeypatch.chdir(tmp_path)
+    marker = tmp_path / ".fleetproof"
+    marker.mkdir()
+    (marker / "checks.json").write_text(json.dumps({"checks": [
+        {"id": "bad", "run": f'"{sys.executable}" -c "raise SystemExit(1)"'},
+    ]}), encoding="utf-8")
+    runlog.set_runs_dir(marker / "runs")
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000010-show01")
+    set_arming(ADVISORY, note="publish phase")
+    stop_gate()
+    assert main(["show", "20260101-000010-show01"]) == 0
+    text = capsys.readouterr().out
+    assert "arming: bridge gate advisory (publish phase)" in text
+
+
+def test_show_tolerates_records_without_an_arming_stamp(tmp_path, monkeypatch, capsys):
+    # A 0.4.0 record has no arming key; show must render it as before.
+    monkeypatch.chdir(tmp_path)
+    rd = tmp_path / "runs"
+    runlog.set_runs_dir(rd)
+    sub = rd / "20260101-000011-old001" / "fleetproof-check-20260101-000011-000000"
+    sub.mkdir(parents=True)
+    (sub / "invocation.json").write_text(json.dumps(
+        {"tool": "fleetproof", "subcmd": "check"}), encoding="utf-8")
+    (sub / "result.json").write_text(json.dumps({"exit_code": 0}), encoding="utf-8")
+    (sub / "output.json").write_text(json.dumps({"verdict": "pass"}), encoding="utf-8")
+    assert main(["show", "20260101-000011-old001"]) == 0
+    text = capsys.readouterr().out
+    assert "fleetproof check" in text and "arming:" not in text

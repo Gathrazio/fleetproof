@@ -42,6 +42,7 @@ from . import __version__
 from .checker import (
     CHECK_ENV_SESSION_ID,
     CHECK_ENV_TIER,
+    format_arming_stamp,
     format_report_text,
     run_checks,
     spec_drifted,
@@ -122,6 +123,9 @@ _LIVENESS_WARNING = (
     "restarts.")
 _LIVENESS_UNKNOWN = "hooks-liveness unknown (not running under a hook session)."
 
+# The arming stamp a bare `fleetproof check` writes: no gate, so no arming.
+ARMING_NOT_APPLICABLE = "n/a"
+
 
 def _session_has_hook_evidence(session_id: str) -> bool:
     """True when this session left any record only a hook could have written."""
@@ -172,9 +176,13 @@ def _cmd_check(args: argparse.Namespace) -> int:
     # (empty when unknown); run id and agent type are left as inherited.
     identity = {CHECK_ENV_TIER: args.tier or "",
                 CHECK_ENV_SESSION_ID: os.environ.get(SESSION_ID_ENV) or ""}
+    # No gate ordered this run, so no arming governed it: state "n/a" on the
+    # record, distinct from both "armed" and "advisory".
+    arming = {"tier": args.tier, "state": ARMING_NOT_APPLICABLE, "note": None}
     try:
         report = run_checks(checks, record_to_log=not args.no_record,
-                            spec_path=spec_path, tier=args.tier, identity=identity)
+                            spec_path=spec_path, tier=args.tier, identity=identity,
+                            arming=arming)
     except ValueError as e:  # unknown tier
         _emit_error("bad_tier", str(e), args.format)
         return 2
@@ -264,6 +272,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
                     "duration_ms": s.duration_ms,
                     "exception_type": s.exception_type,
                     "record_dir": str(s.record_dir),
+                    "arming": _checker_arming(s),
                 }
                 for s in r.sub_invocations
             ],
@@ -280,7 +289,24 @@ def _cmd_show(args: argparse.Namespace) -> int:
             badge = "fail"
         dur = f"{s.duration_ms:.1f}ms" if s.duration_ms is not None else "?ms"
         print(f"  [{badge}] {s.tool} {s.subcmd} ({dur})  {s.record_dir}")
+        # A checker verdict says which gate's arming governed it, every
+        # time — a reader six months on must not need arming.json as it was.
+        stamp = format_arming_stamp(_checker_arming(s))
+        if stamp:
+            print(f"        {stamp}")
     return 0
+
+
+def _checker_arming(sub) -> dict | None:
+    """The arming stamp on a checker sub-invocation's output.json, or None
+    (older records, non-checker invocations, unreadable output)."""
+    if sub.tool != "fleetproof" or sub.subcmd != "check":
+        return None
+    payload = sub.load_output()
+    if not isinstance(payload, dict):
+        return None
+    arming = payload.get("arming")
+    return arming if isinstance(arming, dict) else None
 
 
 def _cmd_report(args: argparse.Namespace) -> int:
