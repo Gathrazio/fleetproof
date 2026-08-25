@@ -40,20 +40,26 @@ os.environ.setdefault("FLEETPROOF_NO_RECORD", "1")
 
 from . import __version__
 from .checker import (
+    CHECK_ENV_AGENT_TYPE,
+    CHECK_ENV_RUN_ID,
     CHECK_ENV_SESSION_ID,
     CHECK_ENV_TIER,
+    check_env,
     format_arming_stamp,
     format_report_text,
+    run_check,
     run_checks,
     spec_drifted,
 )
 from .checks import (
+    Check,
     CheckSpecError,
     SPEC_DRIFT_NOTE,
     STARTER_SPEC,
     VALID_TIERS,
     default_checks_path,
     load_checks,
+    parse_manifest_check,
     short_spec_hash,
 )
 from .hookgate import (
@@ -402,6 +408,128 @@ def _load_json_file(path: str, label: str) -> dict:
     return data
 
 
+# === Preflight: see the grader run before the work is pinned to it ===
+#
+# A blocking check demanded a health field that had never existed, its
+# positive control was a sample its own author wrote, and the lane renamed a
+# production field to satisfy it (observed in a field deployment on Windows).
+# Nothing in the tool showed the author what the command actually was and
+# what the target actually emitted before the intent was pinned. Preflight
+# does exactly that and nothing else: it runs each manifest check now, from
+# the project root, with the runner the gate uses, and prints the resolved
+# command line, the exit code, the expectation, PASS/FAIL, and a redacted
+# output tail. It records nothing under runs/ — the work has not happened
+# yet, most checks are expected to fail, and a preview is not evidence.
+
+_PREFLIGHT_CLOSING = (
+    "A positive control must be a captured real emission, never authored by "
+    "the check's author.")
+_PREFLIGHT_TAIL_LINES = 8
+
+
+def _manifest_checks_strict(manifest: dict | None) -> list[Check]:
+    """Every manifest check parsed with the gate's parser; the first malformed
+    entry raises :class:`CheckSpecError` naming it. Authoring time is where
+    a malformed check still has someone to land on — the gate would skip it
+    with a stderr line nobody reads."""
+    entries = (manifest or {}).get("checks") or []
+    if not isinstance(entries, list):
+        raise CheckSpecError("manifest.checks must be an array")
+    out: list[Check] = []
+    seen: set[str] = set()
+    for i, entry in enumerate(entries):
+        check = parse_manifest_check(entry, f"manifest check [{i}]")
+        if check.id in seen:
+            raise CheckSpecError(f"manifest check [{i}]: duplicate id {check.id!r}")
+        seen.add(check.id)
+        out.append(check)
+    return out
+
+
+def _describe_command(check: Check) -> tuple[str, str]:
+    """``(form, rendered)``: the exact command as the runner will see it.
+    Argv form is rendered as a JSON array — the one rendering that is
+    re-parseable into the argv it came from."""
+    if check.run is None:
+        return "none", "(no command; file_exists only)"
+    if isinstance(check.run, str):
+        return "shell", check.run
+    return "argv", json.dumps(check.run)
+
+
+def _tail_lines(text: str, limit: int = _PREFLIGHT_TAIL_LINES) -> list[str]:
+    lines = text.rstrip("\r\n").splitlines()
+    if len(lines) <= limit:
+        return lines
+    return ["...(" + str(len(lines) - limit) + " earlier line(s) omitted)"] + lines[-limit:]
+
+
+def _preflight_manifest(checks: list[Check], *, tier: str | None,
+                        agent_type: str | None) -> list[dict]:
+    """Run every manifest check now, as the gate would, recording nothing.
+
+    Same runner (:func:`fleetproof.checker.run_check`), same cwd (the
+    resolved project root), same argv-or-shell as declared, same identity
+    environment the gate would set — except the run id, which does not
+    exist yet and is the empty string. Output tails are the checker's own
+    redacted tails, so a preview leaks nothing a verdict would not.
+    """
+    root = project_root()
+    env = check_env({
+        CHECK_ENV_RUN_ID: "",
+        CHECK_ENV_AGENT_TYPE: agent_type or "",
+        CHECK_ENV_TIER: tier or "",
+        CHECK_ENV_SESSION_ID: os.environ.get(SESSION_ID_ENV) or "",
+    })
+    results = []
+    for check in checks:
+        form, rendered = _describe_command(check)
+        result = run_check(check, root, env=env)
+        results.append({
+            "id": check.id,
+            "blocking": check.block,
+            "owner": check.owner,
+            "form": form,
+            "command": rendered,
+            "expectation": result.expectation,
+            "returncode": result.returncode,
+            "passed": result.passed,
+            "detail": result.detail,
+            "stdout_tail": result.stdout_tail,
+            "stderr_tail": result.stderr_tail,
+            "duration_ms": result.duration_ms,
+        })
+    return results
+
+
+def _render_preflight(results: list[dict]) -> str:
+    root = project_root()
+    lines = [f"preflight: {len(results)} manifest check(s), run now from {root} "
+             "as the gate would; nothing recorded"]
+    for r in results:
+        mark = "PASS" if r["passed"] else "FAIL"
+        kind = "blocking" if r["blocking"] else "advisory"
+        if r["owner"]:
+            kind += f", owner: {r['owner']}"
+        lines.append(f"[{mark}] {r['id']}  ({kind})")
+        lines.append(f"  {r['form'] + ':':<8}{r['command']}")
+        lines.append(f"  expect: {r['expectation']}")
+        code = "none (did not complete)" if r["returncode"] is None else str(r["returncode"])
+        lines.append(f"  exit:   {code}  -> {r['detail']}")
+        for stream in ("stdout", "stderr"):
+            tail = _tail_lines(r[f"{stream}_tail"])
+            if not tail:
+                lines.append(f"  {stream}: (empty)")
+                continue
+            lines.append(f"  {stream}: | {tail[0]}")
+            lines.extend(f"          | {line}" for line in tail[1:])
+    passed = sum(1 for r in results if r["passed"])
+    lines.append(f"preflight: {passed} passed, {len(results) - passed} failed of "
+                 f"{len(results)} - a preview only; nothing was recorded under runs/.")
+    lines.append(_PREFLIGHT_CLOSING)
+    return "\n".join(lines)
+
+
 # `dispatch new` from a shell with no session id. The dispatch is still
 # recorded — the ledger records what happened — but the operator is told what
 # that record can and cannot do.
@@ -431,6 +559,20 @@ def _cmd_dispatch_new(args: argparse.Namespace) -> int:
         inner = manifest.get("manifest")
         if isinstance(inner, dict):
             manifest = inner
+
+    preflight = None
+    if getattr(args, "preflight", False):
+        if manifest is None:
+            _emit_error("bad_preflight", "--preflight needs --manifest: there are no "
+                        "manifest checks to run.", args.format)
+            return 2
+        try:
+            checks = _manifest_checks_strict(manifest)
+        except CheckSpecError as e:
+            _emit_error("bad_manifest_check", str(e), args.format)
+            return 2
+        preflight = _preflight_manifest(
+            checks, tier=args.tier, agent_type=getattr(args, "agent_name", None))
 
     # --agent-name makes the dispatch joinable: the agent block records the
     # spawn name the harness will report as agent_type, with a null agent_id
@@ -464,9 +606,14 @@ def _cmd_dispatch_new(args: argparse.Namespace) -> int:
 
     record = load_dispatch(run_id)
     if args.format == "json":
-        print(json.dumps(record.to_dict() if record else {"run_id": run_id}, indent=2))
+        payload = record.to_dict() if record else {"run_id": run_id}
+        if preflight is not None:
+            payload["preflight"] = preflight
+        print(json.dumps(payload, indent=2))
     else:
         print(run_id)
+        if preflight is not None:
+            print(_render_preflight(preflight))
     return 0
 
 
@@ -479,6 +626,13 @@ def _cmd_dispatch_intent(args: argparse.Namespace) -> int:
     validated here where an error still has someone to land on, and the printed
     path is the audit surface: the file that will vanish when the spawn
     consumes it.
+
+    ``--preflight`` additionally parses every manifest check with the gate's
+    parser (a malformed one is an error here, not a skipped line in a hook's
+    stderr) and, after the sidecar is written, runs each check now and prints
+    what the gate will see — see :func:`_preflight_manifest`. Nothing is
+    recorded; the exit code is 0 whatever the checks did, because a preview
+    of graders that mostly cannot pass yet is the point, not a failure.
     """
     try:
         # utf-8-sig for the same reason as _resolve_prompt: strip a
@@ -502,17 +656,35 @@ def _cmd_dispatch_intent(args: argparse.Namespace) -> int:
         if isinstance(inner, dict):
             manifest = inner
 
+    checks: list[Check] = []
+    if args.preflight:
+        # Parsed before the sidecar is written: a malformed check is refused
+        # here, where the author is still in the seat to fix it.
+        try:
+            checks = _manifest_checks_strict(manifest)
+        except CheckSpecError as e:
+            _emit_error("bad_manifest_check", str(e), args.format)
+            return 2
+
     try:
         path = write_intent(args.agent, prompt, manifest=manifest, tier=args.tier,
                             role=args.role)
     except LedgerError as e:
         _emit_error("ledger_error", str(e), args.format)
         return 1
+
+    preflight = None
+    if args.preflight:
+        preflight = _preflight_manifest(checks, tier=args.tier, agent_type=args.agent)
     if args.format == "json":
-        print(json.dumps({"ok": True, "agent_type": args.agent,
-                          "intent_path": str(path)}))
+        payload = {"ok": True, "agent_type": args.agent, "intent_path": str(path)}
+        if preflight is not None:
+            payload["preflight"] = preflight
+        print(json.dumps(payload, indent=2 if preflight is not None else None))
     else:
         print(str(path))
+        if preflight is not None:
+            print(_render_preflight(preflight))
     return 0
 
 
@@ -1005,6 +1177,12 @@ def build_parser() -> argparse.ArgumentParser:
                              f"{SESSION_ID_ENV} from the environment). Without "
                              "one the dispatch is recorded session-less, which "
                              "no hook stop can ever adopt; a warning says so.")
+    p_dnew.add_argument("--preflight", action="store_true",
+                        help="Run every manifest check now, from the project root, exactly as the "
+                             "gate would, and print the resolved command, exit code, "
+                             "expectation, PASS/FAIL, and an output tail per check. Records "
+                             "nothing; exits 0 whatever the checks did (it is a preview), "
+                             "non-zero on a malformed check." + " Needs --manifest.")
     _add_format(p_dnew)
     p_dnew.set_defaults(func=_cmd_dispatch_new)
 
@@ -1025,6 +1203,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Second match key: a spawn whose agent_type equals "
                              "this exactly consumes the intent even when the "
                              "filename does not match.")
+    p_dint.add_argument("--preflight", action="store_true",
+                        help="Run every manifest check now, from the project root, exactly as the "
+                             "gate would, and print the resolved command, exit code, "
+                             "expectation, PASS/FAIL, and an output tail per check. Records "
+                             "nothing; exits 0 whatever the checks did (it is a preview), "
+                             "non-zero on a malformed check.")
     _add_format(p_dint)
     p_dint.set_defaults(func=_cmd_dispatch_intent)
 

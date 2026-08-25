@@ -324,6 +324,21 @@ spawn: the row should show the real prompt and a `tier!`. A `lane?` means no
 intent matched — the dispatch is running with a placeholder prompt at a
 defaulted tier, and the capture you thought you declared didn't happen.
 
+**See the grader run before you pin it.** `fleetproof dispatch intent
+--preflight` (and `dispatch new --manifest ... --preflight`) runs every
+manifest check right now, from the project root, with the runner the gate
+uses, and prints per check the exact command line as the runner sees it, the
+exit code, the expectation, PASS/FAIL, and a redacted stdout/stderr tail.
+Nothing is recorded under `runs/` and the exit code is 0 whatever the checks
+did: the work has not happened yet, most checks are expected to fail, and the
+point is to watch the command meet the real target — a grader demanding a
+field the target has never emitted is visible here, before an agent with a
+deploy path and a deadline is pointed at it. A malformed check is an error at
+this step, not a skipped line in a hook's stderr. And the line preflight
+closes with is the rule that would have caught the field's deployed mistake:
+a positive control must be a captured real emission, never authored by the
+check's author.
+
 **Never dispatch an agent against a blocking check its seat cannot satisfy.**
 A lane gated on something only the bridge or the operator can do will fail,
 retry, and fail again — the gate is working; the dispatch was wrong. Declare

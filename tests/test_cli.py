@@ -956,3 +956,126 @@ def test_show_tolerates_records_without_an_arming_stamp(tmp_path, monkeypatch, c
     assert main(["show", "20260101-000011-old001"]) == 0
     text = capsys.readouterr().out
     assert "fleetproof check" in text and "arming:" not in text
+
+
+# === dispatch intent / new --preflight (C11) ===
+
+def _preflight_manifest_file(tmp_path: Path) -> Path:
+    mf = tmp_path / "manifest.json"
+    mf.write_text(json.dumps({"manifest": {
+        "deliverables": ["health field"],
+        "checks": [
+            {"id": "m-ok", "cmd": [sys.executable, "-c", "print('checked=true days_remaining=67')"],
+             "expect": {"regex": "days_remaining=\\d+"}},
+            {"id": "m-bad", "cmd": f'"{sys.executable}" -c "import sys; print(\'FAIL: '
+                                   f'sati_cert.days_until_expiry missing\'); sys.exit(5)"'},
+        ],
+        "check_map": {"health field": ["m-ok", "m-bad"]},
+    }}), encoding="utf-8")
+    return mf
+
+
+def test_dispatch_intent_preflight_renders_both_checks_and_records_nothing(
+        cli_runs, tmp_path, capsys):
+    # The authoring-time surface the field lacked: the exact command, its
+    # exit, the expectation, and what the target emitted - before pinning.
+    pf = tmp_path / "prompt.md"
+    pf.write_text("ensure the health field", encoding="utf-8")
+    mf = _preflight_manifest_file(tmp_path)
+    assert main(["dispatch", "intent", "--agent", "tcn", "--prompt-file", str(pf),
+                 "--manifest", str(mf), "--tier", "lane", "--preflight"]) == 0
+    out = capsys.readouterr().out
+    first, rest = out.split("\n", 1)
+    assert Path(first).name == "tcn.json" and Path(first).exists()  # sidecar written
+    assert "preflight: 2 manifest check(s)" in rest
+    assert "[PASS] m-ok  (blocking)" in rest
+    assert "argv:   [" in rest and "days_remaining=67" in rest
+    assert "expect: output matches /days_remaining=\\d+/" in rest
+    assert "[FAIL] m-bad  (blocking)" in rest
+    assert "shell:  " in rest
+    assert "exit:   5  -> exit 5 (expected 0)" in rest
+    assert "stdout: | FAIL: sati_cert.days_until_expiry missing" in rest
+    assert "preflight: 1 passed, 1 failed of 2 - a preview only" in rest
+    assert rest.rstrip().endswith(
+        "A positive control must be a captured real emission, never authored by "
+        "the check's author.")
+    # Nothing under runs/: the work has not happened yet.
+    assert not any(p.is_dir() and not p.name.startswith(".") for p in cli_runs.iterdir()) \
+        if cli_runs.exists() else True
+    assert runlog.list_run_records() == []
+
+
+def test_dispatch_intent_preflight_refuses_a_malformed_check_before_writing(
+        cli_runs, tmp_path, capsys):
+    pf = tmp_path / "prompt.md"
+    pf.write_text("work", encoding="utf-8")
+    mf = tmp_path / "manifest.json"
+    mf.write_text(json.dumps({"checks": [
+        {"id": "m-bad", "cmd": "echo a\necho b"}]}), encoding="utf-8")
+    assert main(["dispatch", "intent", "--agent", "tcn", "--prompt-file", str(pf),
+                 "--manifest", str(mf), "--preflight"]) == 2
+    err = capsys.readouterr().err
+    assert "manifest check [0] (m-bad): 'cmd' must be a single line" in err
+    from fleetproof.ledger import intents_dir
+    assert not (intents_dir() / "tcn.json").exists()
+
+
+def test_dispatch_intent_without_preflight_still_writes_a_manifest_with_a_bad_check(
+        cli_runs, tmp_path, capsys):
+    # Unchanged 0.4.0 posture: the gate skips it loudly at stop time.
+    pf = tmp_path / "prompt.md"
+    pf.write_text("work", encoding="utf-8")
+    mf = tmp_path / "manifest.json"
+    mf.write_text(json.dumps({"checks": [{"id": "m-bad", "cmd": "echo a\necho b"}]}),
+                  encoding="utf-8")
+    assert main(["dispatch", "intent", "--agent", "tcn", "--prompt-file", str(pf),
+                 "--manifest", str(mf)]) == 0
+
+
+def test_dispatch_intent_preflight_json_carries_the_results(cli_runs, tmp_path, capsys):
+    pf = tmp_path / "prompt.md"
+    pf.write_text("work", encoding="utf-8")
+    mf = _preflight_manifest_file(tmp_path)
+    assert main(["dispatch", "intent", "--agent", "tcn", "--prompt-file", str(pf),
+                 "--manifest", str(mf), "--preflight", "--format", "json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert [(r["id"], r["passed"], r["returncode"]) for r in out["preflight"]] == [
+        ("m-ok", True, 0), ("m-bad", False, 5)]
+    assert out["preflight"][1]["form"] == "shell"
+
+
+def test_preflight_checks_see_the_identity_env_with_an_empty_run_id(
+        cli_runs, tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-pre")
+    pf = tmp_path / "prompt.md"
+    pf.write_text("work", encoding="utf-8")
+    mf = tmp_path / "manifest.json"
+    mf.write_text(json.dumps({"checks": [{"id": "echo", "cmd": [
+        sys.executable, "-c",
+        "import os; print(repr(os.environ['FLEETPROOF_RUN_ID']), "
+        "os.environ['FLEETPROOF_AGENT_TYPE'], os.environ['FLEETPROOF_TIER'], "
+        "os.environ['FLEETPROOF_SESSION_ID'])"]}]}), encoding="utf-8")
+    assert main(["dispatch", "intent", "--agent", "tcn", "--prompt-file", str(pf),
+                 "--manifest", str(mf), "--tier", "lane", "--preflight"]) == 0
+    assert "stdout: | '' tcn lane sess-pre" in capsys.readouterr().out
+
+
+def test_dispatch_new_preflight_shares_the_code_path(cli_runs, tmp_path, capsys):
+    mf = _preflight_manifest_file(tmp_path)
+    assert main(["dispatch", "new", "--prompt", "p", "--manifest", str(mf),
+                 "--agent-name", "tcn", "--preflight", "--session-id", "s1"]) == 0
+    out = capsys.readouterr().out
+    run_id = out.split("\n", 1)[0]
+    assert "[PASS] m-ok" in out and "[FAIL] m-bad" in out
+    # The dispatch itself is recorded (that is what `new` does); no checker
+    # run is.
+    from fleetproof.ledger import load_dispatch
+    assert load_dispatch(run_id) is not None
+    assert not any(s.subcmd == "check" for r in runlog.list_run_records()
+                   for s in r.sub_invocations)
+
+
+def test_dispatch_new_preflight_needs_a_manifest(cli_runs, capsys):
+    assert main(["dispatch", "new", "--prompt", "p", "--preflight"]) == 2
+    assert "--preflight needs --manifest" in capsys.readouterr().err
