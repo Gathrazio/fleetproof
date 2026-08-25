@@ -1280,6 +1280,47 @@ def test_malformed_manifest_check_entries_are_skipped_loudly(
     assert list_dispatches()[0].verdict == "verified"
 
 
+def test_manifest_check_cmd_may_be_an_argv_list(tmp_path, monkeypatch, capsys):
+    # B5 reaches the manifest too: an argv-form cmd runs without a shell, and
+    # its metacharacter argument arrives literally.
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    manifest = _intent_manifest(cmd_exit=0)
+    manifest["checks"] = [{
+        "id": "m-argv",
+        "cmd": [sys.executable, "-c",
+                "import sys; raise SystemExit(0 if sys.argv[1] == 'a && b' else 1)",
+                "a && b"],
+    }]
+    manifest["check_map"] = {"the widget refactor": ["m-argv"]}
+    _spawn_with_intent(tmp_path, monkeypatch, manifest)
+
+    _feed(monkeypatch, _stop_payload(message="Done, shell-free."))
+    assert subagent_stop_main() == 0
+    assert capsys.readouterr().out == ""
+
+    assert _graded_check_ids() == ["m-argv"]
+    assert list_dispatches()[0].verdict == "verified"
+
+
+def test_malformed_argv_manifest_cmd_is_skipped_loudly(tmp_path, monkeypatch, capsys):
+    from fleetproof.hookgate import subagent_stop_main
+    manifest = _intent_manifest(cmd_exit=0)
+    manifest["checks"] = [
+        {"id": "empty-argv", "cmd": []},
+        {"id": "non-string-argv", "cmd": ["python", 3]},
+        {"id": "multiline-argv", "cmd": ["python", "-c", "x\ny"]},
+    ] + manifest["checks"]
+    _spawn_with_intent(tmp_path, monkeypatch, manifest)
+
+    _feed(monkeypatch, _stop_payload(message="Done."))
+    assert subagent_stop_main() == 0
+    err = capsys.readouterr().err
+    assert "skipped" in err
+
+    assert _graded_check_ids() == ["m-widget"]  # only the well-formed entry ran
+
+
 def test_read_hook_input_tolerates_utf8_bom(monkeypatch):
     # Some shells prepend a BOM when piping; losing the payload would silently
     # lose session grouping and drift detection.

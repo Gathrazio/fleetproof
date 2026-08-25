@@ -319,6 +319,36 @@ def test_no_drift_without_session_context(tmp_runs, tmp_path):
     assert spec_drifted(report.spec_sha256, None) == (False, None)
 
 
+# === argv-form runner (B5: no shell unless the spec asked for one) ===
+
+def test_argv_run_executes_without_a_shell(tmp_project):
+    # Shell metacharacters pass through as one literal argument: with
+    # shell=True on Windows, cmd.exe would split this on '&&' and the echoed
+    # text would never contain it.
+    r = run_check(
+        _check("argv", run=[sys.executable, "-c", "import sys; print(sys.argv[1])",
+                            "literal && not-a-chain"],
+               expect={"kind": "regex", "pattern": r"literal && not-a-chain"}),
+        tmp_project,
+    )
+    assert r.passed is True
+
+
+def test_argv_run_exit_codes_grade_as_usual(tmp_project):
+    ok = run_check(_check("ok", run=[sys.executable, "-c", "raise SystemExit(0)"]),
+                   tmp_project)
+    bad = run_check(_check("bad", run=[sys.executable, "-c", "raise SystemExit(1)"]),
+                    tmp_project)
+    assert ok.passed is True
+    assert bad.passed is False
+
+
+def test_argv_run_unlaunchable_is_a_failure(tmp_project):
+    r = run_check(_check("gone", run=["no-such-binary-fleetproof-test"]), tmp_project)
+    assert r.passed is False
+    assert r.returncode is None
+
+
 # === check ownership (B4: a blocking check must be satisfiable by its seat) ===
 
 def test_owned_check_failing_away_from_its_seat_grades_advisory(tmp_project):

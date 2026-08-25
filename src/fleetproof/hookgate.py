@@ -720,14 +720,41 @@ def _try_build_telemetry(run_id: str, check_report=None, checks=None) -> None:
         sys.stderr.write(f"[fleetproof] telemetry build failed for {run_id}: {e}\n")
 
 
+def _usable_manifest_cmd(cmd: Any) -> str | None:
+    """None when ``cmd`` is a runnable manifest command, else why it is not.
+
+    Mirrors the spec loader's rules for ``run``: a single-line string (shell
+    form, finding H5 — cmd.exe executes only the first line), or an argv array
+    of single-line strings (shell-free form, same as a spec check's argv
+    ``run``).
+    """
+    if isinstance(cmd, str):
+        if not cmd.strip():
+            return "'cmd' must not be blank"
+        if "\n" in cmd or "\r" in cmd:
+            return "'cmd' must be a single line"
+        return None
+    if isinstance(cmd, list):
+        if not cmd:
+            return "argv-form 'cmd' needs at least one element"
+        for j, element in enumerate(cmd):
+            if not isinstance(element, str):
+                return f"'cmd'[{j}] must be a string"
+            if "\n" in element or "\r" in element:
+                return f"'cmd'[{j}] must be a single line"
+        return None
+    return "'cmd' must be a string or an array of strings"
+
+
 def _manifest_checks(dispatch) -> list[Check]:
     """Runnable blocking checks declared on the dispatch's own manifest.
 
     A manifest check is an ``{"id", "cmd"}`` entry: always blocking, always
-    expect-exit0. The richer expectation kinds stay a ``checks.json`` feature —
-    the manifest is a per-dispatch contract, and its checks exist so a
-    manifest-bearing dispatch can grade without pre-registering into the
-    spec-hash-pinned repo file.
+    expect-exit0, with ``cmd`` either a shell line or an argv array — the same
+    two forms a spec check's ``run`` takes. The richer expectation kinds stay
+    a ``checks.json`` feature — the manifest is a per-dispatch contract, and
+    its checks exist so a manifest-bearing dispatch can grade without
+    pre-registering into the spec-hash-pinned repo file.
 
     An entry that is not that shape is skipped with a stderr note rather than
     run half-parsed. A skipped check is never a passing check: its id never
@@ -745,15 +772,12 @@ def _manifest_checks(dispatch) -> list[Check]:
             sys.stderr.write(f"[fleetproof] {where} is not an object; skipped\n")
             continue
         cid, cmd = entry.get("id"), entry.get("cmd")
-        if not isinstance(cid, str) or not cid or not isinstance(cmd, str) or not cmd.strip():
-            sys.stderr.write(
-                f"[fleetproof] {where} needs a string 'id' and 'cmd'; skipped\n")
+        if not isinstance(cid, str) or not cid:
+            sys.stderr.write(f"[fleetproof] {where} needs a string 'id'; skipped\n")
             continue
-        if "\n" in cmd or "\r" in cmd:
-            # Same rule the spec loader enforces (finding H5): cmd.exe executes
-            # only the first line, and a check that half-runs is worse than one
-            # that never runs.
-            sys.stderr.write(f"[fleetproof] {where}: 'cmd' must be a single line; skipped\n")
+        problem = _usable_manifest_cmd(cmd)
+        if problem is not None:
+            sys.stderr.write(f"[fleetproof] {where}: {problem}; skipped\n")
             continue
         if cid in seen:
             continue

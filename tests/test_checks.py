@@ -107,6 +107,46 @@ def test_non_string_tier_raises(tmp_path):
         load_checks(p)
 
 
+# === argv-form run (B5: no shell unless the spec asked for one) ===
+
+def test_argv_run_parsed_and_recorded_verbatim(tmp_path):
+    p = _write(tmp_path, {"checks": [
+        {"id": "a", "run": ["python", "-m", "pytest", "-q"]},
+    ]})
+    check = load_checks(p)[0]
+    assert check.run == ["python", "-m", "pytest", "-q"]
+    assert check.describe_run() == "python -m pytest -q"
+
+
+def test_string_run_describes_verbatim(tmp_path):
+    p = _write(tmp_path, {"checks": [{"id": "a", "run": "pytest -q && echo done"}]})
+    assert load_checks(p)[0].describe_run() == "pytest -q && echo done"
+
+
+def test_empty_argv_run_raises(tmp_path):
+    p = _write(tmp_path, {"checks": [{"id": "a", "run": []}]})
+    with pytest.raises(CheckSpecError):
+        load_checks(p)
+
+
+def test_non_string_argv_element_raises(tmp_path):
+    p = _write(tmp_path, {"checks": [{"id": "a", "run": ["python", 3]}]})
+    with pytest.raises(CheckSpecError):
+        load_checks(p)
+
+
+def test_multiline_argv_element_raises(tmp_path):
+    p = _write(tmp_path, {"checks": [{"id": "a", "run": ["python", "-c", "x\ny"]}]})
+    with pytest.raises(CheckSpecError):
+        load_checks(p)
+
+
+def test_non_string_non_list_run_raises(tmp_path):
+    p = _write(tmp_path, {"checks": [{"id": "a", "run": 42}]})
+    with pytest.raises(CheckSpecError):
+        load_checks(p)
+
+
 # === optional owner field (B4: who can actually satisfy this check) ===
 
 def test_owner_absent_reads_back_as_none(tmp_path):

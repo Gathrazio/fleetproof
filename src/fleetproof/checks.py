@@ -28,6 +28,11 @@ gated, at every gate — scoping untiered checks to the bridge alone left the
 default subagent gate grading nothing at all (adversarial pass, finding C1).
 Narrowing a check to one rung is an explicit act: write the tier.
 
+``run`` is a shell command line (string) or an argv array (list of single-line
+strings). The array form executes with no shell involved at all — no cmd.exe
+quoting rules — and is the right form whenever an argument could be mistaken
+for a shell metacharacter.
+
 ``expect`` is one of:
     "exit0"                        command must exit 0 (default if omitted)
     {"exit": N}                    command must exit with code N
@@ -91,7 +96,10 @@ class CheckSpecError(Exception):
 class Check:
     """One declared check. Immutable — the spec is a contract, not a scratchpad."""
     id: str
-    run: str | None
+    # A shell command line (string, run through the platform shell for
+    # compatibility) or an argv array (list of strings, run with no shell at
+    # all — no cmd.exe quoting rules, no metacharacter surprises).
+    run: str | list[str] | None
     expect: dict[str, Any]  # normalized: {"kind": ..., ...}
     block: bool
     description: str = ""
@@ -105,6 +113,17 @@ class Check:
     # check nobody at the graded seat can fix is a wedge, not a gate
     # (observed in a field deployment on Windows).
     owner: str | None = None
+
+    def describe_run(self) -> str | None:
+        """The command for display: string form verbatim, argv form joined
+        with spaces. The join is rendering only — the spec (and every record
+        derived from it) keeps the list verbatim, because a joined argv is
+        not re-parseable into the argv it came from."""
+        if self.run is None:
+            return None
+        if isinstance(self.run, str):
+            return self.run
+        return " ".join(self.run)
 
     def describe_expectation(self) -> str:
         kind = self.expect["kind"]
@@ -250,9 +269,11 @@ def _parse_check(entry: Any, index: int) -> Check:
         raise CheckSpecError(f"{where} is missing a string 'id'.")
 
     run = entry.get("run")
-    if run is not None and not isinstance(run, str):
-        raise CheckSpecError(f"{where} ({cid}): 'run' must be a string or omitted.")
-    if run is not None and ("\n" in run or "\r" in run):
+    if run is not None and not isinstance(run, (str, list)):
+        raise CheckSpecError(
+            f"{where} ({cid}): 'run' must be a string, an array of strings, "
+            "or omitted.")
+    if isinstance(run, str) and ("\n" in run or "\r" in run):
         # cmd.exe executes only the first line and silently discards the rest,
         # inheriting line 1's exit code (finding H5) — a check that half-runs is
         # worse than one that refuses to parse.
@@ -260,6 +281,21 @@ def _parse_check(entry: Any, index: int) -> Check:
             f"{where} ({cid}): 'run' must be a single line — on Windows only the "
             "first line would execute. Chain with '&&' or call a script instead."
         )
+    if isinstance(run, list):
+        # Argv form: executed with no shell at all, so the H5 first-line hazard
+        # cannot arise — but a newline inside an argv element is almost
+        # certainly a quoting accident, and an argv with no elements cannot
+        # name a program to run.
+        if not run:
+            raise CheckSpecError(
+                f"{where} ({cid}): argv-form 'run' needs at least one element.")
+        for j, element in enumerate(run):
+            if not isinstance(element, str):
+                raise CheckSpecError(
+                    f"{where} ({cid}): 'run'[{j}] must be a string.")
+            if "\n" in element or "\r" in element:
+                raise CheckSpecError(
+                    f"{where} ({cid}): 'run'[{j}] must be a single line.")
 
     block = entry.get("block", True)
     if not isinstance(block, bool):

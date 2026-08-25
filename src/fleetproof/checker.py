@@ -133,16 +133,21 @@ def _tail(text: str, limit: int = 2000) -> str:
     return "…(truncated)…\n" + text[-limit:]
 
 
-def _run_command(command: str, cwd: Path, timeout: int) -> tuple[int | None, str, str]:
-    """Execute a shell command in a separate process. Returns (returncode, stdout, stderr).
+def _run_command(
+    command: str | list[str], cwd: Path, timeout: int,
+) -> tuple[int | None, str, str]:
+    """Execute a check command in a separate process. Returns (returncode, stdout, stderr).
 
-    A timeout or spawn failure yields a None returncode, which every grader treats
-    as a failure — the tool never lets an unrunnable check silently pass.
+    String form runs through the platform shell (v0.1 compatibility — every
+    existing spec is a shell line); argv form (a list) runs with ``shell=False``,
+    no cmd.exe involvement, same timeout and encoding handling. A timeout or
+    spawn failure yields a None returncode, which every grader treats as a
+    failure — the tool never lets an unrunnable check silently pass.
     """
     try:
         proc = subprocess.run(
             command,
-            shell=True,
+            shell=isinstance(command, str),
             cwd=str(cwd),
             capture_output=True,
             text=True,
