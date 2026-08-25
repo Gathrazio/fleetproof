@@ -354,9 +354,20 @@ no file, a corrupt file, or an unknown value all read as armed. The note is
 required on disarm by design, and the file records who set it and when; the
 board echoes a disarmed gate on every render. A bridge disarming its own gate
 is therefore visible and attributed, not silent: anything that can write the
-repo can flip the switch, but it cannot flip it quietly. The ledger sweep
-still blocks on stalled dispatches regardless of arming, and subagent grading
-is never affected by it.
+repo can flip the switch, but it cannot flip it quietly.
+
+Arming is per tier. `--tier coordinator` (on either verb) does the same for
+coordinator-tier dispatches in the subagent gate: a coordinator ends many
+turns per task too, and a blocking coordinator-tier check that can only pass
+at the end would otherwise wedge every mid-task stop — the field's workaround
+was authoring such checks `block: false`, which left the coordinator's own
+deliverable ungated. A disarmed coordinator's failing check is recorded
+(verdict `verified` with an `advisory:` detail naming the failures), rendered
+in full as context, never blocks, and never counts as a contradiction. Each
+tier carries its own note. **Lanes are never disarmable** — `--tier lane` is
+refused with that sentence; a lane's stop is the claim being verified. The
+ledger sweep still blocks on stalled dispatches regardless of arming, and the
+abandonment ladder neither sees nor is reset by it.
 
 **The graders are part of the spec.** The tree hash pins every file under
 `.fleetproof/checks/` alongside `checks.json` itself. A check whose grading

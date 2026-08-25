@@ -77,6 +77,7 @@ from .ledger import (
     STATE_DISPATCHED,
     STATE_VERIFIED,
     TIER_BRIDGE,
+    TIER_COORDINATOR,
     TIER_SOURCE_DEFAULTED,
     TIER_SOURCE_INHERITED,
     LedgerError,
@@ -134,23 +135,46 @@ def _apply_session_id(payload: dict[str, Any]) -> None:
 
 # === Arming: separate "can't end a turn" from "claims done" ===
 #
-# The bridge's Stop gate conflates ending a turn with claiming the work done,
-# and blocking checks that can only pass at the end of a release train
-# deadlocked the bridge mid-phase. The field workaround — flip every check to
+# A Stop gate conflates ending a turn with claiming the work done, and
+# blocking checks that can only pass at the end of a release train deadlocked
+# the bridge mid-phase. The field workaround — flip every check to
 # block:false, flip back at publish — is a spec edit, which post-B1 is drift
 # that wedges every in-flight dispatch. So the switch lives OUTSIDE the hashed
 # spec and outside the checks tree: .fleetproof/arming.json is never pinned,
-# and flipping it trips no drift mechanism. It governs the bridge gate only —
-# the ledger sweep still blocks on stalled dispatches (a half-closed dispatch
-# is bookkeeping, not phase), and subagents are always graded.
+# and flipping it trips no drift mechanism.
+#
+# Arming is per tier, for the two tiers that end many turns per task: the
+# bridge (its own Stop gate) and the coordinator (graded in the subagent gate
+# at tier "coordinator"). A coordinator has the bridge's exact problem — any
+# blocking coordinator-tier check that can only pass at the end wedges every
+# mid-task stop — and without a switch the field authored its coordinator
+# checks block:false, leaving the coordinator's own deliverable ungated
+# (observed in a field deployment on Windows). Lanes and leaves are NEVER
+# disarmable: a lane's "done" is the claim this tool exists to grade, and
+# `--tier lane` is rejected by the CLI with that sentence. Two things arming
+# never touches: the ledger sweep still blocks on stalled dispatches (a
+# half-closed dispatch is bookkeeping, not phase), and the abandonment ladder
+# counts contradictions exactly as before — an advisory verdict is not a
+# contradiction, so it neither strikes nor resets the ladder.
 
 ARMING_FILENAME = "arming.json"
-BRIDGE_ARMED = "armed"
-BRIDGE_ADVISORY = "advisory"
+ARMED = "armed"
+ADVISORY = "advisory"
+# Historical names, kept: every 0.4.x caller spells the values this way.
+BRIDGE_ARMED = ARMED
+BRIDGE_ADVISORY = ADVISORY
+ARMING_STATES = (ARMED, ADVISORY)
+# The tiers a gate can be set to advisory for. Ordered: the file and the
+# board render them in this order.
+ARMABLE_TIERS = (TIER_BRIDGE, TIER_COORDINATOR)
+DEFAULT_ARMING_TIER = TIER_BRIDGE
+LANE_NEVER_DISARMED = (
+    "lanes are always graded — arming exists for tiers that end many turns "
+    "per task (bridge, coordinator); a lane's stop is the claim being verified.")
 
 # The advisory sibling of GATE_BLOCK_MARKER: same machine-shaped opener, but
 # it says plainly that nothing is blocked and why the gate is down.
-ADVISORY_MARKER_TEMPLATE = "[FLEETPROOF ADVISORY — bridge gate disarmed: {note}]"
+ADVISORY_MARKER_TEMPLATE = "[FLEETPROOF ADVISORY — {tier} gate disarmed: {note}]"
 
 
 def arming_path() -> Path:
@@ -158,46 +182,124 @@ def arming_path() -> Path:
     return runs_dir().parent / ARMING_FILENAME
 
 
-def load_arming() -> dict[str, Any]:
-    """The bridge arming state; ``{"bridge": "armed"}`` when absent or unusable.
+def _armed_default() -> dict[str, Any]:
+    return {
+        TIER_BRIDGE: ARMED, TIER_COORDINATOR: ARMED,
+        "note": "", "notes": {TIER_BRIDGE: "", TIER_COORDINATOR: ""},
+        "set_at": None, "by": None,
+        "set": {},
+    }
 
-    Armed is the fail-safe direction: no file, a corrupt file, or an unknown
-    value all read as the gate ON — a disarm nobody recorded is a disarm
-    nobody asked for.
+
+def load_arming() -> dict[str, Any]:
+    """The arming state for every armable tier, normalized; all-armed when
+    the file is absent or unusable.
+
+    File shape (``.fleetproof/arming.json``)::
+
+        {
+          "bridge": "armed" | "advisory",
+          "coordinator": "armed" | "advisory",
+          "note": "<the bridge's note>",           # 0.4.0 key, kept as-is
+          "notes": {"bridge": "...", "coordinator": "..."},
+          "set_at": "<last write, ISO-8601>", "by": "<who>",
+          "set": {"<tier>": {"set_at": ..., "by": ...}}
+        }
+
+    One note per tier, not one shared note: the bridge disarms for a
+    publish phase and the coordinator for a build phase, and a board that
+    could only show one reason for two switches would be showing the wrong
+    reason half the time. The 0.4.0 top-level ``note`` stays the bridge's
+    note so a 0.4.0 file (``{"bridge", "note", "set_at", "by"}``) reads
+    exactly as it did, with the coordinator armed.
+
+    Armed is the fail-safe direction, per tier: no file, a corrupt file, or an
+    unknown value all read as the gate ON — a disarm nobody recorded is a
+    disarm nobody asked for. An unknown *bridge* value invalidates the whole
+    file (the 0.4.0 rule); an unknown coordinator value arms the coordinator
+    alone.
     """
+    out = _armed_default()
     try:
         raw = json.loads(arming_path().read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
-        return {"bridge": BRIDGE_ARMED}
-    if not isinstance(raw, dict) or raw.get("bridge") not in (BRIDGE_ARMED, BRIDGE_ADVISORY):
-        return {"bridge": BRIDGE_ARMED}
-    return raw
+        return out
+    if not isinstance(raw, dict) or raw.get(TIER_BRIDGE) not in ARMING_STATES:
+        return out
+    out[TIER_BRIDGE] = raw[TIER_BRIDGE]
+    if raw.get(TIER_COORDINATOR) in ARMING_STATES:
+        out[TIER_COORDINATOR] = raw[TIER_COORDINATOR]
+    notes = raw.get("notes") if isinstance(raw.get("notes"), dict) else {}
+    out["notes"][TIER_BRIDGE] = str(notes.get(TIER_BRIDGE) or raw.get("note") or "")
+    out["notes"][TIER_COORDINATOR] = str(notes.get(TIER_COORDINATOR) or "")
+    out["note"] = out["notes"][TIER_BRIDGE]
+    out["set_at"] = raw.get("set_at")
+    out["by"] = raw.get("by")
+    if isinstance(raw.get("set"), dict):
+        out["set"] = {k: v for k, v in raw["set"].items()
+                      if k in ARMABLE_TIERS and isinstance(v, dict)}
+    return out
 
 
-def set_arming(bridge: str, note: str = "", by: str | None = None) -> Path:
-    """Write the arming state. Returns the path written.
+def tier_arming(arming: dict[str, Any], tier: str | None) -> tuple[str, str]:
+    """``(state, note)`` governing ``tier``; always ``(armed, "")`` for a tier
+    that cannot be disarmed (lane, leaf, or unknown)."""
+    if tier not in ARMABLE_TIERS:
+        return ARMED, ""
+    state = arming.get(tier)
+    if state not in ARMING_STATES:
+        return ARMED, ""
+    return state, str((arming.get("notes") or {}).get(tier) or "")
+
+
+def tier_set_meta(arming: dict[str, Any], tier: str) -> dict[str, Any]:
+    """``{"set_at", "by"}`` for one tier's last write; the file-level values
+    stand in for a 0.4.0 file that has no per-tier record."""
+    meta = (arming.get("set") or {}).get(tier) or {}
+    return {"set_at": meta.get("set_at") or arming.get("set_at"),
+            "by": meta.get("by") or arming.get("by")}
+
+
+def set_arming(state: str, note: str = "", by: str | None = None,
+               tier: str = DEFAULT_ARMING_TIER) -> Path:
+    """Write one tier's arming state, leaving the other tier's as it was.
+    Returns the path written.
 
     The note travels in the file and is echoed by ``fleet`` — a disarmed gate
     with no visible reason is indistinguishable from a neutered one, which is
-    exactly the ambiguity the note exists to remove.
+    exactly the ambiguity the note exists to remove. ``tier`` must be armable;
+    a lane is refused here as firmly as at the CLI.
     """
-    if bridge not in (BRIDGE_ARMED, BRIDGE_ADVISORY):
+    if state not in ARMING_STATES:
         raise ValueError(
-            f"bridge must be {BRIDGE_ARMED!r} or {BRIDGE_ADVISORY!r}; got {bridge!r}.")
+            f"state must be {ARMED!r} or {ADVISORY!r}; got {state!r}.")
+    if tier not in ARMABLE_TIERS:
+        raise ValueError(f"tier {tier!r} cannot be armed or disarmed: {LANE_NEVER_DISARMED}")
+    current = load_arming()
+    who = by or os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
+    now = datetime.now(timezone.utc).isoformat()
+    current[tier] = state
+    current["notes"][tier] = note or ""
+    current["set"][tier] = {"set_at": now, "by": who}
     path = arming_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "bridge": bridge,
-        "note": note or "",
-        "set_at": datetime.now(timezone.utc).isoformat(),
-        "by": by or os.environ.get("USER") or os.environ.get("USERNAME") or "unknown",
+        TIER_BRIDGE: current[TIER_BRIDGE],
+        TIER_COORDINATOR: current[TIER_COORDINATOR],
+        # The 0.4.0 key: the bridge's note, so a 0.4.0 reader sees what it saw.
+        "note": current["notes"][TIER_BRIDGE],
+        "notes": dict(current["notes"]),
+        "set_at": now,
+        "by": who,
+        "set": dict(current["set"]),
     }
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return path
 
 
-def _advisory_context(note: str, body: str) -> str:
-    return ADVISORY_MARKER_TEMPLATE.format(note=note or "no note recorded") + "\n" + body
+def _advisory_context(note: str, body: str, tier: str = TIER_BRIDGE) -> str:
+    return (ADVISORY_MARKER_TEMPLATE.format(tier=tier, note=note or "no note recorded")
+            + "\n" + body)
 
 
 def _spec_gate() -> tuple[str | None, str | None]:
@@ -222,9 +324,8 @@ def _spec_gate() -> tuple[str | None, str | None]:
     switch off.
     """
     session_id = os.environ.get(SESSION_ID_ENV)
-    arming = load_arming()
-    advisory = arming.get("bridge") == BRIDGE_ADVISORY
-    advisory_note = str(arming.get("note") or "")
+    arming_state, advisory_note = tier_arming(load_arming(), TIER_BRIDGE)
+    advisory = arming_state == ADVISORY
     try:
         checks = load_checks()
     except CheckSpecError as e:
@@ -917,6 +1018,16 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
        agent finds only a terminal dispatch and lands on the orphan path.
        Otherwise -> ``verified`` and terminate.
 
+       Arming applies here for the armable tiers only (see the arming block
+       above): a dispatch at tier ``coordinator`` (or ``bridge``) while that
+       tier's gate is advisory has its blocking failures demoted for the
+       decision — mirroring :func:`_spec_gate` — so the verdict is recorded
+       as ``verified`` with an ``advisory:`` detail that names the failures
+       and the disarm, the failure renders in full as context under the
+       advisory marker, nothing blocks, and no ``contradicted`` transition is
+       written (so the ladder neither strikes nor resets). A lane dispatch
+       is graded identically whatever ``arming.json`` says.
+
     When nothing is runnable — the tier selects no repo checks *and* the
     manifest declares none — no verdict is recorded at all: the dispatch is
     terminated still-ungraded, because an absent grade must never read as a
@@ -1056,10 +1167,34 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     # dispatch recorded its spawn name up front, and a payload with none
     # (harness helper) should not blank a name the ledger already has.
     agent_type_known = (dispatch.agent or {}).get("agent_type") or agent_type
+    arming_state, arming_note = tier_arming(load_arming(), dispatch.tier)
     report = run_checks(
         runnable, record_to_log=True, tier=dispatch.tier,
         identity=_check_identity(dispatch.run_id, agent_type_known, dispatch.tier,
                                  session_id))
+    if report.blocking_failures and arming_state == ADVISORY:
+        # This tier's gate is disarmed: the failure is recorded and rendered
+        # in full, and nothing blocks. The verdict line says "advisory" first
+        # so a verified-with-failures row can never be misread as clean.
+        failing_ids = "; ".join(r.id for r in report.blocking_failures)
+        record_verdict(
+            dispatch.run_id, STATE_VERIFIED,
+            detail=(f"advisory: {len(report.blocking_failures)}/{report.total} "
+                    f"blocking check(s) failed ({failing_ids}) — {dispatch.tier} "
+                    f"gate disarmed, failures did not block"),
+            by=VERDICT_BY)
+        _try_close(dispatch.run_id)
+        _try_build_telemetry(dispatch.run_id, check_report=report, checks=runnable)
+        body = (f"{len(report.blocking_failures)}/{report.total} blocking "
+                f"check(s) failed on dispatch {dispatch.run_id} — rendered as "
+                f"context only; the {dispatch.tier} gate is disarmed and check "
+                "failures do not block this stop.\n" + _evidence_context(report))
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "SubagentStop",
+                "additionalContext": _advisory_context(arming_note, body, dispatch.tier),
+            },
+        }, 0
     if report.blocking_failures:
         failing_ids = "; ".join(r.id for r in report.blocking_failures)
         prior_contradictions = sum(

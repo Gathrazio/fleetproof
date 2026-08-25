@@ -2158,3 +2158,124 @@ def test_spec_check_can_branch_per_lane_on_agent_type(tmp_path, monkeypatch, cap
     assert json.loads(capsys.readouterr().out)["decision"] == "block"  # build lane fails
     verdicts = {(d.agent or {}).get("agent_type"): d.verdict for d in list_dispatches()}
     assert verdicts == {"docs": "verified", "build": "contradicted"}
+
+
+# === arming per tier: coordinator disarmable, lane never (C5) ===
+
+def _spawn_at_tier(tmp_path, monkeypatch, tier, manifest, agent_type="tester"):
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import write_intent
+    _setup_project(tmp_path, [_LEAF_ONLY], monkeypatch)
+    _era_config(tmp_path)
+    write_intent(agent_type, _INTENT_PROMPT, manifest=manifest, tier=tier)
+    _feed(monkeypatch, _start_payload(agent_type=agent_type))
+    subagent_start_main()
+
+
+def test_disarmed_coordinator_dispatch_fails_advisory_never_contradicted(
+        tmp_path, monkeypatch, capsys):
+    # A coordinator ends many turns per task; a blocking check that can only
+    # pass at the end wedged every mid-task stop until the field authored it
+    # block:false (observed in a field deployment on Windows). Disarmed at
+    # the coordinator tier: the failure is recorded and rendered, the stop is
+    # allowed, and no contradicted transition (so no ladder strike) exists.
+    from fleetproof.hookgate import ADVISORY, set_arming, subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _spawn_at_tier(tmp_path, monkeypatch, "coordinator", _intent_manifest(cmd_exit=1))
+    set_arming(ADVISORY, note="build phase", tier="coordinator")
+
+    _feed(monkeypatch, _stop_payload(message="Coordinating, mid-task."))
+    assert subagent_stop_main() == 0
+    decision = json.loads(capsys.readouterr().out)
+    assert "decision" not in decision  # never a block
+    ctx = decision["hookSpecificOutput"]["additionalContext"]
+    assert ctx.startswith("[FLEETPROOF ADVISORY — coordinator gate disarmed: build phase]")
+    assert "[FAIL] m-widget:" in ctx  # the failure renders in full
+
+    d = list_dispatches()[0]
+    assert d.state == "terminated"
+    assert d.verdict == "verified"
+    assert not any(t.get("state") == "contradicted" for t in d.transitions)
+    verdict_t = next(t for t in d.transitions if t.get("state") == "verified")
+    assert verdict_t["detail"].startswith("advisory: 1/1 blocking check(s) failed (m-widget)")
+
+
+def test_armed_coordinator_dispatch_still_blocks(tmp_path, monkeypatch, capsys):
+    from fleetproof.hookgate import subagent_stop_main
+    _spawn_at_tier(tmp_path, monkeypatch, "coordinator", _intent_manifest(cmd_exit=1))
+    _feed(monkeypatch, _stop_payload(message="Coordinating."))
+    assert subagent_stop_main() == 0
+    assert json.loads(capsys.readouterr().out)["decision"] == "block"
+
+
+def test_lane_dispatch_is_graded_whatever_arming_says(tmp_path, monkeypatch, capsys):
+    # Both switches down; a lane's failing blocking check still blocks and
+    # still contradicts. Lanes are never disarmable.
+    from fleetproof.hookgate import ADVISORY, set_arming, subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _spawn_at_tier(tmp_path, monkeypatch, "lane", _intent_manifest(cmd_exit=1))
+    set_arming(ADVISORY, note="publish phase", tier="bridge")
+    set_arming(ADVISORY, note="build phase", tier="coordinator")
+
+    _feed(monkeypatch, _stop_payload(message="Lane done."))
+    assert subagent_stop_main() == 0
+    assert json.loads(capsys.readouterr().out)["decision"] == "block"
+    assert list_dispatches()[0].state == "contradicted"
+
+
+def test_bridge_disarm_does_not_disarm_the_coordinator_and_vice_versa(
+        tmp_path, monkeypatch, capsys):
+    from fleetproof.hookgate import ADVISORY, set_arming, subagent_stop_main
+    _spawn_at_tier(tmp_path, monkeypatch, "coordinator", _intent_manifest(cmd_exit=1))
+    set_arming(ADVISORY, note="publish phase", tier="bridge")
+    _feed(monkeypatch, _stop_payload(message="Coordinating."))
+    assert subagent_stop_main() == 0
+    assert json.loads(capsys.readouterr().out)["decision"] == "block"
+
+
+def test_set_arming_refuses_a_lane():
+    from fleetproof.hookgate import ADVISORY, set_arming
+    with pytest.raises(ValueError, match="lanes are always graded"):
+        set_arming(ADVISORY, note="x", tier="lane")
+
+
+def test_legacy_040_arming_file_reads_with_the_coordinator_armed(tmp_path, monkeypatch):
+    from fleetproof.hookgate import arming_path, load_arming, tier_arming
+    _setup_project(tmp_path, [_PASS], monkeypatch)
+    arming_path().write_text(json.dumps(
+        {"bridge": "advisory", "note": "publish phase",
+         "set_at": "2026-08-25T14:18:14+00:00", "by": "ops"}), encoding="utf-8")
+    arming = load_arming()
+    assert tier_arming(arming, "bridge") == ("advisory", "publish phase")
+    assert tier_arming(arming, "coordinator") == ("armed", "")
+    assert tier_arming(arming, "lane") == ("armed", "")
+    assert arming["note"] == "publish phase"  # the 0.4.0 key still reads
+
+
+def test_per_tier_notes_and_states_are_independent(tmp_path, monkeypatch):
+    from fleetproof.hookgate import ADVISORY, ARMED, arming_path, load_arming, set_arming
+    _setup_project(tmp_path, [_PASS], monkeypatch)
+    set_arming(ADVISORY, note="publish phase", tier="bridge", by="bridge-op")
+    set_arming(ADVISORY, note="build phase", tier="coordinator", by="coord-op")
+    raw = json.loads(arming_path().read_text(encoding="utf-8"))
+    assert raw["bridge"] == "advisory" and raw["coordinator"] == "advisory"
+    assert raw["note"] == "publish phase"  # compat key = the bridge's note
+    assert raw["notes"] == {"bridge": "publish phase", "coordinator": "build phase"}
+    assert raw["set"]["bridge"]["by"] == "bridge-op"
+    assert raw["set"]["coordinator"]["by"] == "coord-op"
+
+    set_arming(ARMED, tier="bridge")
+    arming = load_arming()
+    assert arming["bridge"] == "armed"
+    assert arming["coordinator"] == "advisory"  # untouched by the other tier's flip
+    assert arming["notes"]["coordinator"] == "build phase"
+
+
+def test_unknown_coordinator_value_arms_the_coordinator_alone(tmp_path, monkeypatch):
+    from fleetproof.hookgate import arming_path, load_arming
+    _setup_project(tmp_path, [_PASS], monkeypatch)
+    arming_path().write_text(json.dumps(
+        {"bridge": "advisory", "coordinator": "off", "note": "x"}), encoding="utf-8")
+    arming = load_arming()
+    assert arming["bridge"] == "advisory"
+    assert arming["coordinator"] == "armed"

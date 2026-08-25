@@ -838,3 +838,65 @@ def test_check_cli_sets_tier_and_session_only(tmp_path, monkeypatch, capsys):
                  "--format", "json"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["checks"][0]["stdout_tail"].strip() == "lane sess-cli-77 <absent>"
+
+
+# === arm/disarm --tier (C5) ===
+
+def test_disarm_tier_lane_is_an_argparse_error_saying_lanes_are_always_graded(
+        cli_runs, capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["disarm", "--tier", "lane", "--note", "why"])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "lanes are always graded" in err
+    with pytest.raises(SystemExit):
+        main(["arm", "--tier", "leaf"])
+    assert "lanes are always graded" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        main(["arm", "--tier", "captain"])
+    assert "armable tiers: bridge, coordinator" in capsys.readouterr().err
+
+
+def test_disarm_and_arm_coordinator_roundtrip(cli_runs, capsys):
+    from fleetproof.hookgate import arming_path
+    assert main(["disarm", "--tier", "coordinator", "--note", "build phase"]) == 0
+    out = capsys.readouterr().out
+    assert "coordinator gate: ADVISORY (disarmed): build phase" in out
+    assert "lanes are always graded" in out
+    raw = json.loads(arming_path().read_text(encoding="utf-8"))
+    assert raw["coordinator"] == "advisory"
+    assert raw["bridge"] == "armed"
+    assert raw["notes"]["coordinator"] == "build phase"
+    assert raw["note"] == ""  # the bridge note; untouched
+
+    assert main(["arm", "--tier", "coordinator", "--format", "json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["tier"] == "coordinator" and out["coordinator"] == "armed"
+    assert json.loads(arming_path().read_text(encoding="utf-8"))["coordinator"] == "armed"
+
+
+def test_fleet_board_shows_both_tiers_when_both_disarmed(cli_runs, capsys):
+    assert main(["disarm", "--note", "publish phase"]) == 0
+    assert main(["disarm", "--tier", "coordinator", "--note", "build phase"]) == 0
+    capsys.readouterr()
+    assert main(["fleet"]) == 0
+    out = capsys.readouterr().out
+    assert "bridge gate: ADVISORY (disarmed): publish phase" in out
+    assert "coordinator gate: ADVISORY (disarmed): build phase" in out
+    assert "re-arm: fleetproof arm --tier coordinator" in out
+
+    assert main(["arm"]) == 0  # bridge only
+    capsys.readouterr()
+    assert main(["fleet"]) == 0
+    out = capsys.readouterr().out
+    assert "bridge gate: ADVISORY" not in out
+    assert "coordinator gate: ADVISORY (disarmed): build phase" in out
+
+
+def test_fleet_json_carries_the_full_arming_when_any_tier_is_advisory(cli_runs, capsys):
+    assert main(["disarm", "--tier", "coordinator", "--note", "build phase"]) == 0
+    capsys.readouterr()
+    assert main(["fleet", "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["arming"]["coordinator"] == "advisory"
+    assert payload["arming"]["bridge"] == "armed"

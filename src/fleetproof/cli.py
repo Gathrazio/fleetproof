@@ -13,8 +13,8 @@ surface as it can. Subcommands:
     record    PostToolUse-hook entry: append an evidence record from hook stdin
     subagent-start SubagentStart-hook entry: put a spawning subagent on the ledger
     subagent-stop  SubagentStop-hook entry: the per-subagent report-and-verify gate
-    arm       arm the bridge Stop gate (the default state)
-    disarm    set the bridge Stop gate to advisory; requires --note
+    arm       arm a gate (the default state); --tier bridge|coordinator
+    disarm    set a gate to advisory; requires --note; --tier bridge|coordinator
     dispatch  ledger verbs: new / report / close / park a dispatch; intent
               writes the sidecar the SubagentStart capture consumes
     fleet     the dispatch board — every dispatch, its state, and whether it reported
@@ -56,9 +56,14 @@ from .checks import (
     short_spec_hash,
 )
 from .hookgate import (
-    BRIDGE_ADVISORY,
-    BRIDGE_ARMED,
+    ADVISORY,
+    ARMABLE_TIERS,
+    ARMED,
+    DEFAULT_ARMING_TIER,
+    LANE_NEVER_DISARMED,
     load_arming,
+    tier_arming,
+    tier_set_meta,
     record_tool_main,
     set_arming,
     stop_gate_main,
@@ -584,18 +589,36 @@ def _truncate(value: str, width: int) -> str:
     return value if len(value) <= width else value[:width - 3] + "..."
 
 
+def _armable_tier(value: str) -> str:
+    """argparse type for ``--tier`` on arm/disarm: bridge or coordinator only.
+
+    A lane is refused with the reason, not a bare choices list: an operator
+    typing ``--tier lane`` is asking a real question, and "invalid choice" is
+    not the answer.
+    """
+    if value in ARMABLE_TIERS:
+        return value
+    if value in VALID_TIERS:
+        raise argparse.ArgumentTypeError(
+            f"tier {value!r} cannot be armed or disarmed: {LANE_NEVER_DISARMED}")
+    raise argparse.ArgumentTypeError(
+        f"unknown tier {value!r}; armable tiers: {', '.join(ARMABLE_TIERS)}")
+
+
 def _cmd_arm(args: argparse.Namespace) -> int:
-    path = set_arming(BRIDGE_ARMED, note=(args.note or "").strip())
+    tier = args.tier
+    path = set_arming(ARMED, note=(args.note or "").strip(), tier=tier)
     if args.format == "json":
-        print(json.dumps({"ok": True, "bridge": BRIDGE_ARMED, "path": str(path)}))
+        print(json.dumps({"ok": True, "tier": tier, tier: ARMED, "path": str(path)}))
     else:
-        print("bridge gate: armed. Blocking check failures block the stop again.")
+        print(f"{tier} gate: armed. Blocking check failures block the stop again.")
     return 0
 
 
 def _cmd_disarm(args: argparse.Namespace) -> int:
     # Asymmetric with arm on purpose: switching the gate OFF requires a reason,
     # and a whitespace note is no reason.
+    tier = args.tier
     note = (args.note or "").strip()
     if not note:
         _emit_error(
@@ -603,25 +626,35 @@ def _cmd_disarm(args: argparse.Namespace) -> int:
             "disarm needs a non-empty --note; switching the gate off requires "
             "a reason.", args.format)
         return 2
-    path = set_arming(BRIDGE_ADVISORY, note=note)
+    path = set_arming(ADVISORY, note=note, tier=tier)
     if args.format == "json":
-        print(json.dumps({"ok": True, "bridge": BRIDGE_ADVISORY, "note": note,
+        print(json.dumps({"ok": True, "tier": tier, tier: ADVISORY, "note": note,
                           "path": str(path)}))
     else:
-        print(f"bridge gate: ADVISORY (disarmed): {note}")
-        print("Checks still run and render; check failures no longer block the "
-              "bridge's stop. The ledger sweep still blocks on stalled "
-              "dispatches, and subagents are still graded. Re-arm: fleetproof arm")
+        print(f"{tier} gate: ADVISORY (disarmed): {note}")
+        whose = ("the bridge's stop" if tier == DEFAULT_ARMING_TIER
+                 else f"a {tier}-tier dispatch's stop")
+        print(f"Checks still run and render; check failures no longer block "
+              f"{whose}. The ledger sweep still blocks on stalled dispatches, "
+              "lanes are always graded, and the abandonment ladder is "
+              f"unaffected. Re-arm: fleetproof arm --tier {tier}")
     return 0
 
 
-def _arming_board_line(arming: dict) -> str:
-    """The fleet board's echo of a disarmed gate — the note travels with it."""
-    note = str(arming.get("note") or "no note recorded")
-    set_at = str(arming.get("set_at") or "?")[:19]
-    by = str(arming.get("by") or "?")
-    return (f"bridge gate: ADVISORY (disarmed): {note} "
-            f"[set {set_at} by {by}; re-arm: fleetproof arm]")
+def _arming_board_lines(arming: dict) -> list[str]:
+    """The fleet board's echo of every disarmed gate — one line per tier,
+    each with its own note. The armed default stays quiet."""
+    lines = []
+    for tier in ARMABLE_TIERS:
+        state, note = tier_arming(arming, tier)
+        if state != ADVISORY:
+            continue
+        meta = tier_set_meta(arming, tier)
+        set_at = str(meta.get("set_at") or "?")[:19]
+        by = str(meta.get("by") or "?")
+        lines.append(f"{tier} gate: ADVISORY (disarmed): {note or 'no note recorded'} "
+                     f"[set {set_at} by {by}; re-arm: fleetproof arm --tier {tier}]")
+    return lines
 
 
 def _cmd_fleet_orphans(args: argparse.Namespace) -> int:
@@ -663,10 +696,12 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
     scope_session = args.session or os.environ.get(SESSION_ID_ENV) or None
     ungraded = list_ungraded_terminations(scope_session)
     ungraded_line = ungraded_termination_line(ungraded, scope_known=bool(scope_session))
-    # The board echoes a disarmed bridge gate whenever it is advisory — the
-    # armed default stays quiet. Silence here is what makes the echo a signal.
+    # The board echoes every disarmed gate (bridge, coordinator) whenever it
+    # is advisory — the armed default stays quiet. Silence here is what makes
+    # the echo a signal.
     arming = load_arming()
-    advisory = arming.get("bridge") == BRIDGE_ADVISORY
+    arming_lines = _arming_board_lines(arming)
+    advisory = bool(arming_lines)
     if args.format == "json":
         payload = {
             "dispatches": [
@@ -680,8 +715,8 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
             payload["arming"] = arming
         print(json.dumps(payload, indent=2))
         return 0
-    if advisory:
-        print(_arming_board_line(arming))
+    for line in arming_lines:
+        print(line)
     if not records:
         print("No dispatches found.")
         if orphans:
@@ -892,25 +927,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="SubagentStop-hook entry: record the report, grade it, block a false 'done'.")
     p_sstop.set_defaults(func=_cmd_subagent_stop)
 
+    tier_help = ("Which gate: bridge (the Stop gate; default) or coordinator "
+                 "(coordinator-tier dispatches in the subagent gate). Lanes "
+                 "are always graded and cannot be named here.")
     p_arm = sub.add_parser(
         "arm",
-        help="Arm the bridge Stop gate (the default): blocking check failures "
-             "block the bridge's stop.")
+        help="Arm a gate (the default state): blocking check failures block "
+             "the stop again. --tier bridge (default) or coordinator.")
     p_arm.add_argument("--note", default=None,
                        help="Optional note recorded with the arming state.")
+    p_arm.add_argument("--tier", type=_armable_tier, default=DEFAULT_ARMING_TIER,
+                       metavar="{bridge,coordinator}", help=tier_help)
     _add_format(p_arm)
     p_arm.set_defaults(func=_cmd_arm)
 
     p_disarm = sub.add_parser(
         "disarm",
-        help="Set the bridge Stop gate to advisory: checks still run and "
-             "render, but check failures no longer block the bridge's stop. "
-             "The ledger sweep still blocks on stalled dispatches; subagent "
-             "gating is unaffected. Requires --note.")
+        help="Set a gate to advisory: checks still run and render, but check "
+             "failures no longer block that tier's stop. --tier bridge "
+             "(default) or coordinator; lanes are always graded. The ledger "
+             "sweep still blocks on stalled dispatches and the abandonment "
+             "ladder is unaffected. Requires --note.")
     p_disarm.add_argument(
         "--note", required=True,
-        help="Why the gate is coming down (required; recorded in "
+        help="Why the gate is coming down (required; recorded per tier in "
              ".fleetproof/arming.json and echoed by `fleetproof fleet`).")
+    p_disarm.add_argument("--tier", type=_armable_tier, default=DEFAULT_ARMING_TIER,
+                          metavar="{bridge,coordinator}", help=tier_help)
     _add_format(p_disarm)
     p_disarm.set_defaults(func=_cmd_disarm)
 
