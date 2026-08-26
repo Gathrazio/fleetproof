@@ -233,7 +233,12 @@ def test_dispatch_intent_writes_sidecar_and_prints_path(cli_runs, tmp_path, caps
 
     assert main(["dispatch", "intent", "--agent", "recon", "--prompt-file", str(pf),
                  "--manifest", str(mf), "--tier", "lane"]) == 0
-    path = Path(capsys.readouterr().out.strip())
+    lines = capsys.readouterr().out.strip().splitlines()
+    # The write is announced, not implied: the recorded tier with its
+    # provenance, then the sidecar-written line, then the path (ask 7 + 9).
+    assert lines[0] == "tier recorded: lane (declared)"
+    assert lines[1] == "sidecar written (next spawn of recon consumes it):"
+    path = Path(lines[2])
     assert path.exists()
     assert path.name == "recon.json"
 
@@ -252,7 +257,7 @@ def test_dispatch_intent_role_flag_writes_the_role_field(cli_runs, tmp_path, cap
     pf.write_text("work", encoding="utf-8")
     assert main(["dispatch", "intent", "--agent", "widget-refactor",
                  "--prompt-file", str(pf), "--role", "tester"]) == 0
-    path = Path(capsys.readouterr().out.strip())
+    path = Path(capsys.readouterr().out.strip().splitlines()[-1])
     intent = json.loads(path.read_text(encoding="utf-8"))
     assert intent["role"] == "tester"
     assert intent["agent_type"] == "widget-refactor"
@@ -263,7 +268,7 @@ def test_dispatch_intent_prompt_file_strips_a_windows_bom(cli_runs, tmp_path, ca
     pf.write_bytes(b"\xef\xbb\xbfbom prompt")
     assert main(["dispatch", "intent", "--agent", "recon",
                  "--prompt-file", str(pf)]) == 0
-    path = Path(capsys.readouterr().out.strip())
+    path = Path(capsys.readouterr().out.strip().splitlines()[-1])
     intent = json.loads(path.read_text(encoding="utf-8"))
     assert intent["prompt"] == "bom prompt"
 
@@ -276,6 +281,29 @@ def test_dispatch_intent_json_format(cli_runs, tmp_path, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is True
     assert Path(out["intent_path"]).exists()
+    # ask 7/#32: the write path names the tier it recorded and its provenance.
+    assert out["tier"] == "lane"
+    assert out["tier_source"] == "defaulted"
+
+
+def test_dispatch_intent_echoes_a_defaulted_tier(cli_runs, tmp_path, capsys):
+    # Omitting --tier used to be indistinguishable from declaring one on the
+    # write path — the miss surfaced only later, on the board.
+    pf = tmp_path / "prompt.md"
+    pf.write_text("work", encoding="utf-8")
+    assert main(["dispatch", "intent", "--agent", "recon",
+                 "--prompt-file", str(pf)]) == 0
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert lines[0] == "tier recorded: lane (defaulted — pass --tier to declare)"
+    lines[0].encode("cp1252")
+
+    pf2 = tmp_path / "prompt2.md"
+    pf2.write_text("work", encoding="utf-8")
+    assert main(["dispatch", "intent", "--agent", "recon2", "--prompt-file", str(pf2),
+                 "--tier", "coordinator", "--format", "json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["tier"] == "coordinator"
+    assert out["tier_source"] == "declared"
 
 
 def test_dispatch_intent_rejects_bad_inputs(cli_runs, tmp_path, capsys):
@@ -419,6 +447,24 @@ def test_fleet_board_marks_a_defaulted_tier_with_a_question_mark(cli_runs, capsy
     out.encode("cp1252")
 
 
+def test_fleet_board_splits_defaulted_with_intent_from_a_clean_miss(cli_runs, capsys):
+    # ask 7/#32: a matched sidecar whose intent omitted --tier used to wear
+    # the same '?' as a genuine miss, so a dispatcher read their own matched
+    # intent as a failed capture. intent_source is only ever written by a
+    # consumed sidecar, so it is the honest splitter: '=' matched-but-
+    # undeclared, '?' nothing matched.
+    from fleetproof.ledger import TIER_SOURCE_DEFAULTED, create_dispatch
+    create_dispatch("matched but undeclared", tier="lane",
+                    tier_source=TIER_SOURCE_DEFAULTED,
+                    intent_source={"name": "recon.json", "sha256": "ab" * 32})
+    assert main(["fleet"]) == 0
+    out = capsys.readouterr().out
+    assert "lane=" in out
+    assert "lane?" not in out
+    assert "tier= = defaulted (an intent matched but declared no tier" in out
+    out.encode("cp1252")
+
+
 def test_fleet_json_still_emits_the_full_records(cli_runs, capsys):
     # The human board changed shape; the machine-readable form must not.
     run_id = _dispatch_new(capsys)
@@ -460,6 +506,27 @@ def test_fleet_counts_orphans_without_listing_them_as_dispatches(cli_runs, capsy
     assert "1 orphan stop(s)" in out
     assert "not graded" in out
     out.encode("cp1252")
+
+
+def test_fleet_orphan_count_uses_the_resolved_scope(cli_runs, monkeypatch, capsys):
+    # ask 12/Q3: the line said "this session" unconditionally while a
+    # session-less shell counted every orphan on disk. Same rule as the
+    # ungraded line now: session known -> "this session", session-scoped
+    # count; unknown -> "on the board", the whole ledger.
+    from fleetproof.ledger import record_orphan_stop
+    record_orphan_stop(agent_id="a-1", agent_type=None, session_id="sess-x",
+                       last_assistant_message="mine")
+    record_orphan_stop(agent_id="a-2", agent_type=None, session_id="sess-other",
+                       last_assistant_message="theirs")
+    assert main(["fleet"]) == 0
+    out = capsys.readouterr().out
+    assert "2 orphan stop(s) on the board" in out
+    assert "orphan stop(s) this session" not in out
+
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-x")
+    assert main(["fleet"]) == 0
+    out = capsys.readouterr().out
+    assert "1 orphan stop(s) this session" in out
 
 
 def test_fleet_orphans_flag_lists_the_orphans(cli_runs, capsys):
@@ -820,11 +887,15 @@ def test_fleet_open_filter_cannot_hide_the_ungraded_line(cli_runs, capsys, monke
     assert "1 dispatch(es) terminated ungraded this session" in out
 
 
-def test_fleet_without_a_session_counts_the_dispatches_shown(cli_runs, capsys):
+def test_fleet_without_a_session_counts_the_whole_board(cli_runs, capsys):
+    # Rewritten for ask 12/Q3: "in the dispatches shown" was false whenever a
+    # row filter hid a dispatch the count still covered. One scope rule for
+    # every footer count: "this session" when a session scope is known, else
+    # "on the board" — the whole ledger, never the filtered listing.
     _ungraded_termination(None)
     assert main(["fleet"]) == 0
     out = capsys.readouterr().out
-    assert "1 dispatch(es) terminated ungraded in the dispatches shown" in out
+    assert "1 dispatch(es) terminated ungraded on the board" in out
 
 
 def test_fleet_json_carries_the_ungraded_terminations(cli_runs, capsys, monkeypatch):
@@ -975,6 +1046,56 @@ def test_show_tolerates_records_without_an_arming_stamp(tmp_path, monkeypatch, c
     assert "fleetproof check" in text and "arming:" not in text
 
 
+# === show badges the verdict, not the process exit (ask 5/#35) ===
+
+def test_show_badges_a_checker_row_by_verdict_not_process_exit(
+        tmp_path, monkeypatch, capsys):
+    # A checker that blocked a lane under a disarmed gate exits 0 as a
+    # process; [ok] off the exit code taught operators that a blocking
+    # failure looked fine. The badge and the row now carry the verdict,
+    # in both formats.
+    from fleetproof.hookgate import ADVISORY, set_arming, stop_gate
+    monkeypatch.chdir(tmp_path)
+    marker = tmp_path / ".fleetproof"
+    marker.mkdir()
+    (marker / "checks.json").write_text(json.dumps({"checks": [
+        {"id": "bad", "run": f'"{sys.executable}" -c "raise SystemExit(1)"'},
+    ]}), encoding="utf-8")
+    runlog.set_runs_dir(marker / "runs")
+    monkeypatch.setenv(runlog.RUN_ID_ENV, "20260101-000012-show02")
+    set_arming(ADVISORY, note="publish phase")
+    stop_gate()
+    assert main(["show", "20260101-000012-show02"]) == 0
+    text = capsys.readouterr().out
+    assert "[fail] fleetproof check" in text
+    assert "verdict: fail (blocking_failed: 1)" in text
+    assert main(["show", "20260101-000012-show02", "--format", "json"]) == 0
+    row = json.loads(capsys.readouterr().out)["sub_invocations"][0]
+    assert row["verdict"] == "fail"
+    assert row["blocking_failed"] == 1
+
+
+def test_show_relabels_non_checker_rows_with_their_exit_code(
+        tmp_path, monkeypatch, capsys):
+    # [ok]/[fail] is reserved for checker verdicts now; every other row
+    # wears its process exit plainly, which claims nothing it isn't.
+    monkeypatch.chdir(tmp_path)
+    rd = tmp_path / "runs"
+    runlog.set_runs_dir(rd)
+    sub = rd / "20260101-000013-old002" / "claude-tool-Bash-20260101-000013-000000"
+    sub.mkdir(parents=True)
+    (sub / "invocation.json").write_text(json.dumps(
+        {"tool": "claude-tool", "subcmd": "Bash"}), encoding="utf-8")
+    (sub / "result.json").write_text(json.dumps({"exit_code": 0}), encoding="utf-8")
+    assert main(["show", "20260101-000013-old002"]) == 0
+    text = capsys.readouterr().out
+    assert "[exit:0] claude-tool Bash" in text
+    assert "[ok]" not in text
+    assert main(["show", "20260101-000013-old002", "--format", "json"]) == 0
+    row = json.loads(capsys.readouterr().out)["sub_invocations"][0]
+    assert row["verdict"] is None and row["blocking_failed"] is None
+
+
 # === dispatch intent / new --preflight (C11) ===
 
 def _preflight_manifest_file(tmp_path: Path) -> Path:
@@ -1002,8 +1123,12 @@ def test_dispatch_intent_preflight_renders_both_checks_and_records_nothing(
     assert main(["dispatch", "intent", "--agent", "tcn", "--prompt-file", str(pf),
                  "--manifest", str(mf), "--tier", "lane", "--preflight"]) == 0
     out = capsys.readouterr().out
-    first, rest = out.split("\n", 1)
-    assert Path(first).name == "tcn.json" and Path(first).exists()  # sidecar written
+    lines = out.split("\n")
+    # ask 9: the sidecar write is said out loud before the path, because
+    # "records nothing" let --preflight read as a pure preview.
+    assert lines[1] == "sidecar written (next spawn of tcn consumes it):"
+    assert Path(lines[2]).name == "tcn.json" and Path(lines[2]).exists()
+    rest = "\n".join(lines[3:])
     assert "preflight: 2 manifest check(s)" in rest
     assert "[PASS] m-ok  (blocking)" in rest
     assert "argv:   [" in rest and "days_remaining=67" in rest
@@ -1098,6 +1223,86 @@ def test_dispatch_new_preflight_needs_a_manifest(cli_runs, capsys):
     assert "--preflight needs --manifest" in capsys.readouterr().err
 
 
+# === dispatch intent --dry-run (ask 9/#29) ===
+
+def test_dispatch_intent_dry_run_previews_and_writes_nothing(
+        cli_runs, tmp_path, capsys):
+    # The no-write variant --preflight was read as: checks run, output
+    # renders, and neither a sidecar nor anything under runs/ exists after.
+    from fleetproof.ledger import intents_dir
+    pf = tmp_path / "prompt.md"
+    pf.write_text("work", encoding="utf-8")
+    mf = _preflight_manifest_file(tmp_path)
+    assert main(["dispatch", "intent", "--agent", "tcn", "--prompt-file", str(pf),
+                 "--manifest", str(mf), "--tier", "lane", "--preflight",
+                 "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "dry run: no sidecar written; nothing recorded." in out
+    assert "sidecar written (next spawn" not in out
+    assert "[PASS] m-ok" in out and "[FAIL] m-bad" in out
+    assert not (intents_dir() / "tcn.json").exists()
+    assert runlog.list_run_records() == []
+
+    assert main(["dispatch", "intent", "--agent", "tcn", "--prompt-file", str(pf),
+                 "--manifest", str(mf), "--dry-run", "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True and payload["dry_run"] is True
+    assert payload["intent_path"] is None
+    assert not (intents_dir() / "tcn.json").exists()
+
+
+def test_dispatch_intent_dry_run_still_refuses_a_malformed_check(
+        cli_runs, tmp_path, capsys):
+    # Dry run is a validation pass, not a validation skip.
+    pf = tmp_path / "prompt.md"
+    pf.write_text("work", encoding="utf-8")
+    mf = tmp_path / "manifest.json"
+    mf.write_text(json.dumps({"checks": [
+        {"id": "m-bad", "cmd": "echo a\necho b"}]}), encoding="utf-8")
+    assert main(["dispatch", "intent", "--agent", "tcn", "--prompt-file", str(pf),
+                 "--manifest", str(mf), "--preflight", "--dry-run"]) == 2
+    assert "'cmd' must be a single line" in capsys.readouterr().err
+
+
+# === check_map documented + warned about (ask 10a/c/#38) ===
+
+def test_dispatch_intent_warns_when_deliverables_and_checks_lack_a_check_map(
+        cli_runs, tmp_path, capsys):
+    # Both halves authored, nothing joining them: coverage will read null
+    # however thoroughly the checks grade the work, and no surface said so.
+    pf = tmp_path / "prompt.md"
+    pf.write_text("work", encoding="utf-8")
+    mf = tmp_path / "manifest.json"
+    mf.write_text(json.dumps({"manifest": {
+        "deliverables": ["health field"],
+        "checks": [{"id": "c1", "cmd": "true"}],
+    }}), encoding="utf-8")
+    assert main(["dispatch", "intent", "--agent", "tcn", "--prompt-file", str(pf),
+                 "--manifest", str(mf)]) == 0
+    err = capsys.readouterr().err
+    assert "no check_map joining them" in err
+    assert "coverage will read null" in err
+
+
+def test_no_check_map_warning_when_the_map_or_either_half_is_absent(
+        cli_runs, tmp_path, capsys):
+    pf = tmp_path / "prompt.md"
+    pf.write_text("work", encoding="utf-8")
+    # A mapped manifest is silent about check_map (the controls warning for
+    # its uncontrolled blocking check still fires; that is not this warning).
+    mf = _control_manifest(tmp_path)
+    assert main(["dispatch", "intent", "--agent", "tcn", "--prompt-file", str(pf),
+                 "--manifest", str(mf)]) == 0
+    assert "no check_map joining them" not in capsys.readouterr().err
+    # Checks with no deliverables: nothing to join, nothing to warn about.
+    mf2 = tmp_path / "manifest2.json"
+    mf2.write_text(json.dumps({"checks": [{"id": "c1", "cmd": "true"}]}),
+                   encoding="utf-8")
+    assert main(["dispatch", "intent", "--agent", "tcn2", "--prompt-file", str(pf),
+                 "--manifest", str(mf2)]) == 0
+    assert "no check_map joining them" not in capsys.readouterr().err
+
+
 # === grader control ledger at the CLI (C12) ===
 
 def _control_manifest(tmp_path: Path) -> Path:
@@ -1164,7 +1369,8 @@ def test_dispatch_intent_warns_per_uncontrolled_blocking_check(cli_runs, tmp_pat
     assert main(["dispatch", "intent", "--agent", "tcn", "--prompt-file", str(pf),
                  "--manifest", str(mf)]) == 0
     captured = capsys.readouterr()
-    assert Path(captured.out.strip()).exists()  # sidecar written: a warning, not a refusal
+    # sidecar written: a warning, not a refusal
+    assert Path(captured.out.strip().splitlines()[-1]).exists()
     assert "WARNING: blocking check 'tcn-health' has no grader control" in captured.err
     assert "advisory-note" not in captured.err  # advisory checks are not warned about
     assert "fleetproof check control tcn-health --pass-sample" in captured.err
@@ -1484,3 +1690,57 @@ def test_check_cli_lists_a_retired_check_as_retired(cli_runs, tmp_path, capsys):
     assert main(["check", "--spec", str(spec), "--format", "json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["verdict"] == "pass" and payload["retired"][0]["id"] == "bad"
+
+
+# === phase preflight: the vacuous-successor tripwire (#28) ===
+
+def test_phase_preflight_flags_a_vacuous_successor(cli_runs, tmp_path, capsys):
+    # A successor that passes against the pre-work tree retires its
+    # predecessor on contact — the pair gates nothing from the first stop.
+    # dispatch intent --preflight cannot catch it (succession lives in the
+    # repo spec, not the manifest); this verb runs the successor NOW.
+    spec = tmp_path / "checks.json"
+    spec.write_text(json.dumps({"checks": [
+        {"id": "pred", "run": f'"{sys.executable}" -c "raise SystemExit(1)"',
+         "succeeded_by": "succ"},
+        {"id": "succ", "run": f'"{sys.executable}" -c "raise SystemExit(0)"'},
+    ]}), encoding="utf-8")
+    assert main(["phase", "preflight", "--spec", str(spec)]) == 1
+    out = capsys.readouterr().out
+    assert "vacuous successor: 'succ' already passes against the pre-work tree" in out
+    assert "would retire 'pred' before any work exists" in out
+    # A preview is not evidence: no persisted run that could itself retire.
+    assert runlog.list_run_records() == []
+    out.encode("cp1252")
+
+    assert main(["phase", "preflight", "--spec", str(spec),
+                 "--format", "json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False and payload["vacuous_count"] == 1
+    assert payload["pairs"][0]["predecessor"] == "pred"
+    assert payload["pairs"][0]["successor"] == "succ"
+    assert payload["pairs"][0]["vacuous"] is True
+
+
+def test_phase_preflight_passes_quietly_on_a_sound_pair(cli_runs, tmp_path, capsys):
+    # The sound shape: the successor fails pre-work, because it asserts
+    # something the predecessor's completion causes.
+    spec = tmp_path / "checks.json"
+    spec.write_text(json.dumps({"checks": [
+        {"id": "pred", "run": f'"{sys.executable}" -c "raise SystemExit(0)"',
+         "succeeded_by": "succ"},
+        {"id": "succ", "run": f'"{sys.executable}" -c "raise SystemExit(1)"'},
+    ]}), encoding="utf-8")
+    assert main(["phase", "preflight", "--spec", str(spec)]) == 0
+    out = capsys.readouterr().out
+    assert "vacuous" not in out
+    assert "succession is sound" in out
+
+
+def test_phase_preflight_with_no_pairs_says_so(cli_runs, tmp_path, capsys):
+    spec = tmp_path / "checks.json"
+    spec.write_text(json.dumps({"checks": [
+        {"id": "only", "run": f'"{sys.executable}" -c "raise SystemExit(0)"'},
+    ]}), encoding="utf-8")
+    assert main(["phase", "preflight", "--spec", str(spec)]) == 0
+    assert "no succeeded_by pairs" in capsys.readouterr().out

@@ -487,6 +487,10 @@ def _verifier_block(check_report: Any, checks: list[Any] | None) -> dict[str, An
 
     Check *ids* are deliberately not stored here — they are operator-authored
     and path-like, and this block is the part of the record the export carries.
+    Check *commands* (the per-check ``cmd`` persisted in ``output.json`` as of
+    0.6.0) are excluded for the same reason, more so: an argv is exactly the
+    kind of operator-authored, secret-bearing string an export must never
+    carry.
     """
     kind_counts: dict[str, int] = {}
     for check in checks or []:

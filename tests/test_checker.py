@@ -59,6 +59,29 @@ def test_file_exists(tmp_project):
     assert absent.passed is False
 
 
+def test_check_result_persists_the_exact_command(tmp_project):
+    # ask 6/#33: a verdict whose command lives only in a since-edited spec or
+    # a vanished sidecar is unauditable. String form verbatim; argv form as
+    # the list (a joined argv is not re-parseable into the argv it came from).
+    shell = run_check(_check("s", run=f'"{sys.executable}" -c "raise SystemExit(0)"'),
+                      tmp_project)
+    assert shell.cmd == f'"{sys.executable}" -c "raise SystemExit(0)"'
+    argv = run_check(_check("a", run=[sys.executable, "-c", "pass"]), tmp_project)
+    assert argv.cmd == [sys.executable, "-c", "pass"]
+    assert argv.to_dict()["cmd"] == [sys.executable, "-c", "pass"]
+    no_cmd = run_check(_check("f", expect={"kind": "file_exists", "path": "x.txt"}),
+                       tmp_project)
+    assert no_cmd.cmd is None
+
+
+def test_persisted_output_json_carries_the_command(tmp_runs, tmp_project):
+    check = _check("c", run=[sys.executable, "-c", "pass"])
+    run_checks([check], cwd=tmp_project)
+    [run] = list_run_records()
+    payload = run.sub_invocations[0].load_output()
+    assert payload["checks"][0]["cmd"] == [sys.executable, "-c", "pass"]
+
+
 def test_unrunnable_check_is_a_failure_not_a_pass(tmp_project):
     # A command that cannot complete must never be graded as passing.
     r = run_check(_check("hang", run=f'"{sys.executable}" -c "import time; time.sleep(5)"'),

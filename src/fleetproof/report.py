@@ -109,13 +109,18 @@ def state_label(dispatch: DispatchRecord) -> str:
 
 
 def tier_label(dispatch: DispatchRecord) -> str:
-    """Tier, with a trailing '!' when declared, '?' when defaulted, '~' when inherited.
+    """Tier, with a trailing '!' when declared, '?'/'=' when defaulted, '~' when inherited.
 
     Inference is a guess off the shape of the run tree, and it degrades to ``lane``
     when a parent record is unreadable — so which provenance produced this tier
-    changes how much the tier is worth. A defaulted tier ('?') means no intent
-    declared one and the capture fell back — the visible trace of a missed
-    intent, which the '!' marker used to paper over by claiming a declaration.
+    changes how much the tier is worth. A defaulted tier splits in two, on
+    ``intent_source`` (only ever written by a consumed sidecar): '=' means an
+    intent DID match but declared no tier — the prompt and manifest are the
+    dispatcher's, only the tier fell back; pass ``--tier`` to ``dispatch
+    intent`` to declare it. '?' means no intent matched at all and the whole
+    capture fell back — the visible trace of a missed intent. The two used to
+    share '?', so a dispatcher who omitted ``--tier`` read their own matched
+    sidecar as a miss (observed in a field deployment on Windows).
     An inherited tier ('~') means no sidecar matched but an earlier dispatch of
     the same agent type in the same session had one, and this dispatch is under
     that contract — distinct from '!' because nobody declared it *for this
@@ -132,7 +137,7 @@ def tier_label(dispatch: DispatchRecord) -> str:
     if dispatch.tier_source == TIER_SOURCE_DECLARED:
         marker = "!"
     elif dispatch.tier_source == TIER_SOURCE_DEFAULTED:
-        marker = "?"
+        marker = "=" if dispatch.intent_source is not None else "?"
     elif dispatch.tier_source == TIER_SOURCE_INHERITED:
         if (dispatch.inherited_from_state == STATE_TERMINATED
                 and dispatch.inherited_from_verdict is None):

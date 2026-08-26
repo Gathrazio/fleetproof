@@ -680,7 +680,12 @@ def ungraded_termination_line(ungraded: list[DispatchRecord], scope_known: bool)
     """
     if not ungraded:
         return None
-    scope = "this session" if scope_known else "in the dispatches shown"
+    # One scope rule with the board's other footer counts: ledger-scoped,
+    # never listing-scoped. "In the dispatches shown" was false whenever a
+    # row filter (--open) hid a terminated dispatch the count still covered;
+    # "on the board" says what the count actually runs over — everything on
+    # the ledger — when no session scope is known.
+    scope = "this session" if scope_known else "on the board"
     ids = ", ".join(r.run_id for r in ungraded)
     return (f"{len(ungraded)} dispatch(es) terminated ungraded {scope} — {ids}. "
             "A claim was recorded and closed with no verdict; an absent grade "
@@ -714,7 +719,8 @@ def advisory_verdict_line(advisory: list[DispatchRecord], scope_known: bool) -> 
     """
     if not advisory:
         return None
-    scope = "this session" if scope_known else "in the dispatches shown"
+    # Same scope rule as ungraded_termination_line: ledger-scoped wording.
+    scope = "this session" if scope_known else "on the board"
     details = "; ".join(
         f"{r.run_id}: {r.verdict_detail or 'no detail recorded'}" for r in advisory)
     return (f"{len(advisory)} dispatch(es) graded advisory {scope} — a blocking "

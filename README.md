@@ -66,6 +66,7 @@ No language model sits in the grading path. Grading is comparison.
 | `fleetproof telemetry` | v0.3: per-dispatch outcome records, a local reliability summary, and a strict-allowlist export. |
 | `fleetproof arm` / `disarm`, `dispatch park`, `fleet --orphans` | v0.4: the fleet-operating surface — phase arming, deliberate termination, and the orphan-stop view. |
 | `dispatch intent --preflight`, `check control`, `phase advance`, `init --library` | v0.5: grader integrity — see the grader run before pinning it, record what it was controlled against, retire a check its phase has outgrown, and start from graders that carry their own source of truth. |
+| `dispatch park --unsatisfiable`, `phase preflight`, `check control --upgrade`, `dispatch intent --dry-run` | v0.6: honest bookkeeping — an escalation is neither a success nor a failure, a vacuous successor is caught before it retires anything, a creation-work control is upgraded from the real emission, and every surface says what it actually wrote. |
 
 Runtime dependencies: none (Python standard library only). A tool whose job is
 being trustworthy should add as little dependency and supply-chain surface as it can.
@@ -148,7 +149,14 @@ never inferred — it is a role you assign, not a shape that shows up in a run t
 On the board a declared tier carries a trailing `!`, so you can tell a decision
 from a guess — and a tier that is neither declared nor inferred but *defaulted*
 (a captured spawn no intent matched) renders as `lane?`, because a guess
-wearing a declared tier's clothes is how a leaf gets graded as a lane. A fourth
+wearing a declared tier's clothes is how a leaf gets graded as a lane — and,
+as of 0.6.0, a matched sidecar whose intent declared no tier renders `lane=`,
+not `lane?`: the prompt and manifest are the dispatcher's, only the tier fell
+back (pass `--tier` to `dispatch intent` to declare it). The two used to
+share `?`, so a dispatcher who omitted `--tier` read their own matched
+sidecar as a miss. `dispatch intent` also echoes the recorded tier and its
+provenance on every write (`tier recorded: lane (defaulted — pass --tier to
+declare)`), so the omission is visible before the spawn. A fourth
 provenance, `inherited` (`lane~`), means no sidecar matched this spawn but an
 earlier dispatch of the same agent type in the same session carried a declared
 intent, and this one took its prompt, manifest, and tier from that record
@@ -217,11 +225,18 @@ fleetproof dispatch park <run-id> --reason "..."  # terminate on purpose, reason
 
 fleetproof dispatch intent --agent recon --prompt-file p.md \
     [--manifest m.json] [--tier lane] [--role tester] \
-    [--preflight] [--strict-controls]
+    [--preflight] [--strict-controls] [--dry-run]
                                               # declare the NEXT spawn of an agent
                                               # type; the start capture consumes it.
-                                              # --preflight runs the manifest checks
-                                              # now and records nothing (v0.5)
+                                              # Echoes the recorded tier and its
+                                              # provenance. --preflight runs the
+                                              # manifest checks now against the
+                                              # sidecar this command writes — the
+                                              # sidecar IS written and consumable
+                                              # (the announce line says so); no
+                                              # checker run lands under runs/.
+                                              # --dry-run: validate (and preflight)
+                                              # writing nothing at all (v0.6)
 fleetproof dispatch new --session-id <id> ... # or export FLEETPROOF_SESSION_ID: a
                                               # session-less CLI dispatch can never
                                               # be adopted by a hook stop (v0.5)
@@ -245,6 +260,9 @@ fleetproof disarm --note "why" [--tier ...]   # a gate goes advisory; note requi
 
 fleetproof phase advance --retire <id> --note "why"   # retire a check outside
 fleetproof phase status / phase reset                 # the hashed spec (v0.5)
+fleetproof phase preflight                    # run every succeeded_by successor
+                                              # NOW, recording nothing; non-zero
+                                              # exit per vacuous successor (v0.6)
 fleetproof init --library                     # the shipped check library (v0.5)
 ```
 
@@ -263,9 +281,10 @@ transition trail, and which process wrote each transition.
   --prompt-file <file>` writes `.fleetproof/intents/<agent_type>.json`, and the
   next SubagentStart of that agent type consumes it — one intent, one spawn.
 - Captured subagents without a declared intent tier are recorded at `lane`
-  tier, marked `defaulted` — `lane?` on the board — and the miss is loud: the
-  start capture writes a stderr line naming the spawn that matched nothing and
-  listing the sidecars that were present. Real nesting depth is not visible
+  tier, marked `defaulted` — `lane?` on the board when nothing matched,
+  `lane=` when a sidecar matched but declared no tier — and the clean miss is
+  loud: the start capture writes a stderr line naming the spawn that matched
+  nothing and listing the sidecars that were present. Real nesting depth is not visible
   from the payload — there is no parent-agent field — so declaring a tier
   beats inferring it wrongly.
 - An agent killed mid-turn can reach SubagentStop with an empty final message,
@@ -393,7 +412,9 @@ calls drift apart, key the sidecar to the role instead with
 role, never a prefix guess. Then look at `fleetproof fleet` right after each
 spawn: the row should show the real prompt and a `tier!`. A `lane?` means no
 intent matched — the dispatch is running with a placeholder prompt at a
-defaulted tier, and the capture you thought you declared didn't happen.
+defaulted tier, and the capture you thought you declared didn't happen. A
+`lane=` is the milder cousin: your sidecar matched, but it declared no tier —
+re-issue with `--tier` if the spawn is not a lane.
 
 **Never dispatch an agent against a blocking check its seat cannot satisfy.**
 A lane gated on something only the bridge or the operator can do will fail,
@@ -455,7 +476,13 @@ Every checker run a gate orders stamps the arming that governed it into its
 "publish phase"}` — and `fleetproof show <run>` renders it, so a `verdict:
 fail` in the evidence is readable as blocked-or-not without the arming file as
 it was at the time. A bare `fleetproof check` has no gate and records
-`"state": "n/a"`.
+`"state": "n/a"`. As of 0.6.0 `show` also badges every checker row by its
+*verdict*, not its process exit — a checker that blocked a lane under a
+disarmed gate exits 0, and `[ok]` off the exit code taught operators that a
+blocking failure looked fine. The row reads `[fail] fleetproof check ...
+verdict: fail (blocking_failed: 2)` (both formats carry `verdict` and
+`blocking_failed`), and non-checker rows wear their exit plainly (`[exit:0]`),
+which claims nothing.
 
 **The graders are part of the spec.** The tree hash pins every file under
 `.fleetproof/checks/` alongside `checks.json` itself. A check whose grading
@@ -487,7 +514,13 @@ denylist-filtered — but redaction is a backstop, not a permission slip. The
 PostToolUse hook records `tool_input` *verbatim by design*: redacting
 arbitrary code before recording it would be false comfort about what your
 agents ran, so a secret typed on a command line is a secret in the run log,
-full stop. Never type one. And add `.fleetproof/runs/` to `.gitignore` — it
+full stop. Never type one. The same applies to check commands: as of 0.6.0
+every persisted check entry in `output.json` records the exact `cmd` the
+runner executed (string form verbatim, argv form as the list) so the verdict
+is auditable after the spec or sidecar it came from is gone — and redaction
+does **not** cover it, so a token in a check's command line persists verbatim
+in the local record. It stays local: telemetry and the export carry no check
+ids and no check commands. And add `.fleetproof/runs/` to `.gitignore` — it
 is evidence, not source.
 
 ## Operating a fleet (v0.5)
@@ -514,13 +547,20 @@ different contract, write a new sidecar before the re-message.
 **A claim closed with no verdict is announced, not filed.** `fleetproof fleet`
 prints `N dispatch(es) terminated ungraded this session — <ids>. A claim was
 recorded and closed with no verdict; an absent grade is not a passing grade.`
-after the orphan count whenever N > 0 (counted off the ledger, so `--open`
-cannot hide it; "in the dispatches shown" when no session is known; the JSON
-form carries `terminated_ungraded_count`, `terminated_ungraded`, and a
-per-row `terminated_ungraded` flag). The bridge's Stop gate writes the same
-line to stderr on every stop while the condition holds. "Terminated ungraded"
-is precise: state `terminated`, no verdict transition ever, at least one
-`reported` transition, and not parked.
+after the orphan count whenever N > 0 (the JSON form carries
+`terminated_ungraded_count`, `terminated_ungraded`, and a per-row
+`terminated_ungraded` flag). The bridge's Stop gate writes the same line to
+stderr on every stop while the condition holds. "Terminated ungraded" is
+precise: state `terminated`, no verdict transition ever, at least one
+`reported` transition, and not parked. One scope rule governs every footer
+count — orphans, ungraded, advisory — as of 0.6.0: the counts are
+**ledger-scoped, never listing-scoped**. With a session known (`--session`,
+or `FLEETPROOF_SESSION_ID` in the environment) each line says "this session"
+and counts that session; with neither it says "on the board" and counts the
+whole ledger. Row filters like `--open` never shrink the counts, which is
+why the wording is never "in the dispatches shown" — and the orphan line no
+longer says "this session" from a session-less shell while counting every
+orphan on disk.
 
 **Manifest checks carry the full check shape, and point at scripts inside the
 pin.** A dispatch manifest's `checks` entries accept everything a
@@ -557,8 +597,11 @@ intent --preflight` (and `dispatch new --manifest ... --preflight`) runs every
 manifest check now, from the project root, with the gate's runner and the
 identity environment it would set (run id empty — it does not exist yet), and
 prints per check the exact command line, the expectation, the exit code,
-PASS/FAIL, and a redacted output tail. Nothing is written under `runs/`; the
-exit code is 0 whatever the checks did. Then `check control` records, under
+PASS/FAIL, and a redacted output tail. Nothing is written under `runs/` — but
+the *sidecar* is a real, consumable write, and as of 0.6.0 the output says so
+before the path (`sidecar written (next spawn of X consumes it):`); use
+`--dry-run` to parse, validate, and preflight while writing nothing at all.
+The exit code is 0 whatever the checks did. Then `check control` records, under
 `.fleetproof/controls/<check-id>.json`, the pass and fail samples a check was
 exercised against, their hashes, the provenance of each sample (`captured` —
 a real emission — or `authored`; the pass direction may also be
@@ -663,11 +706,25 @@ between the grader and the task it grades. Four rules, all cheap:
 4. **A lane whose prompt contradicts existing code escalates before changing
    either.** Put this sentence in the standing lane instructions; the field
    did not have it there.
+5. **A successor check must assert something the predecessor's completion
+   causes, not something its starting state already satisfies; run the
+   successor against the pre-work state — if it passes there, it is not a
+   successor, it is a hole.** A vacuous successor retires its predecessor on
+   contact, so the pair gates nothing from the first stop. `fleetproof phase
+   preflight` (v0.6) is this rule as a command: it runs every `succeeded_by`
+   successor NOW, against the current tree, recording nothing — a preview
+   must never earn the persisted pass that would itself retire the
+   predecessor — and exits non-zero naming each successor that already
+   passes (`vacuous successor: would retire <id> before any work exists`).
+   Run it when you author a succession pair, before any dispatch pins the
+   spec; `dispatch intent --preflight` cannot catch this, because succession
+   lives in the repo spec, not the manifest.
 
-`--preflight`, `check control`, `--strict-controls`, and the shipped library
-exist to make these four rules the path of least resistance. None of them can
-tell you that a field name is wrong; all of them put the real emission in
-front of you before an agent is pointed at the check.
+`--preflight`, `check control`, `--strict-controls`, `phase preflight`, and
+the shipped library exist to make these five rules the path of least
+resistance. None of them can tell you that a field name is wrong; all of them
+put the real emission in front of you before an agent is pointed at the
+check.
 
 ## Install (each line is one command in Claude Code)
 
@@ -748,6 +805,28 @@ manifest `cmd` at a script under `.fleetproof/checks/` so the grader is inside
 the tree pin. Checks execute from the resolved project root, not from
 wherever the hook's shell happened to be `cd`'d, and every rendered verdict
 prints the cwd it ran from.
+
+A dispatch manifest carries three declared lists — `deliverables`,
+`allowed_paths`, `checks` — plus `check_map`, the object that *joins* the
+first to the last: which checks stand as evidence for which deliverable.
+Telemetry's `outcome.coverage` is computed from exactly this join (executed
+checks over deliverables, through the map), so a manifest that declares
+deliverables and checks but no `check_map` measures nothing — coverage reads
+`null`, and `dispatch intent` / `dispatch new` warn on stderr when both
+halves are present with no map (v0.6; the key was parsed and validated since
+0.3 but no surface ever named it):
+
+```json
+{
+  "manifest": {
+    "deliverables": ["health endpoint"],
+    "checks": [
+      { "id": "health-field", "cmd": "python .fleetproof/checks/http_json_field.py --url http://localhost:8080/health --field days_remaining --type number" }
+    ],
+    "check_map": { "health endpoint": ["health-field"] }
+  }
+}
+```
 
 An agent is welcome to propose or edit checks. The guarantee FleetProof makes is
 narrower and firmer than "the agent verified its work": it is that *something

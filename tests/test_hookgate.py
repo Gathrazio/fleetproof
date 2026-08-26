@@ -2527,6 +2527,41 @@ def test_per_tier_notes_and_states_are_independent(tmp_path, monkeypatch):
     assert arming["notes"]["coordinator"] == "build phase"
 
 
+def test_top_level_arming_trio_stays_bridge_pinned_on_a_coordinator_write(
+        tmp_path, monkeypatch):
+    # ask 11/#40: top-level note was always the bridge's, but set_at/by came
+    # from whatever tier was just set — so setting the coordinator stamped
+    # the bridge's note with the coordinator's time and actor. The 0.4.0
+    # trio is one coherent view of the bridge tier; per-tier truth is in
+    # notes/set.
+    from fleetproof.hookgate import ADVISORY, arming_path, set_arming
+    _setup_project(tmp_path, [_PASS], monkeypatch)
+    set_arming(ADVISORY, note="publish phase", tier="bridge", by="bridge-op")
+    before = json.loads(arming_path().read_text(encoding="utf-8"))
+    set_arming(ADVISORY, note="build phase", tier="coordinator", by="coord-op")
+    after = json.loads(arming_path().read_text(encoding="utf-8"))
+    assert after["note"] == "publish phase"
+    assert after["set_at"] == before["set_at"]  # the bridge's write, not the coordinator's
+    assert after["by"] == "bridge-op"
+    assert after["set"]["coordinator"]["by"] == "coord-op"
+    assert after["set"]["coordinator"]["set_at"] is not None
+    assert after["notes"]["coordinator"] == "build phase"
+
+
+def test_top_level_arming_trio_is_empty_when_the_bridge_was_never_set(
+        tmp_path, monkeypatch):
+    # A coordinator-only file: the bridge has no write to report, and the
+    # 0.4.0 trio must not borrow the coordinator's — a null is coherent, a
+    # wrong attribution is not.
+    from fleetproof.hookgate import ADVISORY, arming_path, set_arming
+    _setup_project(tmp_path, [_PASS], monkeypatch)
+    set_arming(ADVISORY, note="build phase", tier="coordinator", by="coord-op")
+    raw = json.loads(arming_path().read_text(encoding="utf-8"))
+    assert raw["note"] == ""
+    assert raw["set_at"] is None and raw["by"] is None
+    assert raw["set"]["coordinator"]["by"] == "coord-op"
+
+
 def test_unknown_coordinator_value_arms_the_coordinator_alone(tmp_path, monkeypatch):
     from fleetproof.hookgate import arming_path, load_arming
     _setup_project(tmp_path, [_PASS], monkeypatch)

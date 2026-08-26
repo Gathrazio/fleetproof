@@ -125,6 +125,15 @@ class CheckResult:
     duration_ms: float
     stdout_tail: str = ""
     stderr_tail: str = ""
+    # The exact command the runner executed — string form verbatim, argv form
+    # as the list — because a persisted verdict whose command lives only in a
+    # since-edited spec or a vanished intent sidecar is unauditable (asked for
+    # from a field deployment on Windows). Redaction does NOT cover this
+    # field: it masks output tails, so a secret typed into a check's command
+    # line persists verbatim in the local output.json. It stays local —
+    # telemetry excludes check commands for the same reason it excludes check
+    # ids (operator-authored and path-like). Additive: None on older records.
+    cmd: str | list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -363,6 +372,7 @@ def run_check(check: Check, cwd: Path, timeout: int = DEFAULT_TIMEOUT_S,
         duration_ms=round(duration_ms, 3),
         stdout_tail=_tail(redact_output(stdout, check.redact)),
         stderr_tail=_tail(redact_output(stderr, check.redact)),
+        cmd=check.run,
     )
 
 

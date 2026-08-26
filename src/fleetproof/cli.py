@@ -17,7 +17,8 @@ surface as it can. Subcommands:
     subagent-stop  SubagentStop-hook entry: the per-subagent report-and-verify gate
     arm       arm a gate (the default state); --tier bridge|coordinator
     disarm    set a gate to advisory; requires --note; --tier bridge|coordinator
-    phase     advance (retire checks, outside the hashed spec) / status / reset
+    phase     advance (retire checks, outside the hashed spec) / status /
+              reset / preflight (the vacuous-successor tripwire)
     dispatch  ledger verbs: new / report / close / park a dispatch; intent
               writes the sidecar the SubagentStart capture consumes
     fleet     the dispatch board — every dispatch, its state, and whether it reported
@@ -82,6 +83,7 @@ from .hookgate import (
     ADVISORY,
     ARMABLE_TIERS,
     ARMED,
+    CAPTURED_SUBAGENT_TIER,
     DEFAULT_ARMING_TIER,
     LANE_NEVER_DISARMED,
     load_arming,
@@ -105,6 +107,8 @@ from .ledger import (
     REASON_ABANDONED,
     REASON_OPERATOR_CLOSE,
     REASON_PARKED_PREFIX,
+    TIER_SOURCE_DECLARED,
+    TIER_SOURCE_DEFAULTED,
     VALID_TERMINATE_REASONS,
     LedgerError,
     advisory_verdict_line,
@@ -455,52 +459,94 @@ def _cmd_show(args: argparse.Namespace) -> int:
         _emit_error("run_not_found", f"No run record for {args.run_id!r}", args.format)
         return 1
     if args.format == "json":
+        rows = []
+        for s in r.sub_invocations:
+            verdict, blocking_failed = _checker_verdict(_checker_output(s))
+            rows.append({
+                "tool": s.tool,
+                "subcmd": s.subcmd,
+                "started_at": s.started_at,
+                "exit_code": s.exit_code,
+                "duration_ms": s.duration_ms,
+                "exception_type": s.exception_type,
+                "record_dir": str(s.record_dir),
+                "arming": _checker_arming(s),
+                # The checker's own grade, off its output.json — null for
+                # non-checker invocations and records with no readable
+                # verdict. The process exit is not the verdict (see below).
+                "verdict": verdict,
+                "blocking_failed": blocking_failed,
+            })
         print(json.dumps({
             "run_id": r.run_id,
             "root_tool": r.root_tool,
             "started_at": r.started_at,
             "session_id": r.session_id,
-            "sub_invocations": [
-                {
-                    "tool": s.tool,
-                    "subcmd": s.subcmd,
-                    "started_at": s.started_at,
-                    "exit_code": s.exit_code,
-                    "duration_ms": s.duration_ms,
-                    "exception_type": s.exception_type,
-                    "record_dir": str(s.record_dir),
-                    "arming": _checker_arming(s),
-                }
-                for s in r.sub_invocations
-            ],
+            "sub_invocations": rows,
         }, indent=2))
         return 0
     print(f"{r.run_id}  root_tool={r.root_tool or '-'}  started={(r.started_at or '-')[:19]}"
           f"  session={r.session_id or '-'}")
     for s in r.sub_invocations:
-        if s.exit_code is None:
+        # [ok]/[fail] is reserved for the checker's VERDICT: a checker that
+        # blocked a lane under a disarmed gate exits 0, and even under an
+        # armed gate the process exit is not the grade — a `[ok]` off exit
+        # codes taught operators that a blocking failure looked fine
+        # (observed in a field deployment on Windows). Every other row wears
+        # its exit code plainly (`exit:0`), which claims nothing it isn't.
+        payload = _checker_output(s)
+        verdict, blocking_failed = _checker_verdict(payload)
+        verdict_bit = ""
+        if verdict is not None:
+            badge = "ok" if verdict == "pass" else "fail"
+            verdict_bit = f"  verdict: {verdict}"
+            if verdict != "pass" and blocking_failed is not None:
+                verdict_bit += f" (blocking_failed: {blocking_failed})"
+        elif s.exit_code is None:
             badge = "?"
-        elif s.exit_code == 0 and not s.exception_type:
-            badge = "ok"
         else:
-            badge = "fail"
+            badge = f"exit:{s.exit_code}"
+            if s.exception_type:
+                badge += "!"
         dur = f"{s.duration_ms:.1f}ms" if s.duration_ms is not None else "?ms"
-        print(f"  [{badge}] {s.tool} {s.subcmd} ({dur})  {s.record_dir}")
+        print(f"  [{badge}] {s.tool} {s.subcmd} ({dur}){verdict_bit}  {s.record_dir}")
         # A checker verdict says which gate's arming governed it, every
         # time — a reader six months on must not need arming.json as it was.
-        stamp = format_arming_stamp(_checker_arming(s))
+        stamp = format_arming_stamp(payload.get("arming")) if payload else None
         if stamp:
             print(f"        {stamp}")
     return 0
 
 
-def _checker_arming(sub) -> dict | None:
-    """The arming stamp on a checker sub-invocation's output.json, or None
-    (older records, non-checker invocations, unreadable output)."""
+def _checker_output(sub) -> dict | None:
+    """A checker sub-invocation's output.json payload, or None (non-checker
+    invocations, unreadable output)."""
     if sub.tool != "fleetproof" or sub.subcmd != "check":
         return None
     payload = sub.load_output()
-    if not isinstance(payload, dict):
+    return payload if isinstance(payload, dict) else None
+
+
+def _checker_verdict(payload: dict | None) -> tuple[str | None, int | None]:
+    """``(verdict, blocking_failed)`` off a checker's output.json; Nones when
+    absent or poisoned — show must never crash on the record it is auditing."""
+    if payload is None:
+        return None, None
+    verdict = payload.get("verdict")
+    if not isinstance(verdict, str):
+        return None, None
+    summary = payload.get("summary")
+    blocking_failed = summary.get("blocking_failed") if isinstance(summary, dict) else None
+    if not isinstance(blocking_failed, int) or isinstance(blocking_failed, bool):
+        blocking_failed = None
+    return verdict, blocking_failed
+
+
+def _checker_arming(sub) -> dict | None:
+    """The arming stamp on a checker sub-invocation's output.json, or None
+    (older records, non-checker invocations, unreadable output)."""
+    payload = _checker_output(sub)
+    if payload is None:
         return None
     arming = payload.get("arming")
     return arming if isinstance(arming, dict) else None
@@ -783,6 +829,33 @@ def _controls_ok(manifest: dict | None, *, strict: bool, fmt: str) -> bool:
     return True
 
 
+def _warn_missing_check_map(manifest: dict | None) -> None:
+    """One stderr line when a manifest declares deliverables AND checks but no
+    ``check_map`` joining them.
+
+    Beside the controls warnings, warn-only: the manifest is legal, but
+    nothing joins any check to any deliverable, so telemetry's
+    ``outcome.coverage`` will read null however thoroughly the checks grade
+    the work — a field-deployment operator authored both halves and never
+    learned the mapping key existed, because no surface named it.
+    """
+    m = manifest or {}
+    deliverables = m.get("deliverables")
+    checks = m.get("checks")
+    if not (isinstance(deliverables, list) and deliverables):
+        return
+    if not (isinstance(checks, list) and checks):
+        return
+    check_map = m.get("check_map")
+    if isinstance(check_map, dict) and check_map:
+        return
+    print(
+        f"WARNING: manifest declares {len(deliverables)} deliverable(s) and "
+        f"{len(checks)} check(s) but no check_map joining them — coverage "
+        "will read null. Add manifest.check_map: "
+        "{\"<deliverable>\": [\"<check-id>\", ...]}.", file=sys.stderr)
+
+
 # `dispatch new` from a shell with no session id. The dispatch is still
 # recorded — the ledger records what happened — but the operator is told what
 # that record can and cannot do.
@@ -815,6 +888,7 @@ def _cmd_dispatch_new(args: argparse.Namespace) -> int:
 
     if manifest is not None and not _manifest_keys_ok(manifest, args.format):
         return 2
+    _warn_missing_check_map(manifest)
     if manifest is not None and not _controls_ok(
             manifest, strict=getattr(args, "strict_controls", False), fmt=args.format):
         return 1
@@ -884,14 +958,21 @@ def _cmd_dispatch_intent(args: argparse.Namespace) -> int:
     real prompt on Windows is how prompts get mangled), the manifest is
     validated here where an error still has someone to land on, and the printed
     path is the audit surface: the file that will vanish when the spawn
-    consumes it.
+    consumes it. The human output says which tier was recorded and whether it
+    was declared or defaulted — the write path used to print the path alone,
+    so ``--tier coordinator`` and its omission were indistinguishable until
+    the board rendered the spawn (observed in a field deployment on Windows).
 
     ``--preflight`` additionally parses every manifest check with the gate's
     parser (a malformed one is an error here, not a skipped line in a hook's
     stderr) and, after the sidecar is written, runs each check now and prints
-    what the gate will see — see :func:`_preflight_manifest`. Nothing is
-    recorded; the exit code is 0 whatever the checks did, because a preview
-    of graders that mostly cannot pass yet is the point, not a failure.
+    what the gate will see — see :func:`_preflight_manifest`. The sidecar IS
+    written and consumable (the announce line says so); what is never written
+    is a checker run under ``runs/``. The exit code is 0 whatever the checks
+    did, because a preview of graders that mostly cannot pass yet is the
+    point, not a failure. ``--dry-run`` parses and validates everything —
+    and, with ``--preflight``, runs the checks — but writes nothing at all:
+    no sidecar, nothing under ``runs/``.
     """
     try:
         # utf-8-sig for the same reason as _resolve_prompt: strip a
@@ -928,26 +1009,53 @@ def _cmd_dispatch_intent(args: argparse.Namespace) -> int:
             _emit_error("bad_manifest_check", str(e), args.format)
             return 2
 
+    _warn_missing_check_map(manifest)
     if not _controls_ok(manifest, strict=args.strict_controls, fmt=args.format):
         return 1
 
-    try:
-        path = write_intent(args.agent, prompt, manifest=manifest, tier=args.tier,
-                            role=args.role)
-    except LedgerError as e:
-        _emit_error("ledger_error", str(e), args.format)
-        return 1
+    # What the capture will actually record: the declared tier, or the
+    # captured-subagent default with its provenance said plainly. Echoed on
+    # every write so an omitted --tier is visible here, not first on the
+    # board as a surprising 'lane='.
+    if args.tier:
+        tier, tier_source = args.tier, TIER_SOURCE_DECLARED
+        tier_echo = f"tier recorded: {tier} (declared)"
+    else:
+        tier, tier_source = CAPTURED_SUBAGENT_TIER, TIER_SOURCE_DEFAULTED
+        tier_echo = (f"tier recorded: {tier} (defaulted — pass --tier to "
+                     "declare)")
+
+    path = None
+    if not args.dry_run:
+        try:
+            path = write_intent(args.agent, prompt, manifest=manifest,
+                                tier=args.tier, role=args.role)
+        except LedgerError as e:
+            _emit_error("ledger_error", str(e), args.format)
+            return 1
 
     preflight = None
     if args.preflight:
         preflight = _preflight_manifest(checks, tier=args.tier, agent_type=args.agent)
     if args.format == "json":
-        payload = {"ok": True, "agent_type": args.agent, "intent_path": str(path)}
+        payload = {"ok": True, "agent_type": args.agent,
+                   "intent_path": str(path) if path is not None else None,
+                   "tier": tier, "tier_source": tier_source,
+                   "dry_run": bool(args.dry_run)}
         if preflight is not None:
             payload["preflight"] = preflight
         print(json.dumps(payload, indent=2 if preflight is not None else None))
     else:
-        print(str(path))
+        print(tier_echo)
+        if args.dry_run:
+            print("dry run: no sidecar written; nothing recorded.")
+        else:
+            # The sidecar is a real, consumable write — --preflight's
+            # "records nothing" means no checker run under runs/, and the
+            # narrower phrasing let an operator read the whole command as a
+            # pure preview (observed in a field deployment on Windows).
+            print(f"sidecar written (next spawn of {args.agent} consumes it):")
+            print(str(path))
         if preflight is not None:
             print(_render_preflight(preflight))
     return 0
@@ -1177,6 +1285,79 @@ def _cmd_phase_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_phase_preflight(args: argparse.Namespace) -> int:
+    """Run every ``succeeded_by`` successor against the CURRENT tree, recording
+    nothing, and flag each one that already passes.
+
+    The successor rule (README, *Grader integrity*): a successor must assert
+    something the predecessor's completion causes, not something the starting
+    state already satisfies. A successor that passes before any work exists
+    retires its predecessor on contact — the pair gates nothing from the
+    first stop — and ``dispatch intent --preflight`` cannot catch it, because
+    succession lives in the repo spec, not the manifest (a field deployment
+    authored exactly this pair and disclosed it as their own finding). Exit
+    is non-zero when any vacuous successor is found; a sound pair — the
+    successor fails pre-work — passes quietly.
+    """
+    try:
+        checks = load_checks(Path(args.spec) if args.spec else None)
+    except CheckSpecError as e:
+        _emit_error("check_spec_error", str(e), args.format)
+        return 2
+    by_id = {c.id: c for c in checks}
+    pairs = [(c, by_id[c.succeeded_by]) for c in checks if c.succeeded_by]
+    if not pairs:
+        if args.format == "json":
+            print(json.dumps({"ok": True, "pairs": [], "vacuous_count": 0}))
+        else:
+            print("phase preflight: no succeeded_by pairs in the spec.")
+        return 0
+    root = project_root()
+    # Each distinct successor runs once, now, with the checker's own runner —
+    # recording nothing, same posture as dispatch intent --preflight: a
+    # preview is not evidence, and a vacuous successor must never earn a
+    # persisted pass that would itself retire the predecessor.
+    results = {}
+    for _, successor in pairs:
+        if successor.id not in results:
+            results[successor.id] = run_check(successor, root)
+    rows = []
+    for predecessor, successor in pairs:
+        result = results[successor.id]
+        rows.append({
+            "predecessor": predecessor.id,
+            "successor": successor.id,
+            "successor_passed": result.passed,
+            "vacuous": result.passed,
+            "returncode": result.returncode,
+            "detail": result.detail,
+        })
+    vacuous = [row for row in rows if row["vacuous"]]
+    if args.format == "json":
+        print(json.dumps({"ok": not vacuous, "pairs": rows,
+                          "vacuous_count": len(vacuous)}, indent=2))
+        return 1 if vacuous else 0
+    print(f"phase preflight: {len(rows)} succeeded_by pair(s), successors run "
+          f"now from {root}; nothing recorded")
+    for row in rows:
+        if row["vacuous"]:
+            print(f"vacuous successor: '{row['successor']}' already passes "
+                  f"against the pre-work tree — would retire "
+                  f"'{row['predecessor']}' before any work exists "
+                  f"({row['detail']})")
+        else:
+            print(f"[ok] '{row['predecessor']}' -> '{row['successor']}': "
+                  f"successor fails pre-work ({row['detail']})")
+    if vacuous:
+        print(f"phase preflight: {len(vacuous)} vacuous of {len(rows)} — a "
+              "successor must assert something the predecessor's completion "
+              "causes, not something its starting state already satisfies.")
+        return 1
+    print(f"phase preflight: every successor fails pre-work; succession is "
+          "sound.")
+    return 0
+
+
 def _arming_board_lines(arming: dict) -> list[str]:
     """The fleet board's echo of every disarmed gate — one line per tier,
     each with its own note. The armed default stays quiet."""
@@ -1214,8 +1395,9 @@ def _cmd_fleet_orphans(args: argparse.Namespace) -> int:
     return 0
 
 
-def _orphan_count_line(orphans: list[dict]) -> str:
-    return (f"{len(orphans)} orphan stop(s) this session — not graded "
+def _orphan_count_line(orphans: list[dict], scope_known: bool) -> str:
+    scope = "this session" if scope_known else "on the board"
+    return (f"{len(orphans)} orphan stop(s) {scope} — not graded "
             "(view: fleetproof fleet --orphans).")
 
 
@@ -1224,12 +1406,17 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
     if args.orphans:
         return _cmd_fleet_orphans(args)
     records = list_dispatches(session_id=args.session, non_terminal_only=args.open)
-    orphans = list_orphan_stops(session_id=args.session)
-    # "This session" is the --session filter, else the hook session the CLI
-    # is running inside (FLEETPROOF_SESSION_ID); with neither, the count runs
-    # over everything on the board and the wording says so. Counted off the
-    # ledger directly, not off `records`, so --open cannot hide it.
+    # One scope rule for every footer count (orphans, ungraded, advisory):
+    # ledger-scoped, never listing-scoped. "This session" is the --session
+    # filter, else the hook session the CLI is running inside
+    # (FLEETPROOF_SESSION_ID); with neither, the count runs over everything
+    # on the board and the wording says so. Counted off the ledger directly,
+    # not off `records`, so --open cannot hide it — which is why the wording
+    # is never "in the dispatches shown": the orphan line used to say "this
+    # session" from a session-less shell while counting every orphan on disk
+    # (observed in a field deployment on Windows).
     scope_session = args.session or os.environ.get(SESSION_ID_ENV) or None
+    orphans = list_orphan_stops(session_id=scope_session)
     ungraded = list_ungraded_terminations(scope_session)
     ungraded_line = ungraded_termination_line(ungraded, scope_known=bool(scope_session))
     # The advisory stop is a stop: the graded agent never sees its failure
@@ -1267,7 +1454,7 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
     if not records:
         print("No dispatches found.")
         if orphans:
-            print(_orphan_count_line(orphans))
+            print(_orphan_count_line(orphans, scope_known=bool(scope_session)))
         if ungraded_line:
             print(ungraded_line)
         if advisory_line:
@@ -1286,8 +1473,10 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
     # The legend is not decoration: '!' and '(stalled)' are load-bearing and an
     # unexplained marker on an audit surface is worse than no marker.
     print("tier! = declared, not inferred.  tier? = defaulted (no intent "
-          "matched).  tier~ = inherited from an earlier dispatch of the same "
-          "agent type this session (no sidecar matched; see inherited_from).  "
+          "matched).  tier= = defaulted (an intent matched but declared no "
+          "tier; pass --tier to dispatch intent).  tier~ = inherited from an "
+          "earlier dispatch of the same agent type this session (no sidecar "
+          "matched; see inherited_from).  "
           "(stalled) = reported or graded but never closed.")
     print("ungraded = no verdict on record; an absent grade is not a passing grade.")
     # Only explained when present, like the orphan count: these two labels are
@@ -1309,7 +1498,7 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
               "prompt/manifest/tier (see inherited_from_state / "
               "inherited_from_verdict on the record).")
     if orphans:
-        print(_orphan_count_line(orphans))
+        print(_orphan_count_line(orphans, scope_known=bool(scope_session)))
     if ungraded_line:
         print(ungraded_line)
     if advisory_line:
@@ -1619,7 +1808,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_phase = sub.add_parser(
         "phase",
         help="Phase succession: retire checks outside the hashed spec "
-             "(advance), list retirements (status), clear them (reset).")
+             "(advance), list retirements (status), clear them (reset), "
+             "catch vacuous successors before they retire anything "
+             "(preflight).")
     psub = p_phase.add_subparsers(dest="phase_command", required=True)
     p_padv = psub.add_parser(
         "advance",
@@ -1641,6 +1832,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_prs = psub.add_parser("reset", help="Clear every retirement (attributed, dated).")
     _add_format(p_prs)
     p_prs.set_defaults(func=_cmd_phase_reset)
+    p_ppf = psub.add_parser(
+        "preflight",
+        help="Run every succeeded_by successor against the CURRENT tree, "
+             "recording nothing, and exit non-zero for each successor that "
+             "already passes — a successor that passes before any work "
+             "exists would retire its predecessor on contact (the vacuous-"
+             "successor tripwire; see Grader integrity in the README).")
+    p_ppf.add_argument("--spec", default=None,
+                       help="Path to a check spec (default: .fleetproof/checks.json).")
+    _add_format(p_ppf)
+    p_ppf.set_defaults(func=_cmd_phase_preflight)
 
     p_dispatch = sub.add_parser("dispatch", help="Dispatch-ledger verbs.")
     dsub = p_dispatch.add_subparsers(dest="dispatch_command", required=True)
@@ -1652,7 +1854,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_dnew.add_argument("--tier", choices=sorted(VALID_TIERS), default=None,
                         help="Declare the tier. Omit to infer it from the run tree.")
     p_dnew.add_argument("--manifest", default=None,
-                        help="JSON file with the dispatch manifest. Omit to derive from the prompt.")
+                        help="JSON file with the dispatch manifest (deliverables, checks, and "
+                             "check_map joining the two — see `dispatch intent --manifest`). "
+                             "Omit to derive from the prompt.")
     p_dnew.add_argument("--agent-name", default=None,
                         help="The Task-tool spawn name the harness will report "
                              "as agent_type. Makes the dispatch joinable: the "
@@ -1670,8 +1874,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_dnew.add_argument("--preflight", action="store_true",
                         help="Run every manifest check now, from the project root, exactly as the "
                              "gate would, and print the resolved command, exit code, "
-                             "expectation, PASS/FAIL, and an output tail per check. Records "
-                             "nothing; exits 0 whatever the checks did (it is a preview), "
+                             "expectation, PASS/FAIL, and an output tail per check. The "
+                             "dispatch itself is still recorded; no checker run lands under "
+                             "runs/. Exits 0 whatever the checks did (it is a preview), "
                              "non-zero on a malformed check." + " Needs --manifest.")
     _add_format(p_dnew)
     p_dnew.set_defaults(func=_cmd_dispatch_new)
@@ -1685,7 +1890,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="File holding the dispatch prompt, verbatim.")
     p_dint.add_argument("--manifest", default=None,
                         help="JSON file with the dispatch manifest "
-                             "(bare object or a {'manifest': ...} wrapper).")
+                             "(bare object or a {'manifest': ...} wrapper): "
+                             "deliverables, checks, and check_map — "
+                             "{'<deliverable>': ['<check-id>', ...]} joining "
+                             "the two, which is what telemetry coverage is "
+                             "computed from (without it, coverage reads "
+                             "null).")
     p_dint.add_argument("--tier", choices=sorted(VALID_TIERS), default=None,
                         help="Declare the tier. Omit to record the captured-subagent "
                              "default (lane).")
@@ -1697,11 +1907,16 @@ def build_parser() -> argparse.ArgumentParser:
                              "manifest check has no grader control or an authored-only pass "
                              "sample (see `fleetproof check control`).")
     p_dint.add_argument("--preflight", action="store_true",
-                        help="Run every manifest check now, from the project root, exactly as the "
-                             "gate would, and print the resolved command, exit code, "
-                             "expectation, PASS/FAIL, and an output tail per check. Records "
-                             "nothing; exits 0 whatever the checks did (it is a preview), "
-                             "non-zero on a malformed check.")
+                        help="Run every manifest check now, from the project root, exactly as "
+                             "the gate would, against the sidecar this command writes — the "
+                             "sidecar is still written and the next spawn consumes it (add "
+                             "--dry-run to skip the write). Prints the resolved command, exit "
+                             "code, expectation, PASS/FAIL, and an output tail per check; "
+                             "nothing recorded under runs/; exits 0 whatever the checks did "
+                             "(it is a preview), non-zero on a malformed check.")
+    p_dint.add_argument("--dry-run", action="store_true",
+                        help="Parse and validate everything — and, with --preflight, run the "
+                             "checks — but write nothing: no sidecar, nothing under runs/.")
     _add_format(p_dint)
     p_dint.set_defaults(func=_cmd_dispatch_intent)
 

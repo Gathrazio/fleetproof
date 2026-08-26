@@ -207,7 +207,7 @@ def load_arming() -> dict[str, Any]:
           "coordinator": "armed" | "advisory",
           "note": "<the bridge's note>",           # 0.4.0 key, kept as-is
           "notes": {"bridge": "...", "coordinator": "..."},
-          "set_at": "<last write, ISO-8601>", "by": "<who>",
+          "set_at": "<the bridge's last write, ISO-8601>", "by": "<who>",
           "set": {"<tier>": {"set_at": ..., "by": ...}}
         }
 
@@ -288,14 +288,20 @@ def set_arming(state: str, note: str = "", by: str | None = None,
     current["set"][tier] = {"set_at": now, "by": who}
     path = arming_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    # The 0.4.0 trio — note, set_at, by — is one coherent view: the BRIDGE
+    # tier's, so a 0.4.0 reader sees exactly what it saw. All three are
+    # bridge-pinned together: a coordinator write used to stamp its own time
+    # and actor beside the bridge's note, so the trio described two different
+    # switches at once (observed in a field deployment on Windows). Per-tier
+    # truth lives in "notes" and "set".
+    bridge_meta = tier_set_meta(current, TIER_BRIDGE)
     payload = {
         TIER_BRIDGE: current[TIER_BRIDGE],
         TIER_COORDINATOR: current[TIER_COORDINATOR],
-        # The 0.4.0 key: the bridge's note, so a 0.4.0 reader sees what it saw.
         "note": current["notes"][TIER_BRIDGE],
         "notes": dict(current["notes"]),
-        "set_at": now,
-        "by": who,
+        "set_at": bridge_meta["set_at"],
+        "by": bridge_meta["by"],
         "set": dict(current["set"]),
     }
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

@@ -372,6 +372,21 @@ def test_verifier_block_counts_kinds_but_never_ids(era_runs):
     assert "secret-path-check" not in json.dumps(verifier)
 
 
+def test_telemetry_never_carries_a_check_command(era_runs):
+    # ask 6/#33: the per-check cmd now persisted in output.json is exactly
+    # the kind of operator-authored, secret-bearing string the export must
+    # never carry — same exclusion rationale as check ids, more so.
+    run_id = create_dispatch("work", tier="lane")
+    record_report(run_id, _report())
+    record_verdict(run_id, "verified")
+    close_dispatch(run_id)
+    report, checks = _graded(("c1",))
+    report.results[0].cmd = "curl -H 'Authorization: Bearer sekret-token' https://x"
+    telemetry = build_telemetry(run_id, check_report=report, checks=checks)
+    assert "sekret-token" not in json.dumps(telemetry)
+    assert "cmd" not in json.dumps(telemetry["outcome.verifier"])
+
+
 # === severity (§5.2) ===
 
 def test_band_edges_are_monotone_in_dollars():
