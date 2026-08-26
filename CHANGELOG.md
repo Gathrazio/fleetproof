@@ -3,6 +3,53 @@
 Releases before 0.4.0 predate this file; their stories are in the README's
 version-marked sections and the git history.
 
+## 0.6.1 — 2026-08-26
+
+Two follow-ups to 0.6.0, both from the same Windows deployment's fourth-trial
+prep: a mechanization the field asked for, and the audit surface the 0.6.0
+`escalated` class's own red-team said it needed.
+
+### Out-of-band grading — `fleetproof dispatch verify <run_id>`
+
+- When the harness drops a `SubagentStop` (a named teammate stops without its
+  hook firing), the dispatch is stuck non-terminal — at `dispatched` or
+  `reported` — and `dispatch close` only terminates it *ungraded*, minting the
+  terminated-ungraded row the fleet footer polices. `dispatch verify` grades it
+  now, out of band: it runs the dispatch's pinned checks through the gate's own
+  selection and runner with the same identity env and per-tier arming, then
+  records the `reported` (synthetic, if it never reported), the
+  `verified`/`contradicted`/`advisory` verdict the same arming logic yields,
+  and the `terminated` close. Legal only on a non-terminal dispatch; a terminal
+  one is refused. Every transition it writes is stamped `by: cli-verify` (not
+  `checker-via-hook`), so the trail shows an operator out-of-band grade, never a
+  live hook grade. This is the L27 mechanization named in reply letter 4 — the
+  remedy line's "verify or close" now ships verify, not only close.
+
+### Escalated visibility (0.6.0 escalated red-team; decision 0012 (a)+(b))
+
+The red-team confirmed `escalated` is sound against agent self-service (no
+hook/env/report/manifest path sets the marker — operator-CLI-only) but flagged
+an operator-gated laundering surface: parking a `contradicted` or never-reported
+dispatch `--unsatisfiable` classes it `escalated`, dropping a real failure out
+of both penalized rates with no aggregate trace. 0.6.1 ships the additive
+visibility half only; the precedence question (should the marker outrank
+`contradicted` / no-report at all?) is **deferred to decision 0012** for MCC
+field input — classification is unchanged, the two pinned tests stand.
+
+- **Board + report marks.** An escalated dispatch whose trail holds a
+  `contradicted` verdict renders `parked (unsatisfiable, over contradiction)`;
+  one that never recorded a `reported` transition renders `parked
+  (unsatisfiable, unreported)`. A plain principled escalation stays `parked
+  (unsatisfiable)`. Derived from the record's own transitions/verdict
+  (`DispatchRecord.escalated_over_contradiction` / `escalated_unreported`),
+  surfaced on the fleet board (both formats) and the HTML report, with the
+  legend explaining both faces.
+- **Export sub-counts.** `escalated_rate` in the export now carries
+  `escalated_over_contradiction`, `escalated_unreported`, and `escalated_clean`
+  alongside the unchanged total, so the published metric cannot hide a
+  reclassified failure. `telemetry summary` prints the split when non-zero
+  (e.g. `escalated_rate: 2/10 = 0.200 (1 over-contradiction, 1 clean)`).
+
 ## 0.6.0 — 2026-08-26
 
 Honest-bookkeeping release. Every item below answers the third field trial
