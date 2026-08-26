@@ -72,6 +72,7 @@ from .checks import (
 )
 from .controls import pending_pass_checks
 from .ledger import (
+    BY_CLI_VERIFY,
     CAPTURE_START,
     REASON_ABANDONED,
     STATE_ADVISORY,
@@ -1056,6 +1057,22 @@ def _manifest_checks(dispatch) -> list[Check]:
     return out
 
 
+def _runnable_checks(dispatch, checks: list[Check]) -> list[Check]:
+    """The checks the gate grades this dispatch against: its tier's repo checks
+    unioned with its own manifest checks, repo spec first.
+
+    A manifest check whose id collides with a selected repo check is dropped:
+    the repo spec is the more attested source, and two commands under one id
+    would make the executed-id set (which coverage joins on) ambiguous. Shared
+    by the SubagentStop gate and the operator's out-of-band ``dispatch verify``
+    so the two grade off byte-identical selection.
+    """
+    selected = select_checks(checks, dispatch.tier) if checks else []
+    selected_ids = {c.id for c in selected}
+    return selected + [c for c in _manifest_checks(dispatch)
+                       if c.id not in selected_ids]
+
+
 def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     """The per-subagent gate. Returns ``(decision_or_None, exit_code)``.
 
@@ -1179,14 +1196,7 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
         # No spec and no pin: an unconfigured repo. Fail open on the stop, but do
         # not manufacture a verdict out of the absence of checks.
         checks = []
-    selected = select_checks(checks, dispatch.tier) if checks else []
-    # Union with the dispatch's own manifest checks, repo spec first. A manifest
-    # check whose id collides with a selected repo check is dropped: the repo
-    # spec is the more attested source, and two commands under one id would make
-    # the executed-id set (which coverage joins on) ambiguous.
-    selected_ids = {c.id for c in selected}
-    runnable = selected + [c for c in _manifest_checks(dispatch)
-                           if c.id not in selected_ids]
+    runnable = _runnable_checks(dispatch, checks)
 
     # Pin-drift is tested only once the runnable set is known. An empty set
     # means there is nothing the drifted spec could corrupt at this tier —
@@ -1390,6 +1400,118 @@ def subagent_stop_main() -> int:
     if decision is not None:
         sys.stdout.write(json.dumps(decision))
     return code
+
+
+def verify_dispatch(run_id: str, note: str | None = None) -> dict[str, Any]:
+    """Grade a stuck non-terminal dispatch out of band, as SubagentStop would.
+
+    The L27 mechanization. When the harness drops a SubagentStop, a dispatch is
+    left non-terminal (at ``dispatched`` or ``reported``) with no verb to grade
+    it — ``dispatch close`` only terminates it ungraded, minting the very
+    terminated-ungraded row the fleet footer polices. This runs the dispatch's
+    pinned checks now, from the project root, through the gate's own selection
+    (:func:`_runnable_checks`) and runner (:func:`run_checks`) with the same
+    identity env and per-tier arming, then records — if the dispatch had not
+    reported — a synthetic ``reported`` transition, the
+    ``verified``/``contradicted``/``advisory`` verdict the same arming logic
+    yields, and the ``terminated`` close.
+
+    Every transition is stamped ``by="cli-verify"`` (not ``checker-via-hook``)
+    so the trail shows an operator out-of-band grade, not a live hook grade.
+    Legal only on a non-terminal dispatch (mirrors ``close_dispatch``'s "legal
+    from any non-terminal state"); a terminal one is refused. A dispatch already
+    carrying a verdict (``verified``/``advisory``, stalled unclosed) is not
+    re-graded — only its missing ``terminated`` close is written, since the
+    state machine forbids a second verdict from there.
+
+    Returns ``{run_id, verdict, detail, graded, already_graded}``.
+    """
+    dispatch = load_dispatch(run_id)
+    if dispatch is None:
+        raise LedgerError(f"No dispatch record for run {run_id!r}.")
+    if dispatch.is_terminal:
+        raise LedgerError(
+            f"Dispatch {run_id} is already terminal ({dispatch.state}); "
+            "`dispatch verify` grades a stuck NON-terminal dispatch out of "
+            "band, not a finished one. Its outcome is already on record.")
+
+    session_id = dispatch.session_id or os.environ.get(SESSION_ID_ENV)
+
+    # Already graded but never closed (verified/advisory, 'stalled'): the grade
+    # happened, only the terminate is missing, and the state machine forbids a
+    # second verdict from here. Close it out, keep the verdict, do not re-grade.
+    if dispatch.verdict in (STATE_VERIFIED, STATE_ADVISORY):
+        close_dispatch(run_id, by=BY_CLI_VERIFY)
+        return {"run_id": run_id, "verdict": dispatch.verdict,
+                "detail": dispatch.verdict_detail, "graded": False,
+                "already_graded": True}
+
+    # Not reported (dispatched, or contradicted awaiting a retry that never
+    # came): record the report the hook would have — a synthetic claim marking
+    # this an operator out-of-band verification, so the dispatch classifies
+    # rather than reading unverifiable-by-omission.
+    if dispatch.state in (STATE_DISPATCHED, STATE_CONTRADICTED):
+        summary = ("operator out-of-band verification via `fleetproof dispatch "
+                   "verify`")
+        if note:
+            summary += f": {note}"
+        record_report(run_id, {"summary": summary, "source": BY_CLI_VERIFY},
+                      by=BY_CLI_VERIFY)
+        dispatch = load_dispatch(run_id) or dispatch
+
+    try:
+        checks = load_checks()
+    except CheckSpecError:
+        checks = []
+    runnable = _runnable_checks(dispatch, checks)
+    active, retired = apply_phase(runnable, session_id)
+
+    if not active:
+        # Nothing to grade at this tier — terminate still-ungraded, exactly as
+        # the gate does, recording the empty CheckReport so telemetry reads
+        # 'unverifiable' (graded nothing on purpose), not 'ungraded'.
+        close_dispatch(run_id, by=BY_CLI_VERIFY)
+        _try_build_telemetry(
+            run_id,
+            check_report=CheckReport(spec_sha256=spec_hash(), tier=dispatch.tier,
+                                     retired=retired),
+            checks=[])
+        return {"run_id": run_id, "verdict": None,
+                "detail": "no runnable check at this tier — terminated ungraded",
+                "graded": False, "already_graded": False}
+
+    agent_type_known = (dispatch.agent or {}).get("agent_type")
+    arming_state, arming_note = tier_arming(load_arming(), dispatch.tier)
+    controls_pending = pending_pass_checks([c for c in active if c.block])
+    report = run_checks(
+        active, record_to_log=True, tier=dispatch.tier,
+        identity=_check_identity(dispatch.run_id, agent_type_known, dispatch.tier,
+                                 session_id),
+        arming=_arming_stamp(dispatch.tier, arming_state, arming_note),
+        retired=retired, controls_pending=controls_pending)
+
+    # The same verdict decision the gate applies (subagent_stop): a blocking
+    # failure under a disarmed tier is 'advisory', a blocking failure under an
+    # armed tier is 'contradicted', all-pass is 'verified'. No abandonment
+    # ladder here — there is no agent to loop, this is a one-shot operator grade.
+    if report.blocking_failures and arming_state == ADVISORY:
+        failing_ids = "; ".join(r.id for r in report.blocking_failures)
+        verdict = STATE_ADVISORY
+        detail = (f"{len(report.blocking_failures)}/{report.total} blocking "
+                  f"check(s) failed ({failing_ids}) — {dispatch.tier} gate "
+                  "disarmed, failures did not block (verified out of band)")
+    elif report.blocking_failures:
+        verdict = STATE_CONTRADICTED
+        detail = "; ".join(r.id for r in report.blocking_failures)
+    else:
+        verdict = STATE_VERIFIED
+        detail = f"{report.passed}/{report.total} checks passed at tier {dispatch.tier}"
+
+    record_verdict(run_id, verdict, detail=detail, by=BY_CLI_VERIFY)
+    close_dispatch(run_id, by=BY_CLI_VERIFY)
+    _try_build_telemetry(run_id, check_report=report, checks=runnable)
+    return {"run_id": run_id, "verdict": verdict, "detail": detail,
+            "graded": True, "already_graded": False}
 
 
 def record_tool_main() -> int:

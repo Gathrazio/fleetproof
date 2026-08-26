@@ -67,6 +67,7 @@ No language model sits in the grading path. Grading is comparison.
 | `fleetproof arm` / `disarm`, `dispatch park`, `fleet --orphans` | v0.4: the fleet-operating surface — phase arming, deliberate termination, and the orphan-stop view. |
 | `dispatch intent --preflight`, `check control`, `phase advance`, `init --library` | v0.5: grader integrity — see the grader run before pinning it, record what it was controlled against, retire a check its phase has outgrown, and start from graders that carry their own source of truth. |
 | `dispatch park --unsatisfiable`, `phase preflight`, `check control --upgrade`, `dispatch intent --dry-run` | v0.6: honest bookkeeping — an escalation is neither a success nor a failure, a vacuous successor is caught before it retires anything, a creation-work control is upgraded from the real emission, and every surface says what it actually wrote. |
+| `dispatch verify`, escalated over-contradiction / unreported marks | v0.6.1: an operator can grade a stuck dispatch out of band when a SubagentStop was dropped, and an escalation that reclassified a real failure is marked on the board and split out in the export instead of hiding in the aggregate. |
 
 Runtime dependencies: none (Python standard library only). A tool whose job is
 being trustworthy should add as little dependency and supply-chain surface as it can.
@@ -222,6 +223,11 @@ fleetproof dispatch new --agent-name worker \
 fleetproof dispatch report <run-id> --report report.json
 fleetproof dispatch close <run-id>
 fleetproof dispatch park <run-id> --reason "..."  # terminate on purpose, reason kept
+fleetproof dispatch verify <run-id> [--note "..."]  # grade a stuck non-terminal
+                                              # dispatch out of band when a
+                                              # SubagentStop was dropped; records
+                                              # report/verdict/terminate stamped
+                                              # cli-verify (v0.6.1)
 
 fleetproof dispatch intent --agent recon --prompt-file p.md \
     [--manifest m.json] [--tier lane] [--role tester] \
@@ -353,7 +359,12 @@ transition history — bookkeeping, not judgment:
   record. Counted (`escalated_rate`), in no success and no failure numerator —
   a lane that correctly refuses unsatisfiable work must never score worse than
   one that guesses. A plain park after a contradiction stays `contradicted`;
-  only the flag reclasses, and a `verified` verdict always wins over it.
+  only the flag reclasses, and a `verified` verdict always wins over it. An
+  escalation that reclassified a real failure — parked over a `contradicted`
+  verdict, or with no report ever — is not hidden: the board marks it `parked
+  (unsatisfiable, over contradiction)` / `(unsatisfiable, unreported)` and the
+  export splits `escalated_rate` into those sub-counts (v0.6.1; whether the
+  marker *should* outrank a contradiction at all is deferred to decision 0012).
 - `ungraded` — checks existed but no verdict ever landed. This is a control
   failure and every summary says so; it is never folded into a benign class.
 - `unverifiable` — reported, but nothing in the claim was checkable. Never counts

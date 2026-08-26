@@ -174,6 +174,36 @@ def test_summary_formulas_pin_numerators_and_denominators(era_runs):
     assert (m["numerator"], m["denominator"]) == (0, 3)
 
 
+def test_escalated_rate_splits_the_laundering_faces(era_runs):
+    # Decision 0012 (b): the escalated total is a bare frequency that can hide a
+    # reclassified failure. The split rides alongside, additive — the total rate
+    # is unchanged — so a contradicted-then-parked or never-reported escalation
+    # is visible in the aggregate, not just the per-record trail.
+    from fleetproof.ledger import REASON_PARKED_PREFIX
+    over = create_dispatch("work", tier="lane")
+    record_report(over, _report("cannot satisfy"))
+    record_verdict(over, "contradicted")
+    close_dispatch(over, reason=REASON_PARKED_PREFIX + "unsat",
+                   park_unsatisfiable=True)
+    build_telemetry(over)
+    unrep = create_dispatch("work", tier="lane")
+    close_dispatch(unrep, reason=REASON_PARKED_PREFIX + "unsat",
+                   park_unsatisfiable=True)
+    build_telemetry(unrep)
+    clean = create_dispatch("work", tier="lane")
+    record_report(clean, _report("cannot be satisfied from this seat"))
+    close_dispatch(clean, reason=REASON_PARKED_PREFIX + "unsat",
+                   park_unsatisfiable=True)
+    build_telemetry(clean)
+
+    m = summarize()["windows"]["full"]["escalated_rate"]
+    # Unchanged total: 3 escalated of 3 classifiable.
+    assert (m["numerator"], m["denominator"]) == (3, 3)
+    assert m["escalated_over_contradiction"] == 1
+    assert m["escalated_unreported"] == 1
+    assert m["escalated_clean"] == 1
+
+
 def test_summary_severity_distribution_counts_unanswered(era_runs):
     ids = _full_corpus(era_runs)
     record_failure_loss(ids["contradicted"], 3, "hours")  # $300 -> S2

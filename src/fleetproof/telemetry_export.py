@@ -225,6 +225,22 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
                      + counts[CLASS_NEAR_MISS] + counts[CLASS_VERIFIER_FLAKE]
                      + counts[CLASS_ABANDONED])
 
+    # Split the escalated count into the two laundering faces the 0.6.0
+    # escalated red-team flagged (#3/#5/#6) plus the clean remainder, so the
+    # published escalated_rate cannot hide a reclassified failure. Derived from
+    # the record's own trail (DispatchRecord.escalated_over_contradiction /
+    # escalated_unreported), additive to the rate — the total is unchanged.
+    escalated_over_contradiction = 0
+    escalated_unreported = 0
+    for row in rows:
+        if row["bucket"] != CLASS_ESCALATED:
+            continue
+        record = row["record"]
+        if record.escalated_over_contradiction:
+            escalated_over_contradiction += 1
+        elif record.escalated_unreported:
+            escalated_unreported += 1
+
     events_by_source = {"hook": 0, "operator": 0}
     overrides_by_source = {"hook": 0, "operator": 0}
     for row in rows:
@@ -289,8 +305,18 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         # could not satisfy and the operator agreed, on record. In D, in no
         # success and no failure numerator — escalating is neither delivering
         # nor failing to deliver, and folding it into either teaches lanes
-        # that escalating scores worse than guessing.
-        "escalated_rate": _frequency(counts[CLASS_ESCALATED], d),
+        # that escalating scores worse than guessing. The rate itself is
+        # unchanged; the sub-counts ride alongside so a reclassified failure
+        # (a contradicted verdict, or no report at all, parked --unsatisfiable)
+        # cannot hide inside the aggregate (0.6.0 escalated red-team; 0012).
+        "escalated_rate": {
+            **_frequency(counts[CLASS_ESCALATED], d),
+            "escalated_over_contradiction": escalated_over_contradiction,
+            "escalated_unreported": escalated_unreported,
+            "escalated_clean": (counts[CLASS_ESCALATED]
+                                - escalated_over_contradiction
+                                - escalated_unreported),
+        },
         "override_rate_by_source": {
             source: _rate(overrides_by_source[source], events_by_source[source])
             for source in ("hook", "operator")

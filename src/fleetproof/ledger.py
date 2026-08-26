@@ -174,6 +174,15 @@ VALID_TERMINATE_REASONS = frozenset({
 # prevent.
 REASON_PARKED_PREFIX = "parked: "
 
+# The transition ``by`` stamp an operator's out-of-band ``fleetproof dispatch
+# verify`` writes on the report/verdict/terminate it records — deliberately
+# distinct from the hook's ``checker-via-hook`` so the audit trail shows this
+# was graded by an operator out of band, not by a live SubagentStop gate (the
+# L27 mechanization: when the harness drops a SubagentStop the dispatch is
+# stuck non-terminal with no verb to grade it, and ``dispatch close`` only
+# terminates it ungraded).
+BY_CLI_VERIFY = "cli-verify"
+
 
 def is_parked_reason(reason: str | None) -> bool:
     """True for a well-formed parked reason (prefix + non-blank remainder)."""
@@ -419,6 +428,38 @@ class DispatchRecord:
         return False
 
     @property
+    def escalated_over_contradiction(self) -> bool:
+        """True for an ``--unsatisfiable`` park whose trail holds a ``contradicted``
+        verdict.
+
+        The laundering face the 0.6.0 escalated red-team flagged (#3/#6): a real
+        false claim that was recorded, then reclassified ``escalated`` by a
+        later park — dropping it out of both ``false_claim_rate`` and
+        ``delivery_failure_rate`` with only the per-record trail to catch it.
+        The marker still outranks ``contradicted`` in classification (decision
+        0012 defers the precedence change); this is the visibility half. False
+        on any dispatch that is not an unsatisfiable park. Mutually exclusive
+        with :attr:`escalated_unreported` — a contradiction implies a report.
+        """
+        return self.park_unsatisfiable and self.verdict == STATE_CONTRADICTED
+
+    @property
+    def escalated_unreported(self) -> bool:
+        """True for an ``--unsatisfiable`` park that never recorded a ``reported``
+        transition.
+
+        The other laundering face (#5): an abandoned or silently-idle dispatch
+        flagged out of the ``delivery_failure_rate`` numerator, with no report
+        in the trail to corroborate the non-satisfiability at all. Unflagged,
+        this exact shape is ``terminated_unreported`` (a delivery failure).
+        False on any dispatch that is not an unsatisfiable park.
+        """
+        if not self.park_unsatisfiable:
+            return False
+        return not any(isinstance(t, dict) and t.get("state") == STATE_REPORTED
+                       for t in self.transitions)
+
+    @property
     def terminated_ungraded(self) -> bool:
         """True when this dispatch claimed something and was closed with no verdict.
 
@@ -542,6 +583,8 @@ class DispatchRecord:
             "block_count": self.block_count,
             "terminated_ungraded": self.terminated_ungraded,
             "park_unsatisfiable": self.park_unsatisfiable,
+            "escalated_over_contradiction": self.escalated_over_contradiction,
+            "escalated_unreported": self.escalated_unreported,
         }
 
 

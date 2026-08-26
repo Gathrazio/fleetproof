@@ -778,6 +778,88 @@ def test_dispatch_park_refuses_a_terminated_dispatch(cli_runs, capsys):
     assert main(["dispatch", "park", run_id, "--reason", "again"]) == 1
 
 
+# === dispatch verify (L27 out-of-band grade) ===
+
+def _manifest_check_file(tmp_path, cmd_exit: int) -> str:
+    mf = tmp_path / f"manifest-{cmd_exit}.json"
+    cmd = f'"{sys.executable}" -c "raise SystemExit({cmd_exit})"'
+    mf.write_text(json.dumps({"checks": [{"id": "m", "cmd": cmd}]}),
+                  encoding="utf-8")
+    return str(mf)
+
+
+def test_dispatch_verify_grades_a_stuck_reported_dispatch(cli_runs, tmp_path, capsys):
+    # The L27 core case: the SubagentStop was dropped, the dispatch is stuck at
+    # 'reported', and the operator grades it out of band. It runs the pinned
+    # manifest check, records the verdict + terminate, and stamps them
+    # cli-verify so the trail shows an operator grade, not a live hook grade.
+    from fleetproof.ledger import record_report, load_dispatch
+    run_id = _dispatch_new(capsys, "--manifest", _manifest_check_file(tmp_path, 0))
+    record_report(run_id, {"summary": "did it"})
+    assert load_dispatch(run_id).state == "reported"
+    capsys.readouterr()
+
+    assert main(["dispatch", "verify", run_id]) == 0
+    out = capsys.readouterr().out
+    assert "verified" in out
+    assert "cli-verify" in out
+    d = load_dispatch(run_id)
+    assert d.verdict == "verified"
+    assert d.state == "terminated"
+    stamped = {t["state"] for t in d.transitions if t.get("by") == "cli-verify"}
+    assert stamped == {"verified", "terminated"}
+
+
+def test_dispatch_verify_grades_a_stuck_dispatched_dispatch(cli_runs, tmp_path, capsys):
+    # Never reported (dropped stop before any report): verify records the
+    # synthetic 'reported' first, then the verdict, then terminate — all
+    # cli-verify — and a failing check classes it contradicted.
+    from fleetproof.ledger import load_dispatch
+    run_id = _dispatch_new(capsys, "--manifest", _manifest_check_file(tmp_path, 1))
+    assert load_dispatch(run_id).state == "dispatched"
+    capsys.readouterr()
+
+    assert main(["dispatch", "verify", run_id, "--note", "teammate stopped, hook dropped"]) == 0
+    out = capsys.readouterr().out
+    assert "contradicted" in out
+    d = load_dispatch(run_id)
+    assert d.verdict == "contradicted"
+    assert d.state == "terminated"
+    stamped = [t for t in d.transitions if t.get("by") == "cli-verify"]
+    assert {t["state"] for t in stamped} == {"reported", "contradicted", "terminated"}
+    report = d.load_report()
+    assert "out-of-band verification" in report["summary"]
+    assert "teammate stopped" in report["summary"]
+
+
+def test_dispatch_verify_refuses_a_terminal_dispatch(cli_runs, capsys):
+    run_id = _dispatch_new(capsys)
+    assert main(["dispatch", "close", run_id]) == 0
+    capsys.readouterr()
+    assert main(["dispatch", "verify", run_id]) == 1
+    assert "already terminal" in capsys.readouterr().err
+
+
+def test_dispatch_verify_classifies_in_telemetry(cli_runs, tmp_path, capsys):
+    # The graded dispatch must classify, not read pre_telemetry or
+    # unverifiable-by-omission: with an era in force, verify's telemetry build
+    # lands a 'verified' outcome that the summary counts.
+    (cli_runs.parent / "config.json").write_text(
+        json.dumps({"telemetry_era": "2026-01-01"}), encoding="utf-8")
+    from fleetproof.ledger import record_report
+    from fleetproof.telemetry import load_telemetry
+    run_id = _dispatch_new(capsys, "--manifest", _manifest_check_file(tmp_path, 0))
+    record_report(run_id, {"summary": "did it"})
+    capsys.readouterr()
+    assert main(["dispatch", "verify", run_id, "--format", "json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["verdict"] == "verified"
+    assert result["graded"] is True
+    telemetry = load_telemetry(run_id)
+    assert telemetry["outcome.class"] == "verified"
+    assert telemetry["outcome.verifier"]["checks_run"] == 1
+
+
 def test_fleet_labels_abandoned_and_parked(cli_runs, capsys):
     from fleetproof.ledger import (
         REASON_ABANDONED, close_dispatch, record_report, record_verdict,
@@ -800,6 +882,43 @@ def test_fleet_labels_abandoned_and_parked(cli_runs, capsys):
     parked_row = next(line for line in out.splitlines() if parked in line)
     assert "parked" in parked_row
     assert "ungraded" in parked_row
+
+
+def test_fleet_marks_escalated_over_contradiction_and_unreported(cli_runs, capsys):
+    # Decision 0012 (a): the escalated class still outranks (classification is
+    # unchanged), but the board must surface which face an escalation wears —
+    # a reclassified contradiction, or no report at all, both drop a penalized
+    # failure out of the aggregate rates. A clean escalation stays unqualified.
+    from fleetproof.ledger import (
+        REASON_PARKED_PREFIX, close_dispatch, record_report, record_verdict,
+    )
+    over = _dispatch_new(capsys)
+    record_report(over, {"summary": "cannot satisfy"})
+    record_verdict(over, "contradicted")
+    close_dispatch(over, reason=REASON_PARKED_PREFIX + "unsat",
+                   park_unsatisfiable=True)
+    unrep = _dispatch_new(capsys)
+    close_dispatch(unrep, reason=REASON_PARKED_PREFIX + "unsat",
+                   park_unsatisfiable=True)
+    clean = _dispatch_new(capsys)
+    record_report(clean, {"summary": "cannot be satisfied from this seat"})
+    close_dispatch(clean, reason=REASON_PARKED_PREFIX + "unsat",
+                   park_unsatisfiable=True)
+    capsys.readouterr()
+
+    assert main(["fleet"]) == 0
+    out = capsys.readouterr().out
+    over_row = next(l for l in out.splitlines() if over in l)
+    assert "parked (unsatisfiable, over contradiction)" in over_row
+    unrep_row = next(l for l in out.splitlines() if unrep in l)
+    assert "parked (unsatisfiable, unreported)" in unrep_row
+    clean_row = next(l for l in out.splitlines() if clean in l)
+    assert "parked (unsatisfiable)" in clean_row
+    assert "over contradiction" not in clean_row
+    assert "unreported" not in clean_row
+    # The legend explains both faces (only printed because they appear).
+    assert "over contradiction) = escalated over a recorded contradicted" in out
+    assert "unreported) = escalated with no report ever recorded" in out
 
 
 def test_fleet_json_rows_carry_report_and_block_counts(cli_runs, capsys):
@@ -1640,6 +1759,29 @@ def test_telemetry_summary_prints_no_verdict_split_and_escalated(cli_runs, capsy
     out = capsys.readouterr().out
     assert "no_verdict_rate: 1/2 = 0.500 (ungraded 1 + unverifiable 0)" in out
     assert "escalated_rate: 1/2 = 0.500" in out
+
+
+def test_telemetry_summary_prints_escalated_laundering_split(cli_runs, capsys):
+    # Decision 0012 (b): the summary prints the escalated split when an
+    # escalation reclassified a penalized failure — the example the brief pins.
+    from fleetproof.ledger import (
+        REASON_PARKED_PREFIX, close_dispatch, record_report, record_verdict)
+    from fleetproof.telemetry import build_telemetry
+    (cli_runs.parent / "config.json").write_text(
+        json.dumps({"telemetry_era": "2026-01-01"}), encoding="utf-8")
+    over = _dispatch_new(capsys)
+    record_report(over, {"summary": "cannot satisfy"})
+    record_verdict(over, "contradicted")
+    close_dispatch(over, reason=REASON_PARKED_PREFIX + "u", park_unsatisfiable=True)
+    clean = _dispatch_new(capsys)
+    record_report(clean, {"summary": "cannot be satisfied from this seat"})
+    close_dispatch(clean, reason=REASON_PARKED_PREFIX + "u", park_unsatisfiable=True)
+    build_telemetry(over)
+    build_telemetry(clean)
+    capsys.readouterr()
+    assert main(["telemetry", "summary"]) == 0
+    out = capsys.readouterr().out
+    assert "escalated_rate: 2/2 = 1.000 (1 over-contradiction, 1 clean)" in out
 
 
 # === phase verbs (C13) ===

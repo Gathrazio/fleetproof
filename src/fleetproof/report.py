@@ -102,6 +102,17 @@ def state_label(dispatch: DispatchRecord) -> str:
             # exit; it must read differently from an ordinary park because
             # the dispatcher owes the two different follow-ups.
             if dispatch.park_unsatisfiable:
+                # An escalation that reclassified a real failure is still an
+                # escalation for the metric (decision 0012 keeps the
+                # precedence), but the board must not hide which face it wears:
+                # a contradicted verdict in the trail, or no report at all, is
+                # a penalized failure the marker dropped out of the aggregate
+                # rates (0.6.0 escalated red-team #3/#5/#6). A plain principled
+                # escalation stays the unqualified label.
+                if dispatch.escalated_over_contradiction:
+                    return "parked (unsatisfiable, over contradiction)"
+                if dispatch.escalated_unreported:
+                    return "parked (unsatisfiable, unreported)"
                 return "parked (unsatisfiable)"
             return "parked"
         return "done" if dispatch.has_report else "done (no report)"

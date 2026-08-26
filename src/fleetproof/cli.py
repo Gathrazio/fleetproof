@@ -94,6 +94,7 @@ from .hookgate import (
     stop_gate_main,
     subagent_start_main,
     subagent_stop_main,
+    verify_dispatch,
 )
 from .phase import (
     apply_phase,
@@ -1140,6 +1141,36 @@ def _cmd_dispatch_park(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_dispatch_verify(args: argparse.Namespace) -> int:
+    """Grade a stuck non-terminal dispatch out of band (the L27 mechanization).
+
+    When the harness drops a SubagentStop, a named teammate's dispatch is left
+    non-terminal with no verb to grade it — ``dispatch close`` only terminates
+    it ungraded. This runs the dispatch's pinned checks now, records the
+    report/verdict/terminate the hook would have, and stamps them ``cli-verify``
+    so the trail shows an operator grade, not a live hook grade. See
+    :func:`fleetproof.hookgate.verify_dispatch`.
+    """
+    try:
+        result = verify_dispatch(args.run_id, note=(args.note or "").strip() or None)
+    except LedgerError as e:
+        _emit_error("ledger_error", str(e), args.format)
+        return 1
+    # Rebuild telemetry already happened inside verify_dispatch; surface the
+    # outcome the operator asked for.
+    if args.format == "json":
+        print(json.dumps(result, indent=2))
+        return 0
+    verdict = result["verdict"] or "ungraded"
+    if result["already_graded"]:
+        print(f"{result['run_id']} -> {verdict} (already graded; closed out of "
+              f"band): {result['detail'] or 'no detail'}")
+    else:
+        print(f"{result['run_id']} -> {verdict} (operator out-of-band verify, "
+              f"stamped cli-verify): {result['detail'] or 'no detail'}")
+    return 0
+
+
 def _format_age(started_at: str | None) -> str:
     """Compact ASCII age of a dispatch: '42s', '17m', '3h05m', '2d04h', or '?'."""
     if not started_at:
@@ -1492,6 +1523,16 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
         print("parked (unsatisfiable) = parked on the operator's "
               "--unsatisfiable flag: the work could not be satisfied from "
               "its seat. Classes as escalated — neither success nor failure.")
+    if "parked (unsatisfiable, over contradiction)" in labels:
+        print("parked (unsatisfiable, over contradiction) = escalated over a "
+              "recorded contradicted verdict — a false claim the marker "
+              "reclassified out of both penalized rates. Audit the trail "
+              "before trusting it (escalated red-team #3/#6; decision 0012).")
+    if "parked (unsatisfiable, unreported)" in labels:
+        print("parked (unsatisfiable, unreported) = escalated with no report "
+              "ever recorded — nothing in the trail corroborates the "
+              "non-satisfiability; unflagged this is a delivery failure "
+              "(escalated red-team #5; decision 0012).")
     if any(tier_label(r).endswith("~!") for r in records):
         print("tier~! = inherited from a predecessor that had terminated "
               "with NO verdict — nothing ever validated the inherited "
@@ -1570,6 +1611,23 @@ def _cmd_telemetry_summary(args: argparse.Namespace) -> int:
                 # collision the companion metric exists to resolve.
                 line += (f" (ungraded {m['ungraded']} + "
                          f"unverifiable {m['unverifiable']})")
+            elif metric == "escalated_rate":
+                # Print the laundering split when any escalation reclassified a
+                # penalized failure, so the aggregate cannot hide it (0.6.0
+                # escalated red-team). Silent when every escalation is clean —
+                # a split of "n clean" alone is noise.
+                over = m.get("escalated_over_contradiction", 0)
+                unrep = m.get("escalated_unreported", 0)
+                clean = m.get("escalated_clean", 0)
+                parts = []
+                if over:
+                    parts.append(f"{over} over-contradiction")
+                if unrep:
+                    parts.append(f"{unrep} unreported")
+                if parts and clean:
+                    parts.append(f"{clean} clean")
+                if parts:
+                    line += " (" + ", ".join(parts) + ")"
             print(line)
         sev = block["severity_distribution"]
         sev_shown = {k: v for k, v in sev.items() if v}
@@ -1958,6 +2016,23 @@ def build_parser() -> argparse.ArgumentParser:
              "instead of leaving the escalation in prose.")
     _add_format(p_dpark)
     p_dpark.set_defaults(func=_cmd_dispatch_park)
+
+    p_dverify = dsub.add_parser(
+        "verify",
+        help="Grade a stuck non-terminal dispatch out of band: run its pinned "
+             "checks now (the gate's own selection + runner) and record the "
+             "report/verdict/terminate the SubagentStop hook would have — "
+             "stamped 'cli-verify' so the trail shows an operator grade, not a "
+             "live hook grade. Legal only on a non-terminal dispatch. Use when "
+             "the harness dropped a SubagentStop and the dispatch is stuck at "
+             "dispatched/reported (L27).")
+    p_dverify.add_argument("run_id")
+    p_dverify.add_argument(
+        "--note", default=None,
+        help="Free-text note recorded on the synthetic report (why this is "
+             "being verified out of band).")
+    _add_format(p_dverify)
+    p_dverify.set_defaults(func=_cmd_dispatch_verify)
 
     p_tel = sub.add_parser("telemetry", help="Verification-telemetry surfaces.")
     tsub = p_tel.add_subparsers(dest="telemetry_command", required=True)
