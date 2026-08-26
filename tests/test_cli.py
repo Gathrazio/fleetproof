@@ -1224,6 +1224,124 @@ def test_dispatch_new_with_a_manifest_warns_and_strict_refuses(cli_runs, tmp_pat
     assert len(list_dispatches()) == 1  # the strict attempt recorded nothing
 
 
+# === strict key validation at authoring time (ask 3 / #30) ===
+
+def _misshaped_manifest(tmp_path: Path) -> Path:
+    # The observed one-character mistake: `expects` for `expect`. Under 0.5.0
+    # this preflighted byte-identically to the correct manifest.
+    mf = tmp_path / "misshaped.json"
+    mf.write_text(json.dumps({"manifest": {
+        "deliverables": ["a"],
+        "checks": [{"id": "c1", "cmd": "true", "expects": "exit0"}],
+    }}), encoding="utf-8")
+    return mf
+
+
+def test_dispatch_intent_refuses_an_unknown_check_key_and_writes_nothing(
+        cli_runs, tmp_path, capsys):
+    from fleetproof.ledger import intents_dir
+    pf = tmp_path / "prompt.md"
+    pf.write_text("work", encoding="utf-8")
+    mf = _misshaped_manifest(tmp_path)
+    assert main(["dispatch", "intent", "--agent", "tcn", "--prompt-file", str(pf),
+                 "--manifest", str(mf)]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "unknown key 'expects'" in captured.err
+    assert "legal keys:" in captured.err
+    assert not (intents_dir() / "tcn.json").exists()
+
+
+def test_dispatch_new_refuses_an_unknown_check_key(cli_runs, tmp_path, capsys):
+    from fleetproof.ledger import list_dispatches
+    mf = _misshaped_manifest(tmp_path)
+    assert main(["dispatch", "new", "--prompt", "p", "--manifest", str(mf),
+                 "--session-id", "s1"]) == 2
+    assert "unknown key 'expects'" in capsys.readouterr().err
+    assert list_dispatches() == []
+
+
+# === per-sample control provenance: pending-capture + --upgrade (ask 4 / #31) ===
+
+def test_creation_check_control_pending_pass_satisfies_strict_with_captured_fail(
+        cli_runs, tmp_path, capsys):
+    # The creation-work shape: the fail direction exists before the work and
+    # is captured; the pass direction cannot exist yet and says so. Strict
+    # controls accept the pair — the capture obligation moves to the moment
+    # the work verifies.
+    pf = tmp_path / "prompt.md"
+    pf.write_text("build the thing", encoding="utf-8")
+    mf = _control_manifest(tmp_path)
+    fail = tmp_path / "pre-state.json"
+    fail.write_text(json.dumps({"days_until_expiry": 67}), encoding="utf-8")
+    assert main(["check", "control", "tcn-health", "--fail-sample", str(fail),
+                 "--provenance", "pending-capture", "--fail-provenance", "captured",
+                 "--manifest", str(mf)]) == 0
+    out = capsys.readouterr().out
+    assert "provenance: pending-capture" in out
+    assert "pending-capture — no file yet" in out
+    assert main(["dispatch", "intent", "--agent", "tcn", "--prompt-file", str(pf),
+                 "--manifest", str(mf), "--strict-controls"]) == 0
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_pending_pass_without_a_captured_fail_still_warns(cli_runs, tmp_path, capsys):
+    mf = _control_manifest(tmp_path)
+    fail = tmp_path / "pre-state.json"
+    fail.write_text("{}", encoding="utf-8")
+    assert main(["check", "control", "tcn-health", "--fail-sample", str(fail),
+                 "--provenance", "pending-capture", "--fail-provenance", "authored",
+                 "--manifest", str(mf)]) == 0
+    capsys.readouterr()
+    pf = tmp_path / "prompt.md"
+    pf.write_text("work", encoding="utf-8")
+    assert main(["dispatch", "intent", "--agent", "tcn", "--prompt-file", str(pf),
+                 "--manifest", str(mf), "--strict-controls"]) == 1
+    err = capsys.readouterr().err
+    assert "pending-capture with no captured fail sample" in err
+
+
+def test_check_control_upgrade_promotes_the_pass_sample_to_captured(
+        cli_runs, tmp_path, capsys):
+    from fleetproof.controls import load_control, sample_provenance
+    mf = _control_manifest(tmp_path)
+    fail = tmp_path / "pre-state.json"
+    fail.write_text(json.dumps({"days_until_expiry": 67}), encoding="utf-8")
+    assert main(["check", "control", "tcn-health", "--fail-sample", str(fail),
+                 "--provenance", "pending-capture", "--fail-provenance", "captured",
+                 "--manifest", str(mf)]) == 0
+    capsys.readouterr()
+
+    emission = tmp_path / "real-emission.json"
+    emission.write_text(json.dumps({"days_remaining": 42.0}), encoding="utf-8")
+    assert main(["check", "control", "tcn-health", "--upgrade",
+                 "--pass-sample", str(emission), "--manifest", str(mf)]) == 0
+    out = capsys.readouterr().out
+    assert "control upgraded for 'tcn-health' (provenance: captured)" in out
+    assert "promoted from 'pending-capture' to 'captured'" in out
+    rec = load_control("tcn-health")
+    assert sample_provenance(rec, "pass_sample") == "captured"
+    assert rec["pass_sample"]["observed_pass"] is True  # graded by the real check
+    assert sample_provenance(rec, "fail_sample") == "captured"  # untouched
+    assert rec["upgraded_from"] == "pending-capture"
+
+
+def test_check_control_upgrade_needs_an_existing_record_and_a_sample(
+        cli_runs, tmp_path, capsys):
+    emission = tmp_path / "e.json"
+    emission.write_text("{}", encoding="utf-8")
+    assert main(["check", "control", "never-recorded", "--upgrade",
+                 "--pass-sample", str(emission)]) == 2
+    assert "no control record" in capsys.readouterr().err
+    assert main(["check", "control", "x", "--upgrade"]) == 2
+    assert "--upgrade needs --pass-sample" in capsys.readouterr().err
+    assert main(["check", "control", "x", "--upgrade", "--pass-sample",
+                 str(emission), "--provenance", "captured"]) == 2
+    assert "drop --provenance" in capsys.readouterr().err
+    assert main(["check", "control", "x", "--pass-sample", str(emission)]) == 2
+    assert "--provenance is required" in capsys.readouterr().err
+
+
 # === telemetry summary off-state (C8) ===
 
 def _graded_dispatch(capsys) -> str:

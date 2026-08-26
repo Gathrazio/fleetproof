@@ -152,8 +152,14 @@ wearing a declared tier's clothes is how a leaf gets graded as a lane. A fourth
 provenance, `inherited` (`lane~`), means no sidecar matched this spawn but an
 earlier dispatch of the same agent type in the same session carried a declared
 intent, and this one took its prompt, manifest, and tier from that record
-(`inherited_from` names it). The `tier_source` field on the record carries the
-word; the board carries the glyph.
+(`inherited_from` names it). As of 0.6.0 the inherit also stamps
+`inherited_from_state`/`inherited_from_verdict` — the predecessor's state and
+verdict as loaded at that moment (a message-vs-resume trigger is not
+observable from the SubagentStart payload, so the stamp records what is) —
+and when the predecessor had terminated with *no* verdict, the capture warns
+on stderr and the board sharpens the glyph to `lane~!`: nothing ever
+validated the configuration being copied. The `tier_source` field on the
+record carries the word; the board carries the glyph.
 
 ### The two new hooks
 
@@ -221,8 +227,11 @@ fleetproof dispatch new --session-id <id> ... # or export FLEETPROOF_SESSION_ID:
                                               # be adopted by a hook stop (v0.5)
 
 fleetproof check control <check-id> --pass-sample f [--fail-sample g] \
-    --provenance captured|authored [--manifest m.json]
-                                              # the grader control ledger (v0.5)
+    --provenance captured|authored|pending-capture [--fail-provenance ...] \
+    [--manifest m.json]                       # the grader control ledger (v0.5)
+fleetproof check control <check-id> --upgrade --pass-sample <captured-emission>
+                                              # promote a pending/authored pass
+                                              # direction from the real emission (v0.6)
 
 fleetproof fleet                              # the board, newest first
 fleetproof fleet --open                       # only what has not terminated
@@ -426,8 +435,12 @@ was authoring such checks `block: false`, which left the coordinator's own
 deliverable ungated. A disarmed coordinator's failing check is recorded as
 verdict **`advisory`** — a third verdict value, never `verified` with a note,
 because a failed blocking check must not read as verified on the board — with
-a detail naming the failures and the disarm; it renders in full as context,
-never blocks, and never counts as a contradiction. Each tier carries its own
+a detail naming the failures and the disarm; it never blocks and never counts
+as a contradiction, and — as of 0.6.0 — the stop is a real stop: the dispatch
+closes and the agent is *not* resumed with the failure text (handing it back
+kept the graded seat editing the failed artifact after its own dispatch was
+closed). The failure detail reaches the dispatcher instead, on the fleet
+board's footer and the bridge's next stop. Each tier carries its own
 note. **Lanes are never disarmable** — `--tier lane` is refused with that
 sentence; a lane's stop is the claim being verified. The ledger sweep still
 blocks on stalled dispatches regardless of arming, and the abandonment ladder
@@ -547,14 +560,24 @@ prints per check the exact command line, the expectation, the exit code,
 PASS/FAIL, and a redacted output tail. Nothing is written under `runs/`; the
 exit code is 0 whatever the checks did. Then `check control` records, under
 `.fleetproof/controls/<check-id>.json`, the pass and fail samples a check was
-exercised against, their hashes, the provenance of the pass sample
-(`captured` — a real emission — or `authored`), who and when, and the
-observed exit per direction when the check resolves from `--manifest` or the
-spec; the sample reaches the check as `FLEETPROOF_CONTROL_SAMPLE`. `dispatch
-intent` and `dispatch new --manifest` print one loud stderr warning per
-blocking manifest check with no control or an authored-only pass sample;
-`--strict-controls` refuses with nothing written. The controls directory is
-outside the hashed tree: a control is evidence about a grader, not a grader.
+exercised against, their hashes, the provenance of each sample (`captured` —
+a real emission — or `authored`; the pass direction may also be
+`pending-capture`: the emission does not exist yet, so it is recorded with no
+value at all), who and when, and the observed exit per direction when the
+check resolves from `--manifest` or the spec; the sample reaches the check as
+`FLEETPROOF_CONTROL_SAMPLE`. `dispatch intent` and `dispatch new --manifest`
+print one loud stderr warning per blocking manifest check with no control or
+an authored-only pass sample; `--strict-controls` refuses with nothing
+written. For *creation* work — a check asserting a state the lane is about to
+build, whose pass direction cannot be captured before the work by
+construction — strict is also satisfied by a **captured fail sample beside a
+pending-capture pass**: the discipline moves to the moment it can be met.
+When such a dispatch verifies, the gate names every control still pending and
+the remedy (`check control <id> --upgrade --pass-sample <captured-emission>`,
+which promotes the pass direction from the work's real emission), and stamps
+the outstanding list into the checker's `output.json`
+(`controls_pending_capture`). The controls directory is outside the hashed
+tree: a control is evidence about a grader, not a grader.
 
 **A check knows which dispatch it is grading, so one spec check can branch
 per lane.** Every gate-run check sees `FLEETPROOF_RUN_ID`,
@@ -715,7 +738,12 @@ dispatch manifest — carry the same shape with `cmd` in place of `run` (`run`
 is accepted as an alias): `expect` of every kind, `block`, `owner`, `redact`,
 `description`. Only `tier` and `succeeded_by` are refused there, because a
 manifest is graded at its own dispatch's tier and succession is between spec
-checks. A bare `{ "id", "cmd" }` entry still means blocking, exit-0. Point a
+checks. The key sets are closed (v0.6): an unknown key — `expects` for
+`expect` — is refused at authoring time (`dispatch intent`, `--preflight`,
+`dispatch new`) with the key and the legal set named, and warned about loudly
+at the gate while the check runs exactly as its known keys declare, so a
+manifest pinned under 0.5.0 cannot start failing mid-flight. A bare
+`{ "id", "cmd" }` entry still means blocking, exit-0. Point a
 manifest `cmd` at a script under `.fleetproof/checks/` so the grader is inside
 the tree pin. Checks execute from the resolved project root, not from
 wherever the hook's shell happened to be `cd`'d, and every rendered verdict

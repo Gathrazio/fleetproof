@@ -164,6 +164,14 @@ class CheckReport:
     # ``total``, ``failed``, or ``blocking_failures``: a retired check is not
     # a failed one. Additive: [] on older records. See :mod:`fleetproof.phase`.
     retired: list[dict[str, Any]] = field(default_factory=list)
+    # Blocking checks whose grader control's PASS sample was still
+    # pending-capture when this report ran (see
+    # :func:`fleetproof.controls.pending_pass_checks`) — stamped by the
+    # subagent gate so the evidence record says the capture obligation was
+    # outstanding at verdict time. Never affects the verdict; the verified
+    # transition warns. Additive: [] on older records and on reports built
+    # without the stamp.
+    controls_pending_capture: list[str] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -218,6 +226,7 @@ class CheckReport:
             "cwd": self.cwd,
             "arming": self.arming,
             "retired": list(self.retired),
+            "controls_pending_capture": list(self.controls_pending_capture),
             "summary": {
                 "total": self.total,
                 "passed": self.passed,
@@ -409,6 +418,7 @@ def run_checks(
     identity: dict[str, Any] | None = None,
     arming: dict[str, Any] | None = None,
     retired: list[dict[str, Any]] | None = None,
+    controls_pending: list[str] | None = None,
 ) -> CheckReport:
     """Run every selected check and (by default) append the verdict to the run log.
 
@@ -447,6 +457,11 @@ def run_checks(
     successor PASSED in this very run is retired here after grading — its
     result moves out of ``results`` into ``retired`` — so the phase swap
     costs no extra blocked stop while the session evidence catches up.
+
+    ``controls_pending`` is what the caller already read off the control
+    ledger before running (see
+    :func:`fleetproof.controls.pending_pass_checks`): stamped verbatim onto
+    the persisted record, never consulted for the verdict.
     """
     if checks is None:
         checks = load_checks(spec_path)
@@ -457,7 +472,8 @@ def run_checks(
 
     report = CheckReport(spec_sha256=sha, tree_sha256=checks_tree_hash(resolved_spec),
                          tier=tier, cwd=str(work_dir), arming=arming,
-                         retired=list(retired or []))
+                         retired=list(retired or []),
+                         controls_pending_capture=list(controls_pending or []))
     env = check_env(identity)
     if not record_to_log:
         for check in checks:

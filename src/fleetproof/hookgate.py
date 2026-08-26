@@ -70,6 +70,7 @@ from .checks import (
     short_spec_hash,
     spec_hash,
 )
+from .controls import pending_pass_checks
 from .ledger import (
     CAPTURE_START,
     REASON_ABANDONED,
@@ -82,12 +83,14 @@ from .ledger import (
     TIER_SOURCE_DEFAULTED,
     TIER_SOURCE_INHERITED,
     LedgerError,
+    advisory_verdict_line,
     close_dispatch,
     consume_intent,
     create_dispatch,
     find_dispatch_for_stop,
     find_inheritable_intent,
     intents_dir,
+    list_advisory_verdicts,
     list_dispatches,
     list_ungraded_terminations,
     load_dispatch,
@@ -578,6 +581,7 @@ def stop_gate() -> tuple[dict[str, Any] | None, int]:
         stalled_reason = _stalled_reason(stalled)
         reason = f"{reason} {stalled_reason}" if reason else stalled_reason
     _announce_ungraded_terminations(session_id)
+    _announce_advisory_verdicts(session_id)
 
     context_parts = [p for p in (context, _ledger_context(stalled, in_fleet)) if p]
     if reason is None and not context_parts:
@@ -614,6 +618,26 @@ def _announce_ungraded_terminations(session_id: str | None) -> None:
         return
     line = ungraded_termination_line(
         list_ungraded_terminations(session_id), scope_known=True)
+    if line:
+        sys.stderr.write(f"[fleetproof] {line}\n")
+
+
+def _announce_advisory_verdicts(session_id: str | None) -> None:
+    """One stderr line per bridge stop naming this session's advisory verdicts.
+
+    The advisory stop is a stop: the agent whose blocking failure was let
+    through by a disarmed gate is not resumed with the failure text (that
+    resume left it editing the graded artifact after its own dispatch was
+    closed — finding #39, observed at a field deployment on Windows), so the
+    dispatcher is the seat that must read it. Same posture as
+    :func:`_announce_ungraded_terminations`: every bridge stop, stderr only,
+    for as long as the condition holds. Wording shared with the fleet board
+    (:func:`fleetproof.ledger.advisory_verdict_line`).
+    """
+    if not session_id:
+        return
+    line = advisory_verdict_line(
+        list_advisory_verdicts(session_id), scope_known=True)
     if line:
         sys.stderr.write(f"[fleetproof] {line}\n")
 
@@ -785,10 +809,18 @@ def capture_subagent_start(payload: dict[str, Any]) -> str:
     for note in notes:
         sys.stderr.write(f"[fleetproof] {note}\n")
     inherited_from: str | None = None
+    inherited_from_state: str | None = None
+    inherited_from_verdict: str | None = None
     if intent is None and not notes:
         source = find_inheritable_intent(os.environ.get(SESSION_ID_ENV), agent_type)
         if source is not None:
             inherited_from = source.run_id
+            # The predecessor's state/verdict as loaded at this moment, on
+            # the record. A message-vs-resume trigger is not in the
+            # SubagentStart payload, so this is the honest observable: what,
+            # if anything, ever validated the configuration being copied.
+            inherited_from_state = source.state
+            inherited_from_verdict = source.verdict
             intent = {
                 "prompt": source.prompt,
                 "manifest": source.manifest,
@@ -802,6 +834,18 @@ def capture_subagent_start(payload: dict[str, Any]) -> str:
                 f"[fleetproof] no intent sidecar for '{agent_type or 'unknown'}' "
                 f"— inherited intent from dispatch {source.run_id} "
                 "(re-message of a live teammate?)\n")
+            if source.is_terminal and source.verdict is None:
+                # A harness resume inherited from a predecessor that had
+                # terminated ungraded, silently doubling an unproven
+                # configuration's evidence footprint (observed in a field
+                # deployment on Windows). Said loudly, never refused: an
+                # unproven contract said out loud still beats an ungoverned
+                # placeholder capture.
+                sys.stderr.write(
+                    f"[fleetproof] dispatch inherits from {source.run_id}, "
+                    "which terminated with NO verdict — nothing ever "
+                    "validated the inherited prompt/manifest/tier; the board "
+                    "marks the row '~!'\n")
         else:
             # A clean miss — no sidecar matched by name or role, and nothing
             # in this session to inherit. Said loudly, because the silent
@@ -834,6 +878,8 @@ def capture_subagent_start(payload: dict[str, Any]) -> str:
         agent={"agent_id": agent_id, "agent_type": agent_type, "capture": CAPTURE_START},
         intent_source=intent["source"] if intent else None,
         inherited_from=inherited_from,
+        inherited_from_state=inherited_from_state,
+        inherited_from_verdict=inherited_from_verdict,
         by="hook",
     )
 
@@ -1048,11 +1094,14 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
        tier's gate is advisory has its blocking failures demoted for the
        decision — mirroring :func:`_spec_gate` — so the verdict is recorded
        as ``advisory`` (a third verdict value, never ``verified``) with a
-       detail naming the failures and the disarm, the failure renders in
-       full as context under the advisory marker, nothing blocks, and no
+       detail naming the failures and the disarm, nothing blocks, no
        ``contradicted`` transition is written (so the ladder neither strikes
-       nor resets). A lane dispatch is graded identically whatever
-       ``arming.json`` says.
+       nor resets), and the stop IS a stop: dispatch closed, no context
+       returned. The failure text reaches the dispatcher via the fleet board
+       and the bridge Stop gate (:func:`_announce_advisory_verdicts`) —
+       returning it to the graded agent resumed a seat whose dispatch was
+       already closed (finding #39). A lane dispatch is graded identically
+       whatever ``arming.json`` says.
 
     When nothing is runnable — the tier selects no repo checks *and* the
     manifest declares none — no verdict is recorded at all: the dispatch is
@@ -1217,18 +1266,31 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
             checks=[])
         return None, 0
 
+    # Read before the checker runs so the outstanding-upgrade fact lands on
+    # the persisted verdict record itself (output.json), not just on stderr.
+    controls_pending = pending_pass_checks([c for c in active if c.block])
     report = run_checks(
         active, record_to_log=True, tier=dispatch.tier,
         identity=_check_identity(dispatch.run_id, agent_type_known, dispatch.tier,
                                  session_id),
         arming=_arming_stamp(dispatch.tier, arming_state, arming_note),
-        retired=retired)
+        retired=retired, controls_pending=controls_pending)
     if report.blocking_failures and arming_state == ADVISORY:
         # This tier's gate is disarmed: the failure is recorded and rendered
         # in full, and nothing blocks. The verdict is its own value —
         # ``advisory`` — never ``verified`` with a note: a failed blocking
         # check must not read as verified on the board, whatever the detail
-        # string says next to it.
+        # string says next to it. And the stop is a STOP, mirroring the
+        # clean-verified close below: this branch used to return the failure
+        # as additionalContext, which resumed the agent after its dispatch
+        # was closed 8 ms earlier — it kept editing the graded artifact for
+        # minutes with no manifest or allowed_paths in force, and its next
+        # stop was an orphan no metric could attribute (finding #39,
+        # observed in a field deployment on Windows). The failure text goes
+        # to the dispatcher instead — the fleet board and the bridge Stop
+        # gate render the verdict detail (advisory_verdict_line) — because
+        # handing it to the seat whose work just failed is self-certification
+        # with the tool supplying the feedback loop.
         failing_ids = "; ".join(r.id for r in report.blocking_failures)
         record_verdict(
             dispatch.run_id, STATE_ADVISORY,
@@ -1238,16 +1300,13 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
             by=VERDICT_BY)
         _try_close(dispatch.run_id)
         _try_build_telemetry(dispatch.run_id, check_report=report, checks=runnable)
-        body = (f"{len(report.blocking_failures)}/{report.total} blocking "
-                f"check(s) failed on dispatch {dispatch.run_id} — rendered as "
-                f"context only; the {dispatch.tier} gate is disarmed and check "
-                "failures do not block this stop.\n" + _evidence_context(report))
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "SubagentStop",
-                "additionalContext": _advisory_context(arming_note, body, dispatch.tier),
-            },
-        }, 0
+        sys.stderr.write(
+            f"[fleetproof] advisory verdict on dispatch {dispatch.run_id}: "
+            f"{len(report.blocking_failures)}/{report.total} blocking check(s) "
+            f"failed ({failing_ids}) under a disarmed {dispatch.tier} gate — "
+            "stop allowed, dispatch closed; the failure surfaces on the fleet "
+            "board and the next bridge stop\n")
+        return None, 0
     if report.blocking_failures:
         failing_ids = "; ".join(r.id for r in report.blocking_failures)
         prior_contradictions = sum(
@@ -1282,6 +1341,19 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
             dispatch.run_id, _failure_reason(report), _evidence_context(report),
             checker_run_id=report.run_id), 0
 
+    if controls_pending:
+        # The verified transition is the moment a pending-capture pass
+        # sample's obligation comes due: the work now emits the pass
+        # direction, so the capture that was impossible before the work is
+        # possible now. Warn, never block — the discipline is "capture
+        # before you call it verified", and this is the tap on the shoulder.
+        listed = ", ".join(controls_pending)
+        sys.stderr.write(
+            f"[fleetproof] dispatch {dispatch.run_id} verified with "
+            f"{len(controls_pending)} grader control(s) whose pass sample is "
+            f"still pending-capture — {listed}. The pass direction now "
+            "exists: promote it from the real emission — fleetproof check "
+            "control <check-id> --upgrade --pass-sample <captured-emission>\n")
     record_verdict(
         dispatch.run_id,
         STATE_VERIFIED,

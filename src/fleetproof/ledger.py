@@ -325,6 +325,17 @@ class DispatchRecord:
     # ``inherited`` (see :func:`find_inheritable_intent`). Additive: None on
     # every record that matched its own sidecar, defaulted, or predates this.
     inherited_from: str | None = None
+    # The predecessor's lifecycle state and verdict AS LOADED at inherit time.
+    # Inheritance faithfully copied a configuration whose source had
+    # terminated with no verdict — nothing had ever validated the inherited
+    # prompt/manifest/tier, and the record could not say so (observed in a
+    # field deployment on Windows). A why-did-this-spawn-fire trigger
+    # (message vs harness resume) is NOT observable from the SubagentStart
+    # payload, so these stamp the honest observable instead. Additive: None
+    # on records written before the stamp; a stamped record with a null
+    # verdict means "stamped, and no verdict existed", which is different.
+    inherited_from_state: str | None = None
+    inherited_from_verdict: str | None = None
 
     @property
     def state(self) -> str:
@@ -362,6 +373,20 @@ class DispatchRecord:
             state = entry.get("state")
             if state in VERDICT_STATES:
                 return str(state)
+        return None
+
+    @property
+    def verdict_detail(self) -> str | None:
+        """The detail recorded on the last verdict transition, or None.
+
+        For an ``advisory`` verdict this is the line that names the blocking
+        failures and the disarm — the text the dispatcher surfaces render,
+        since the graded agent's stop is a real stop and no longer carries it.
+        """
+        for entry in reversed(self.transitions):
+            if entry.get("state") in VERDICT_STATES:
+                detail = entry.get("detail")
+                return str(detail) if detail else None
         return None
 
     @property
@@ -508,6 +533,8 @@ class DispatchRecord:
             "intent_source": self.intent_source,
             "telemetry_era": self.telemetry_era,
             "inherited_from": self.inherited_from,
+            "inherited_from_state": self.inherited_from_state,
+            "inherited_from_verdict": self.inherited_from_verdict,
             "state": self.state,
             "verdict": self.verdict,
             "has_report": self.has_report,
@@ -590,6 +617,8 @@ def load_dispatch(run_id: str) -> DispatchRecord | None:
         intent_source=intent_source if isinstance(intent_source, dict) else None,
         telemetry_era=dispatch.get("telemetry_era") or None,
         inherited_from=str(dispatch.get("inherited_from") or "") or None,
+        inherited_from_state=str(dispatch.get("inherited_from_state") or "") or None,
+        inherited_from_verdict=str(dispatch.get("inherited_from_verdict") or "") or None,
     )
 
 
@@ -656,6 +685,41 @@ def ungraded_termination_line(ungraded: list[DispatchRecord], scope_known: bool)
     return (f"{len(ungraded)} dispatch(es) terminated ungraded {scope} — {ids}. "
             "A claim was recorded and closed with no verdict; an absent grade "
             "is not a passing grade.")
+
+
+def list_advisory_verdicts(session_id: str | None) -> list[DispatchRecord]:
+    """Dispatches in ``session_id`` whose verdict is ``advisory``, newest first.
+
+    ``None`` session means every dispatch on disk (the caller says so in its
+    wording). Same posture as :func:`list_ungraded_terminations`: this is
+    the count the fleet board and the bridge Stop gate announce, because an
+    advisory stop is a real stop — the graded agent is not resumed with the
+    failure text, so the dispatcher's surfaces are where it must land.
+    """
+    return [r for r in list_dispatches(session_id=session_id)
+            if r.verdict == STATE_ADVISORY]
+
+
+def advisory_verdict_line(advisory: list[DispatchRecord], scope_known: bool) -> str | None:
+    """The one line that says a blocking failure was let through disarmed, or None.
+
+    Shared by the fleet board and the bridge Stop gate, like
+    :func:`ungraded_termination_line`. It exists because the advisory branch
+    used to hand the failure back to the graded agent as context — which
+    resumed the agent after its own dispatch was closed, leaving it editing
+    the graded artifact with no manifest and no allowed_paths in force
+    (observed in a field deployment on Windows). Now the stop is a stop, and
+    this line carries the verdict detail to the seat that can act on it.
+    Silence when the count is zero — the line is a signal, not a header.
+    """
+    if not advisory:
+        return None
+    scope = "this session" if scope_known else "in the dispatches shown"
+    details = "; ".join(
+        f"{r.run_id}: {r.verdict_detail or 'no detail recorded'}" for r in advisory)
+    return (f"{len(advisory)} dispatch(es) graded advisory {scope} — a blocking "
+            f"check failed under a disarmed gate and the stop was allowed. "
+            f"{details}. Review before trusting the work.")
 
 
 def find_dispatch_by_agent(session_id: str | None, agent_id: str | None) -> DispatchRecord | None:
@@ -782,7 +846,12 @@ def find_inheritable_intent(
 
     Same session exactly, same ``agent.agent_type`` exactly, any state — the
     record being inherited from is usually terminal (the teammate finished,
-    verified, and was then messaged again). A chain is fine: an inherited
+    verified, and was then messaged again). That assumption is stamped rather
+    than enforced: the capture records ``inherited_from_state``/``_verdict``
+    and warns when the predecessor terminated with no verdict, but it never
+    refuses — chains through open intermediates are legitimate, and an
+    unproven configuration said out loud beats an ungoverned placeholder
+    capture. A chain is fine: an inherited
     dispatch keeps the ``intent_source`` it inherited, so the third re-message
     inherits from the second, which inherited from the first. No session id
     means no inheritance: a session-less spawn has no "same session" to
@@ -1293,6 +1362,8 @@ def create_dispatch(
     spec_path: Path | None = None,
     session_id: str | None = None,
     inherited_from: str | None = None,
+    inherited_from_state: str | None = None,
+    inherited_from_verdict: str | None = None,
 ) -> str:
     """Record a dispatch at launch and return its run id.
 
@@ -1323,6 +1394,11 @@ def create_dispatch(
     the dispatch this one's intent was taken from and is only legal with
     ``tier_source="inherited"`` (and vice versa) — a record must not claim
     inheritance without naming its source, or name one without claiming it.
+    ``inherited_from_state``/``inherited_from_verdict`` stamp the
+    predecessor's state and verdict as loaded at inherit time (see
+    :class:`DispatchRecord`); only legal alongside ``inherited_from``, and
+    the verdict is written even when None — an explicit null says "stamped,
+    and no verdict existed", distinct from a record that predates the stamp.
     """
     if not isinstance(prompt, str) or not prompt.strip():
         raise LedgerError("A dispatch needs a prompt; refusing to record an empty one.")
@@ -1346,6 +1422,11 @@ def create_dispatch(
         raise LedgerError(
             "tier_source 'inherited' and inherited_from go together: pass both "
             "(naming the source dispatch) or neither."
+        )
+    if (inherited_from_state or inherited_from_verdict) and not inherited_from:
+        raise LedgerError(
+            "inherited_from_state/inherited_from_verdict describe a predecessor; "
+            "pass inherited_from with them."
         )
 
     if manifest is None:
@@ -1400,6 +1481,12 @@ def create_dispatch(
         dispatch["intent_source"] = dict(intent_source)
     if inherited_from:
         dispatch["inherited_from"] = inherited_from
+        # The stamp travels as a pair: the verdict is written even when None,
+        # because "stamped, no verdict existed" must read differently from a
+        # record written before the stamp (where both keys are absent).
+        if inherited_from_state:
+            dispatch["inherited_from_state"] = inherited_from_state
+            dispatch["inherited_from_verdict"] = inherited_from_verdict
     _write_json(run_dir / DISPATCH_FILENAME, dispatch)
     return run_id
 

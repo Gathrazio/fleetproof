@@ -19,7 +19,10 @@ from fleetproof.controls import (
     controls_are_outside_the_checks_tree,
     controls_dir,
     load_control,
+    pending_pass_checks,
     record_control,
+    sample_provenance,
+    upgrade_pass_sample,
 )
 
 
@@ -131,3 +134,97 @@ def test_control_warnings_name_uncontrolled_and_authored_blocking_checks(project
     assert warnings[0].startswith("blocking check 'authored-only': its only pass sample is authored")
     assert warnings[1].startswith("blocking check 'uncontrolled' has no grader control")
     assert "fleetproof check control uncontrolled --pass-sample" in warnings[1]
+
+
+# === per-sample provenance: pending-capture and the upgrade path (ask 4 / #31) ===
+
+def test_legacy_record_level_provenance_migrates_on_read(project):
+    # A 0.5.0-shaped record: one record-level provenance, no per-sample
+    # field. It keeps loading, the samples inherit the record's one claim,
+    # and the file on disk is never rewritten by reading it.
+    path = controls_dir() / "legacy.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "check_id": "legacy",
+        "provenance": "captured",
+        "pass_sample": {"path": "x", "sha256": "aa"},
+        "fail_sample": {"path": "y", "sha256": "bb"},
+    }), encoding="utf-8")
+    rec = load_control("legacy")
+    assert rec["pass_sample"]["provenance"] == "captured"
+    assert rec["fail_sample"]["provenance"] == "captured"
+    assert sample_provenance(rec, "pass_sample") == "captured"
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert "provenance" not in on_disk["pass_sample"]  # read-side only
+    # A legacy captured record still satisfies strict, exactly as before.
+    checks = [Check(id="legacy", run="x", expect={"kind": "exit0"}, block=True)]
+    assert control_warnings(checks) == []
+
+
+def test_captured_fail_plus_pending_pass_satisfies_strict(project):
+    # The creation-work shape (#31): the fail direction can be captured
+    # before the work exists; the pass direction cannot, and says so instead
+    # of being authored. Strict accepts the pair — and only the pair.
+    fail = _sample(project, "pre.json", {"days_until_expiry": 67})
+    record_control("creation", pass_sample=None, provenance="pending-capture",
+                   fail_sample=fail, fail_provenance="captured")
+    record_control("creation-weak", pass_sample=None, provenance="pending-capture",
+                   fail_sample=fail, fail_provenance="authored")
+    checks = [
+        Check(id="creation", run="x", expect={"kind": "exit0"}, block=True),
+        Check(id="creation-weak", run="x", expect={"kind": "exit0"}, block=True),
+    ]
+    warnings = control_warnings(checks)
+    assert len(warnings) == 1
+    assert warnings[0].startswith(
+        "blocking check 'creation-weak': pass sample is pending-capture")
+    rec = load_control("creation")
+    assert rec["pass_sample"] == {"provenance": "pending-capture"}  # no value
+    assert rec["provenance"] == "pending-capture"  # the 0.5.0 mirror
+
+
+def test_record_control_pending_capture_input_rules(project):
+    good = _sample(project, "s.json", {})
+    with pytest.raises(ControlError, match="has no value"):
+        record_control("x", pass_sample=good, provenance="pending-capture")
+    with pytest.raises(ControlError, match="needs a file"):
+        record_control("x", pass_sample=None, provenance="captured")
+    with pytest.raises(ControlError, match="explicit --fail-provenance"):
+        record_control("x", pass_sample=None, provenance="pending-capture",
+                       fail_sample=good)
+
+
+def test_upgrade_pass_sample_promotes_and_leaves_the_fail_direction_alone(project):
+    fail = _sample(project, "pre.json", {"days_until_expiry": 67})
+    record_control("tcn-health", pass_sample=None, provenance="pending-capture",
+                   fail_sample=fail, fail_provenance="captured",
+                   check=_SAMPLE_GRADER, cwd=project)
+    emission = _sample(project, "real.json", {"days_remaining": 42.0})
+    rec = upgrade_pass_sample("tcn-health", emission, check=_SAMPLE_GRADER,
+                              check_source="manifest", cwd=project)
+    assert rec["provenance"] == "captured"
+    assert rec["pass_sample"]["provenance"] == "captured"
+    assert rec["pass_sample"]["observed_pass"] is True
+    assert rec["upgraded_from"] == "pending-capture"
+    assert rec["fail_sample"]["provenance"] == "captured"  # untouched
+    assert json.loads(control_path("tcn-health").read_text(encoding="utf-8")) == rec
+    with pytest.raises(ControlError, match="no control record"):
+        upgrade_pass_sample("never-recorded", emission)
+
+
+def test_pending_pass_checks_lists_only_blocking_pending_controls(project):
+    good = _sample(project, "s.json", {"days_remaining": 1})
+    fail = _sample(project, "f.json", {})
+    record_control("done", pass_sample=good, provenance="captured")
+    record_control("pending", pass_sample=None, provenance="pending-capture",
+                   fail_sample=fail, fail_provenance="captured")
+    record_control("pending-advisory", pass_sample=None,
+                   provenance="pending-capture", fail_sample=fail,
+                   fail_provenance="captured")
+    checks = [
+        Check(id="done", run="x", expect={"kind": "exit0"}, block=True),
+        Check(id="pending", run="x", expect={"kind": "exit0"}, block=True),
+        Check(id="pending-advisory", run="x", expect={"kind": "exit0"}, block=False),
+        Check(id="uncontrolled", run="x", expect={"kind": "exit0"}, block=True),
+    ]
+    assert pending_pass_checks(checks) == ["pending"]

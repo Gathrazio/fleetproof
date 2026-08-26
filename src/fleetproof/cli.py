@@ -57,6 +57,7 @@ from .checker import (
 from .checks import (
     Check,
     CheckSpecError,
+    MANIFEST_CHECK_KEYS,
     SPEC_DRIFT_NOTE,
     STARTER_SPEC,
     VALID_TIERS,
@@ -64,13 +65,18 @@ from .checks import (
     load_checks,
     parse_manifest_check,
     short_spec_hash,
+    unknown_check_keys,
+    unknown_key_message,
 )
 from .controls import (
     CONTROL_SAMPLE_ENV,
+    PROVENANCE_PENDING,
+    VALID_PASS_PROVENANCE,
     VALID_PROVENANCE,
     ControlError,
     control_warnings,
     record_control,
+    upgrade_pass_sample,
 )
 from .hookgate import (
     ADVISORY,
@@ -101,8 +107,10 @@ from .ledger import (
     REASON_PARKED_PREFIX,
     VALID_TERMINATE_REASONS,
     LedgerError,
+    advisory_verdict_line,
     close_dispatch,
     create_dispatch,
+    list_advisory_verdicts,
     list_dispatches,
     list_orphan_stops,
     list_ungraded_terminations,
@@ -288,8 +296,33 @@ def _cmd_check_control(args: argparse.Namespace) -> int:
     manifest checks are where lane grading lives), else from the repo spec;
     when neither names the id the control is recorded without an observed
     run and says so — the samples' hashes and provenance are still the
-    record that matters. See :mod:`fleetproof.controls`.
+    record that matters. ``--upgrade`` promotes an existing record's pass
+    direction from a captured real emission (the creation-work closeout:
+    ``pending-capture`` until the work exists, upgraded the moment it emits).
+    See :mod:`fleetproof.controls`.
     """
+    if args.upgrade:
+        if args.provenance is not None:
+            _emit_error("control_error",
+                        "--upgrade always records a captured pass sample; "
+                        "drop --provenance.", args.format)
+            return 2
+        if args.fail_sample:
+            _emit_error("control_error",
+                        "--upgrade replaces only the pass direction; record a "
+                        "fail sample with a full `check control` instead.",
+                        args.format)
+            return 2
+        if not args.pass_sample:
+            _emit_error("control_error",
+                        "--upgrade needs --pass-sample <captured-emission>: "
+                        "the real emission to promote.", args.format)
+            return 2
+    elif args.provenance is None:
+        _emit_error("control_error",
+                    "--provenance is required: captured, authored, or "
+                    "pending-capture.", args.format)
+        return 2
     check = None
     source = None
     if args.manifest:
@@ -317,20 +350,31 @@ def _cmd_check_control(args: argparse.Namespace) -> int:
         if found:
             check, source = found[0], "spec"
     try:
-        record = record_control(
-            args.check_id,
-            pass_sample=Path(args.pass_sample),
-            fail_sample=Path(args.fail_sample) if args.fail_sample else None,
-            provenance=args.provenance,
-            note=(args.note or "").strip(),
-            check=check, check_source=source, cwd=project_root())
+        if args.upgrade:
+            record = upgrade_pass_sample(
+                args.check_id, Path(args.pass_sample),
+                note=(args.note or "").strip(),
+                check=check, check_source=source, cwd=project_root())
+        else:
+            record = record_control(
+                args.check_id,
+                pass_sample=Path(args.pass_sample) if args.pass_sample else None,
+                fail_sample=Path(args.fail_sample) if args.fail_sample else None,
+                provenance=args.provenance,
+                fail_provenance=args.fail_provenance,
+                note=(args.note or "").strip(),
+                check=check, check_source=source, cwd=project_root())
     except ControlError as e:
         _emit_error("control_error", str(e), args.format)
         return 2
     if args.format == "json":
         print(json.dumps(record, indent=2))
         return 0
-    print(f"control recorded for '{args.check_id}' (provenance: {record['provenance']})")
+    verb = "upgraded" if args.upgrade else "recorded"
+    print(f"control {verb} for '{args.check_id}' (provenance: {record['provenance']})")
+    if args.upgrade and record.get("upgraded_from"):
+        print(f"  pass direction promoted from '{record['upgraded_from']}' to "
+              "'captured'.")
     if check is None:
         print(f"  check not found in a manifest or the spec; samples hashed, "
               f"no run observed. Pass --manifest <file> to run it.")
@@ -338,13 +382,19 @@ def _cmd_check_control(args: argparse.Namespace) -> int:
         rec = record[direction]
         if rec is None:
             continue
+        if rec.get("path") is None:
+            print(f"  {direction}: pending-capture — no file yet. Promote it "
+                  f"from the real emission once the work verifies: fleetproof "
+                  f"check control {args.check_id} --upgrade --pass-sample "
+                  "<captured-emission>")
+            continue
         line = f"  {direction}: {rec['path']} sha256 {rec['sha256'][:12]}"
         if rec.get("observed_exit") is not None or rec.get("observed_pass") is not None:
             verdict = "agrees" if rec.get("agrees") else "DISAGREES"
             line += (f"; observed exit {rec['observed_exit']} -> "
                      f"{'pass' if rec['observed_pass'] else 'fail'} ({verdict})")
         print(line)
-    if record["provenance"] != "captured":
+    if record["provenance"] == "authored":
         print("  WARNING: an authored pass sample shares its author's beliefs. "
               "Replace it with a captured real emission before pinning.")
     if record["fail_sample"] is None:
@@ -570,21 +620,50 @@ _PREFLIGHT_TAIL_LINES = 8
 
 def _manifest_checks_strict(manifest: dict | None) -> list[Check]:
     """Every manifest check parsed with the gate's parser; the first malformed
-    entry raises :class:`CheckSpecError` naming it. Authoring time is where
-    a malformed check still has someone to land on — the gate would skip it
-    with a stderr line nobody reads."""
+    entry — including an unknown key — raises :class:`CheckSpecError` naming
+    it. Authoring time is where a malformed check still has someone to land
+    on — the gate would skip it with a stderr line nobody reads."""
     entries = (manifest or {}).get("checks") or []
     if not isinstance(entries, list):
         raise CheckSpecError("manifest.checks must be an array")
     out: list[Check] = []
     seen: set[str] = set()
     for i, entry in enumerate(entries):
-        check = parse_manifest_check(entry, f"manifest check [{i}]")
+        check = parse_manifest_check(entry, f"manifest check [{i}]",
+                                     on_unknown="refuse")
         if check.id in seen:
             raise CheckSpecError(f"manifest check [{i}]: duplicate id {check.id!r}")
         seen.add(check.id)
         out.append(check)
     return out
+
+
+def _manifest_keys_ok(manifest: dict | None, fmt: str) -> bool:
+    """Refuse an unknown check key at authoring time, naming it and the legal set.
+
+    Key validation only, run on every ``dispatch new``/``dispatch intent``
+    whether or not ``--preflight`` is on: ``"expects"`` for ``"expect"``
+    silently converted a content assertion into an exit-code assertion and
+    preflighted byte-identically to the correct manifest (observed in a
+    field deployment on Windows). Entries that are malformed in other ways
+    keep their existing authoring behavior — skipped at the gate with a
+    stderr note, refused only by ``--preflight``'s strict parse.
+    """
+    entries = (manifest or {}).get("checks")
+    if not isinstance(entries, list):
+        return True
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        unknown = unknown_check_keys(entry, MANIFEST_CHECK_KEYS)
+        if unknown:
+            _emit_error(
+                "unknown_check_key",
+                unknown_key_message(f"manifest check [{i}]", entry.get("id"),
+                                    unknown, MANIFEST_CHECK_KEYS),
+                fmt)
+            return False
+    return True
 
 
 def _describe_command(check: Check) -> tuple[str, str]:
@@ -734,6 +813,8 @@ def _cmd_dispatch_new(args: argparse.Namespace) -> int:
         if isinstance(inner, dict):
             manifest = inner
 
+    if manifest is not None and not _manifest_keys_ok(manifest, args.format):
+        return 2
     if manifest is not None and not _controls_ok(
             manifest, strict=getattr(args, "strict_controls", False), fmt=args.format):
         return 1
@@ -833,6 +914,9 @@ def _cmd_dispatch_intent(args: argparse.Namespace) -> int:
         inner = manifest.get("manifest")
         if isinstance(inner, dict):
             manifest = inner
+
+    if manifest is not None and not _manifest_keys_ok(manifest, args.format):
+        return 2
 
     checks: list[Check] = []
     if args.preflight:
@@ -1148,6 +1232,12 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
     scope_session = args.session or os.environ.get(SESSION_ID_ENV) or None
     ungraded = list_ungraded_terminations(scope_session)
     ungraded_line = ungraded_termination_line(ungraded, scope_known=bool(scope_session))
+    # The advisory stop is a stop: the graded agent never sees its failure
+    # text, so the board is one of the two dispatcher surfaces (with the
+    # bridge Stop gate) that must carry the verdict detail.
+    advisory_graded = list_advisory_verdicts(scope_session)
+    advisory_line = advisory_verdict_line(advisory_graded,
+                                          scope_known=bool(scope_session))
     # The board echoes every disarmed gate (bridge, coordinator) whenever it
     # is advisory — the armed default stays quiet. Silence here is what makes
     # the echo a signal.
@@ -1162,6 +1252,11 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
             "orphan_stop_count": len(orphans),
             "terminated_ungraded_count": len(ungraded),
             "terminated_ungraded": [r.run_id for r in ungraded],
+            "advisory_verdict_count": len(advisory_graded),
+            "advisory_verdicts": [
+                {"run_id": r.run_id, "detail": r.verdict_detail}
+                for r in advisory_graded
+            ],
         }
         if advisory:
             payload["arming"] = arming
@@ -1175,6 +1270,8 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
             print(_orphan_count_line(orphans))
         if ungraded_line:
             print(ungraded_line)
+        if advisory_line:
+            print(advisory_line)
         return 0
     print(f"{'run_id':<24} {'state':<26} {'tier':<12} {'agent':<18} "
           f"{'verdict':<13} {'age':>7} {'session':<14}")
@@ -1206,10 +1303,17 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
         print("parked (unsatisfiable) = parked on the operator's "
               "--unsatisfiable flag: the work could not be satisfied from "
               "its seat. Classes as escalated — neither success nor failure.")
+    if any(tier_label(r).endswith("~!") for r in records):
+        print("tier~! = inherited from a predecessor that had terminated "
+              "with NO verdict — nothing ever validated the inherited "
+              "prompt/manifest/tier (see inherited_from_state / "
+              "inherited_from_verdict on the record).")
     if orphans:
         print(_orphan_count_line(orphans))
     if ungraded_line:
         print(ungraded_line)
+    if advisory_line:
+        print(advisory_line)
     return 0
 
 
@@ -1408,15 +1512,34 @@ def build_parser() -> argparse.ArgumentParser:
              "sample, and the observed exit per direction. Written to "
              ".fleetproof/controls/<check-id>.json, outside the hashed tree.")
     p_ctl.add_argument("check_id")
-    p_ctl.add_argument("--pass-sample", required=True,
-                       help="A file the check must grade as PASS.")
+    p_ctl.add_argument("--pass-sample", default=None,
+                       help="A file the check must grade as PASS. Required "
+                            "unless --provenance pending-capture (the pass "
+                            "emission does not exist yet); required again with "
+                            "--upgrade (the captured emission to promote).")
     p_ctl.add_argument("--fail-sample", default=None,
                        help="A file the check must grade as FAIL.")
-    p_ctl.add_argument("--provenance", required=True, choices=list(VALID_PROVENANCE),
+    p_ctl.add_argument("--provenance", default=None,
+                       choices=list(VALID_PASS_PROVENANCE),
                        help="Where the pass sample came from: captured (a real "
-                            "emission of the target) or authored (written by a "
-                            "person). Authored controls are warned about at "
-                            "dispatch intent.")
+                            "emission of the target), authored (written by a "
+                            "person), or pending-capture (creation work — the "
+                            "emission does not exist yet; record the captured "
+                            "FAIL sample now, upgrade the pass at closeout). "
+                            "Authored controls are warned about at dispatch "
+                            "intent. Required except with --upgrade.")
+    p_ctl.add_argument("--fail-provenance", default=None,
+                       choices=list(VALID_PROVENANCE),
+                       help="Where the fail sample came from. Omitted it "
+                            "follows --provenance; beside a pending-capture "
+                            "pass it must be said explicitly — strict mode "
+                            "keys on a CAPTURED fail.")
+    p_ctl.add_argument("--upgrade", action="store_true",
+                       help="Promote the existing record's pass direction from "
+                            "a captured real emission (--pass-sample): "
+                            "provenance flips to captured, the fail direction "
+                            "is untouched. The closeout half of "
+                            "pending-capture.")
     p_ctl.add_argument("--note", default=None,
                        help="Where and when the sample was captured, for the record.")
     p_ctl.add_argument("--manifest", default=None,

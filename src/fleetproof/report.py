@@ -119,8 +119,13 @@ def tier_label(dispatch: DispatchRecord) -> str:
     An inherited tier ('~') means no sidecar matched but an earlier dispatch of
     the same agent type in the same session had one, and this dispatch is under
     that contract — distinct from '!' because nobody declared it *for this
-    spawn*, and from '?' because it is graded. One character keeps the column
-    skimmable.
+    spawn*, and from '?' because it is graded. '~!' sharpens that: the stamped
+    predecessor had already terminated with NO verdict when this dispatch
+    inherited from it, so nothing ever validated the inherited configuration
+    (a harness resume copied a never-graded, wrong-tier contract this way,
+    observed in a field deployment on Windows). A record written before the
+    stamp existed stays plain '~' — an absent stamp is not evidence the
+    verdict was absent. One or two characters keep the column skimmable.
     """
     if not dispatch.tier:
         return "-"
@@ -129,7 +134,11 @@ def tier_label(dispatch: DispatchRecord) -> str:
     elif dispatch.tier_source == TIER_SOURCE_DEFAULTED:
         marker = "?"
     elif dispatch.tier_source == TIER_SOURCE_INHERITED:
-        marker = "~"
+        if (dispatch.inherited_from_state == STATE_TERMINATED
+                and dispatch.inherited_from_verdict is None):
+            marker = "~!"
+        else:
+            marker = "~"
     else:
         marker = ""
     return f"{dispatch.tier}{marker}"
@@ -199,6 +208,9 @@ def _dispatch_for(run: RunRecord, root: dict[str, Any]) -> DispatchRecord | None
         transitions=transitions if isinstance(transitions, list) else [],
         started_at=root.get("started_at"),
         agent=agent if isinstance(agent, dict) else None,
+        inherited_from=str(raw.get("inherited_from") or "") or None,
+        inherited_from_state=str(raw.get("inherited_from_state") or "") or None,
+        inherited_from_verdict=str(raw.get("inherited_from_verdict") or "") or None,
     )
 
 

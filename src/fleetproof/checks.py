@@ -48,6 +48,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,53 @@ from .runlog import PROJECT_MARKER, project_root
 DEFAULT_CHECKS_FILENAME = "checks.json"
 
 _VALID_EXPECT_KEYS = {"exit", "regex", "file_exists"}
+
+# The legal key sets, reified. Until these existed the legal set lived only
+# implicitly in this parser's scatter of ``.get()`` reads, so an unknown key —
+# ``"expects"`` for ``"expect"`` — was dropped without a word and the check
+# fell back to the exit-0 default: a content assertion silently converted
+# into an exit-code assertion, blocking, wrong, with a clean preflight
+# (observed in a field deployment on Windows). Two sets, not one, because a
+# manifest check's command key is ``cmd`` (``run`` aliased) and ``tier`` /
+# ``succeeded_by`` are spec-only. What happens on an unknown key depends on
+# the seat: authoring surfaces refuse (the author is there to fix it); the
+# gate warns loudly but runs the check as its known keys declare, because a
+# manifest pinned under an older release must not start failing mid-flight.
+SPEC_CHECK_KEYS = frozenset({
+    "id", "run", "expect", "block", "description", "tier", "owner", "redact",
+    "succeeded_by",
+})
+MANIFEST_CHECK_KEYS = frozenset({
+    "id", "cmd", "run", "expect", "block", "description", "owner", "redact",
+})
+
+
+def unknown_check_keys(entry: dict, legal: frozenset[str]) -> list[str]:
+    """The entry's keys outside ``legal``, sorted; [] when every key is known."""
+    return sorted(set(entry) - legal)
+
+
+def unknown_key_message(where: str, cid: object, keys: list[str],
+                        legal: frozenset[str]) -> str:
+    """The one wording every unknown-key rejection and warning uses.
+
+    Names the key AND the legal set, same rationale as
+    :func:`unknown_tier_message`: a typo'd key is an operator mistake, and a
+    message that names only the typo sends them to the docs to find the
+    vocabulary.
+    """
+    named = ", ".join(repr(k) for k in keys)
+    label = f"{where} ({cid})" if cid else where
+    plural = "s" if len(keys) != 1 else ""
+    return (f"{label}: unknown key{plural} {named} — legal keys: "
+            + ", ".join(sorted(legal)) + ".")
+
+
+def _warn_unknown_keys(message: str) -> None:
+    sys.stderr.write(
+        f"[fleetproof] WARNING: {message} Key(s) ignored; the check runs as "
+        "its known keys declare — a spec or manifest pinned under an older "
+        "release must not start failing mid-flight. Fix the key at the source.\n")
 
 # The fleet's tier vocabulary. It lives here, in the lowest-level module that
 # needs it, so :mod:`fleetproof.ledger` (which already imports this module for
@@ -332,7 +380,8 @@ MANIFEST_CMD_KEY = "cmd"
 MANIFEST_CHECK_DESCRIPTION = "dispatch-manifest check"
 
 
-def parse_manifest_check(entry: Any, where: str) -> Check:
+def parse_manifest_check(entry: Any, where: str, *,
+                         on_unknown: str = "warn") -> Check:
     """Parse one dispatch-manifest check entry with the spec's own parser.
 
     A manifest check accepts everything a ``checks.json`` check accepts —
@@ -350,6 +399,12 @@ def parse_manifest_check(entry: Any, where: str) -> Check:
     ``where`` names the entry in error text (the manifest has no file:index
     the spec parser could name). Raises :class:`CheckSpecError`; the gate
     turns that into skipped-with-stderr, never a half-run check.
+
+    ``on_unknown`` decides what an unknown key does: ``"refuse"`` raises
+    (authoring surfaces — intent, preflight, ``dispatch new`` — where the
+    author is in the seat to fix the typo), ``"warn"`` says it loudly on
+    stderr and parses the known keys exactly as before (the gate: a manifest
+    pinned under 0.5.0 must not start failing mid-flight).
     """
     if not isinstance(entry, dict):
         raise CheckSpecError(f"{where} is not an object.")
@@ -362,7 +417,16 @@ def parse_manifest_check(entry: Any, where: str) -> Check:
             f"{where}: 'succeeded_by' is not a manifest field — succession is "
             "between checks of the repo spec; retire a manifest check with "
             "`fleetproof phase advance --retire <id>` instead.")
+    unknown = unknown_check_keys(entry, MANIFEST_CHECK_KEYS)
+    if unknown:
+        message = unknown_key_message(where, entry.get("id"), unknown,
+                                      MANIFEST_CHECK_KEYS)
+        if on_unknown == "refuse":
+            raise CheckSpecError(message)
+        _warn_unknown_keys(message)
     normalized = dict(entry)
+    for key in unknown:
+        normalized.pop(key, None)
     cmd = normalized.pop(MANIFEST_CMD_KEY, None)
     if cmd is None:
         cmd = normalized.pop("run", None)
@@ -387,6 +451,16 @@ def _parse_check(entry: Any, index: int, *, where: str | None = None,
     cid = entry.get("id")
     if not cid or not isinstance(cid, str):
         raise CheckSpecError(f"{where} is missing a string 'id'.")
+
+    # Spec entries reach here directly; manifest entries were already
+    # key-checked (against MANIFEST_CHECK_KEYS) and scrubbed by
+    # :func:`parse_manifest_check`, so this can only fire for the spec. Warn,
+    # never refuse: the spec has no authoring command in front of it, and a
+    # stray key in a pinned checks.json turning into a hard block would wedge
+    # every in-flight dispatch on the pin's fail-closed path.
+    unknown = unknown_check_keys(entry, SPEC_CHECK_KEYS)
+    if unknown:
+        _warn_unknown_keys(unknown_key_message(where, cid, unknown, SPEC_CHECK_KEYS))
 
     run = entry.get("run")
     if run is not None and not isinstance(run, (str, list)):

@@ -332,6 +332,64 @@ def test_parse_manifest_check_file_exists_needs_no_cmd():
     assert c.run is None and c.expect == {"kind": "file_exists", "path": "out.txt"}
 
 
+# === strict key validation: the legal sets are reified (ask 3 / #30) ===
+
+def test_unknown_manifest_key_refused_at_authoring_names_key_and_legal_set():
+    from fleetproof.checks import CheckSpecError, parse_manifest_check
+    with pytest.raises(CheckSpecError, match="unknown key 'expects'") as exc:
+        parse_manifest_check({"id": "x", "cmd": "echo", "expects": "exit0"},
+                             "manifest check [0]", on_unknown="refuse")
+    message = str(exc.value)
+    assert "legal keys:" in message and "expect" in message
+
+
+def test_unknown_manifest_key_warns_and_runs_unchanged_at_gate_default(capsys):
+    # The gate's mode: a manifest pinned under 0.5.0 must not start failing
+    # mid-flight after an upgrade. The unknown key is named loudly, then
+    # dropped, and the check parses exactly as its known keys declare —
+    # expect falls back to exit0, which is the observed #30 shape (a content
+    # assertion silently converted into an exit-code assertion).
+    from fleetproof.checks import parse_manifest_check
+    check = parse_manifest_check(
+        {"id": "x", "cmd": "echo", "expects": {"regex": "hi"}},
+        "manifest check [0]")
+    err = capsys.readouterr().err
+    assert "unknown key 'expects'" in err and "legal keys:" in err
+    assert check.expect == {"kind": "exit0"}
+    assert check.block is True
+
+
+def test_legacy_id_cmd_manifest_shape_is_untouched(capsys):
+    from fleetproof.checks import parse_manifest_check
+    check = parse_manifest_check({"id": "m", "cmd": "echo hi"}, "m[0]",
+                                 on_unknown="refuse")
+    assert capsys.readouterr().err == ""
+    assert check.block is True and check.expect == {"kind": "exit0"}
+
+
+def test_unknown_spec_key_warns_but_the_spec_still_loads(tmp_path, capsys):
+    # The spec has no authoring command in front of it, and a stray key in a
+    # pinned checks.json turning into a hard error would wedge every
+    # in-flight dispatch on the fail-closed pin path — so the spec side
+    # always warns, never refuses.
+    checks = load_checks(_write(tmp_path, {"checks": [
+        {"id": "a", "run": "echo", "expects": "exit0"}]}))
+    err = capsys.readouterr().err
+    assert "unknown key 'expects'" in err and "legal keys:" in err
+    assert [c.id for c in checks] == ["a"]
+    assert checks[0].expect == {"kind": "exit0"}
+
+
+def test_spec_only_keys_keep_their_dedicated_manifest_refusals():
+    # tier/succeeded_by are not "unknown" — their refusals say where the
+    # field actually belongs, which the generic message cannot.
+    from fleetproof.checks import parse_manifest_check
+    with pytest.raises(CheckSpecError, match="'tier' is not a manifest field"):
+        parse_manifest_check({"id": "x", "cmd": "echo", "tier": "lane"}, "m[0]")
+    with pytest.raises(CheckSpecError, match="'succeeded_by' is not a manifest field"):
+        parse_manifest_check({"id": "x", "cmd": "echo", "succeeded_by": "y"}, "m[0]")
+
+
 # === phase succession: succeeded_by (C13) ===
 
 def _succ(tmp_path, checks):

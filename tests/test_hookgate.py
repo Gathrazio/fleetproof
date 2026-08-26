@@ -1894,6 +1894,104 @@ def test_cli_dispatch_with_a_manifest_is_an_inheritance_source(tmp_path, monkeyp
     assert bare  # the bare dispatch exists and was not treated as a contract
 
 
+def test_inherit_stamps_the_predecessors_state_and_verdict(
+        tmp_path, monkeypatch, capsys):
+    # Ask 8 / finding #34: a message-vs-resume trigger is not observable from
+    # the SubagentStart payload, so the record stamps what IS — the
+    # predecessor's state and verdict as loaded at inherit time. A VERIFIED
+    # predecessor is the assumed case and inherits without a warning.
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import list_dispatches, write_intent
+    _setup_project(tmp_path, [_LEAF_ONLY], monkeypatch)
+    write_intent("tester", _INTENT_PROMPT, manifest=_intent_manifest(cmd_exit=0),
+                 tier="lane")
+    _feed(monkeypatch, _start_payload(agent_id="agent-1"))
+    subagent_start_main()
+    _feed(monkeypatch, _stop_payload(message="done", agent_id="agent-1"))
+    assert subagent_stop_main() == 0
+    capsys.readouterr()
+
+    _feed(monkeypatch, _start_payload(agent_id="agent-2"))
+    subagent_start_main()
+    err = capsys.readouterr().err
+    second = next(d for d in list_dispatches() if d.agent_id == "agent-2")
+    assert second.inherited_from_state == "terminated"
+    assert second.inherited_from_verdict == "verified"
+    assert "NO verdict" not in err
+    # The stamp rides the record's own dict form, so `fleet --format json`
+    # and `show` carry it without knowing about inheritance.
+    as_dict = second.to_dict()
+    assert as_dict["inherited_from_state"] == "terminated"
+    assert as_dict["inherited_from_verdict"] == "verified"
+
+
+def test_inherit_from_a_no_verdict_terminal_predecessor_warns_and_marks(
+        tmp_path, monkeypatch, capsys):
+    # The observed field shape: a harness resume inherited from a dispatch
+    # that had terminated UNGRADED, silently doubling a configuration nothing
+    # ever validated. Still inherited — refusing would break legitimate
+    # chains and leave the spawn ungoverned — but said on stderr and marked
+    # '~!' on the board, with the stamp naming what was (not) known.
+    from fleetproof.cli import main
+    from fleetproof.hookgate import subagent_start_main, subagent_stop_main
+    from fleetproof.ledger import list_dispatches, write_intent
+    from fleetproof.report import tier_label
+    _setup_project(tmp_path, [_LEAF_ONLY], monkeypatch)
+    # A declared intent whose manifest has no checks: at a tier the spec
+    # leaves empty the stop has nothing runnable and closes ungraded.
+    write_intent("tester", _INTENT_PROMPT,
+                 manifest={"deliverables": ["a thing"], "checks": []},
+                 tier="lane")
+    _feed(monkeypatch, _start_payload(agent_id="agent-1"))
+    subagent_start_main()
+    _feed(monkeypatch, _stop_payload(message="claimed done", agent_id="agent-1"))
+    assert subagent_stop_main() == 0
+    capsys.readouterr()
+    first = list_dispatches()[0]
+    assert first.terminated_ungraded
+
+    _feed(monkeypatch, _start_payload(agent_id="agent-2"))
+    subagent_start_main()
+    err = capsys.readouterr().err
+    assert f"inherits from {first.run_id}" in err
+    assert "NO verdict" in err
+    assert "nothing ever validated" in err
+    second = next(d for d in list_dispatches() if d.agent_id == "agent-2")
+    assert second.inherited_from == first.run_id
+    assert second.inherited_from_state == "terminated"
+    assert second.inherited_from_verdict is None
+    assert tier_label(second) == "lane~!"
+
+    assert main(["fleet"]) == 0
+    board = capsys.readouterr().out
+    row = next(line for line in board.splitlines() if second.run_id in line)
+    assert "lane~!" in row
+    assert "tier~! = inherited from a predecessor" in board
+
+
+def test_inherit_from_an_open_predecessor_stamps_without_the_mark(
+        tmp_path, monkeypatch, capsys):
+    # A chain through an open intermediate is legitimate (a re-message of a
+    # live teammate): stamped like everything else, but no warning and no
+    # '~!' — the predecessor has not terminated, so "no verdict yet" is not
+    # "closed with no verdict".
+    from fleetproof.hookgate import subagent_start_main
+    from fleetproof.ledger import list_dispatches, write_intent
+    from fleetproof.report import tier_label
+    _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
+    write_intent("tester", _INTENT_PROMPT, manifest=_intent_manifest(), tier="lane")
+    _feed(monkeypatch, _start_payload(agent_id="agent-1"))
+    subagent_start_main()
+    _feed(monkeypatch, _start_payload(agent_id="agent-2"))
+    subagent_start_main()
+    err = capsys.readouterr().err
+    assert "NO verdict" not in err
+    second = next(d for d in list_dispatches() if d.agent_id == "agent-2")
+    assert second.inherited_from_state == "dispatched"
+    assert second.inherited_from_verdict is None
+    assert tier_label(second) == "lane~"
+
+
 # === the bridge Stop gate says when a claim was closed ungraded ===
 
 def test_bridge_stop_gate_announces_ungraded_terminations_on_stderr(
@@ -2093,6 +2191,62 @@ def test_manifest_check_with_a_tier_is_skipped_loudly(tmp_path, monkeypatch, cap
     assert _graded_check_ids() == ["m-ok"]
 
 
+def test_unknown_manifest_key_at_gate_warns_and_still_grades(
+        tmp_path, monkeypatch, capsys):
+    # Ask 3 / finding #30, the gate half: a manifest pinned under 0.5.0 with
+    # the `expects` typo names the key loudly on stderr, but the check still
+    # runs (falling back to exit0, exactly as before) and the verdict lands —
+    # selection and behavior unchanged mid-flight. The refusal lives at
+    # authoring time (`dispatch intent` / `--preflight` / `dispatch new`).
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _spawn_with_intent(tmp_path, monkeypatch, _manifest_with(
+        {"id": "m-typo", "cmd": f'"{sys.executable}" -c "raise SystemExit(0)"',
+         "expects": "exit0"}))
+    _feed(monkeypatch, _stop_payload(message="Done."))
+    assert subagent_stop_main() == 0
+    err = capsys.readouterr().err
+    assert "unknown key 'expects'" in err and "legal keys:" in err
+    assert _graded_check_ids() == ["m-typo"]
+    assert list_dispatches()[0].verdict == "verified"
+
+
+def test_verified_with_a_pending_capture_control_warns_and_stamps(
+        tmp_path, monkeypatch, capsys):
+    # Ask 4 / finding #31, close time: "capture the pass direction before
+    # you call the work verified". The verified transition is the first
+    # moment the pass emission exists, so the gate names every blocking
+    # check whose control is still pending-capture and the --upgrade remedy
+    # — a warning, never a block — and stamps the fact into the checker's
+    # own output.json so the evidence record says it too.
+    from fleetproof.controls import record_control
+    from fleetproof.hookgate import subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _spawn_with_intent(tmp_path, monkeypatch, _manifest_with(
+        {"id": "m-create", "cmd": f'"{sys.executable}" -c "raise SystemExit(0)"'}))
+    fail = tmp_path / "pre-state.json"
+    fail.write_text("{}", encoding="utf-8")
+    record_control("m-create", pass_sample=None, provenance="pending-capture",
+                   fail_sample=fail, fail_provenance="captured")
+
+    _feed(monkeypatch, _stop_payload(message="Built and verified."))
+    assert subagent_stop_main() == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""  # the stop is still allowed: warn, not block
+    d = list_dispatches()[0]
+    assert d.verdict == "verified"
+    assert f"dispatch {d.run_id} verified with 1 grader control(s)" in captured.err
+    assert "pending-capture — m-create" in captured.err
+    assert "check control <check-id> --upgrade --pass-sample" in captured.err
+
+    payload = None
+    for run in runlog.list_run_records():
+        for sub in run.sub_invocations:
+            if sub.tool == "fleetproof" and sub.subcmd == "check":
+                payload = sub.load_output()
+    assert payload["controls_pending_capture"] == ["m-create"]
+
+
 # === dispatch identity in the check environment (C15) ===
 
 _ECHO_IDENTITY = [sys.executable, "-c",
@@ -2177,8 +2331,18 @@ def test_disarmed_coordinator_dispatch_fails_advisory_never_contradicted(
     # A coordinator ends many turns per task; a blocking check that can only
     # pass at the end wedged every mid-task stop until the field authored it
     # block:false (observed in a field deployment on Windows). Disarmed at
-    # the coordinator tier: the failure is recorded and rendered, the stop is
-    # allowed, and no contradicted transition (so no ladder strike) exists.
+    # the coordinator tier: the failure is recorded, the stop is allowed, and
+    # no contradicted transition (so no ladder strike) exists.
+    #
+    # DESIGN REVERSED for 0.6.0 (finding #39, third MCC field trial): this
+    # test used to assert the failure came back as additionalContext. That
+    # return resumed the agent AFTER its dispatch was closed 8 ms earlier —
+    # observed live, it kept editing the graded artifact for ~4 minutes with
+    # no manifest or allowed_paths in force, and its next stop landed as an
+    # orphan no metric counts. The advisory stop is now a real stop,
+    # mirroring the clean-verified close: no context, no block, dispatch
+    # closed. The failure text belongs to the dispatcher's surfaces instead
+    # (the fleet board and the bridge Stop gate — tests below).
     from fleetproof.hookgate import ADVISORY, set_arming, subagent_stop_main
     from fleetproof.ledger import list_dispatches
     _spawn_at_tier(tmp_path, monkeypatch, "coordinator", _intent_manifest(cmd_exit=1))
@@ -2186,14 +2350,11 @@ def test_disarmed_coordinator_dispatch_fails_advisory_never_contradicted(
 
     _feed(monkeypatch, _stop_payload(message="Coordinating, mid-task."))
     assert subagent_stop_main() == 0
-    decision = json.loads(capsys.readouterr().out)
-    assert "decision" not in decision  # never a block
-    ctx = decision["hookSpecificOutput"]["additionalContext"]
-    assert ctx.startswith("[FLEETPROOF ADVISORY — coordinator gate disarmed: build phase]")
-    assert "[FAIL] m-widget:" in ctx  # the failure renders in full
+    captured = capsys.readouterr()
+    assert captured.out == ""  # neither a block nor a resume-with-context
 
     d = list_dispatches()[0]
-    assert d.state == "terminated"
+    assert d.state == "terminated"  # the stop was a stop: closed behind it
     # A third verdict value, never "verified": a failed blocking check must
     # not read as verified on the board however the detail is worded.
     assert d.verdict == "advisory"
@@ -2203,10 +2364,65 @@ def test_disarmed_coordinator_dispatch_fails_advisory_never_contradicted(
     assert "coordinator gate disarmed, failures did not block" in verdict_t["detail"]
     # A verdict exists, so this is not a claim closed with no verdict.
     assert d.terminated_ungraded is False
+    # Said on stderr where the transcript keeps it, since no context returns.
+    assert f"advisory verdict on dispatch {d.run_id}" in captured.err
+    assert "stop allowed, dispatch closed" in captured.err
+
+
+def test_after_an_advisory_stop_the_next_stop_is_an_orphan_not_a_regrade(
+        tmp_path, monkeypatch, capsys):
+    # Finding #39's second half, now inert: with the dispatch closed and the
+    # turn actually ended, a later stop of the same agent cannot join or
+    # regrade the closed dispatch — it lands on the orphan path, counted and
+    # said, and mints no new row (inheritance fires on SubagentStart only).
+    from fleetproof.hookgate import ADVISORY, set_arming, subagent_stop_main
+    from fleetproof.ledger import list_dispatches, list_orphan_stops
+    _spawn_at_tier(tmp_path, monkeypatch, "coordinator", _intent_manifest(cmd_exit=1))
+    set_arming(ADVISORY, note="build phase", tier="coordinator")
+    _feed(monkeypatch, _stop_payload(message="Coordinating, mid-task."))
+    assert subagent_stop_main() == 0
+    capsys.readouterr()
+    d = list_dispatches()[0]
+    transitions_before = len(d.transitions)
+
+    _feed(monkeypatch, _stop_payload(message="kept working after the stop"))
+    assert subagent_stop_main() == 0
+    err = capsys.readouterr().err
+    assert "unpaired subagent stop" in err and "orphan" in err
+    assert len(list_dispatches()) == 1  # no second dispatch was minted
+    d = list_dispatches()[0]
+    assert len(d.transitions) == transitions_before  # closed record untouched
+    assert len(list_orphan_stops(session_id="sess-fleet")) == 1
+
+
+def test_bridge_stop_gate_announces_advisory_verdicts_on_stderr(
+        tmp_path, monkeypatch, capsys):
+    # The dispatcher's other surface: the next bridge stop names the advisory
+    # verdict and its blocking-failure detail — the graded agent no longer
+    # receives the text, so the seat that can act on it must (finding #39).
+    from fleetproof.hookgate import ADVISORY, set_arming, subagent_stop_main
+    from fleetproof.ledger import list_dispatches
+    _spawn_at_tier(tmp_path, monkeypatch, "coordinator", _intent_manifest(cmd_exit=1))
+    set_arming(ADVISORY, note="build phase", tier="coordinator")
+    _feed(monkeypatch, _stop_payload(message="Coordinating, mid-task."))
+    assert subagent_stop_main() == 0
+    capsys.readouterr()
+    d = list_dispatches()[0]
+
+    monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-fleet")
+    stop_gate()
+    err = capsys.readouterr().err
+    assert "graded advisory this session" in err
+    assert d.run_id in err
+    assert "1/1 blocking check(s) failed (m-widget)" in err
 
 
 def test_advisory_verdict_renders_on_the_board_and_classifies_advisory(
         tmp_path, monkeypatch, capsys):
+    # Rewritten with the 0.6.0 design reversal (finding #39): the advisory
+    # stop is a stop, so the board footer is now one of the two surfaces
+    # that carry the blocking-failure detail to the dispatcher — asserted
+    # here beside the row render it always had.
     from fleetproof.cli import main
     from fleetproof.hookgate import ADVISORY, set_arming, subagent_stop_main
     from fleetproof.ledger import list_dispatches
@@ -2220,11 +2436,15 @@ def test_advisory_verdict_renders_on_the_board_and_classifies_advisory(
     d = list_dispatches()[0]
 
     assert main(["fleet"]) == 0
-    row = next(line for line in capsys.readouterr().out.splitlines() if d.run_id in line)
+    board = capsys.readouterr().out
+    row = next(line for line in board.splitlines() if d.run_id in line)
     assert "advisory" in row
     assert "verified" not in row
     assert "ungraded" not in row
-    assert "terminated ungraded" not in capsys.readouterr().out
+    assert "terminated ungraded" not in board
+    # The dispatcher line: verdict named with its blocking-failure detail.
+    assert "graded advisory" in board
+    assert "1/1 blocking check(s) failed (m-widget)" in board
 
     telemetry = load_telemetry(d.run_id)
     assert telemetry["outcome.class"] == CLASS_ADVISORY
