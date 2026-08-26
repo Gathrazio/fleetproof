@@ -3,6 +3,103 @@
 Releases before 0.4.0 predate this file; their stories are in the README's
 version-marked sections and the git history.
 
+## 0.6.0 — 2026-08-26
+
+Honest-bookkeeping release. Every item below answers the third field trial
+at the same Windows deployment — a graded sitting under an armed coordinator
+gate, twelve asks and thirteen findings, every one verified against source
+before a line was written — collective credit to that deployment's operators,
+including for the three findings they disclosed against their own authoring.
+The trial's headline was not a false claim (their ledger is still empty after
+three trials); it was a lane *correctly refusing* unsatisfiable work and
+being scored as the fleet's only liar. 0.6.0 gives the escalation a class of
+its own, makes the advisory stop a real stop, and makes every surface say
+what it actually wrote.
+
+### Classification honesty
+
+- `escalated`, a twelfth outcome class: `dispatch park --unsatisfiable`
+  records that the agent reported the work cannot be satisfied from its seat
+  and the operator agreed. Counted (`escalated_rate`), in no success and no
+  failure numerator, no incident or severity attach — a lane that correctly
+  refuses must never score worse than one that guesses. A plain park after a
+  contradiction stays `contradicted`; only the flag reclasses
+  (derivation_version 5). The board renders `parked (unsatisfiable)`.
+- The advisory stop is a stop: a blocking failure under a disarmed
+  coordinator gate records `advisory`, closes the dispatch, and no longer
+  resumes the agent with the failure text — that resume left the graded seat
+  editing the failed artifact after its own dispatch was closed. The failure
+  detail reaches the dispatcher instead: the fleet board footer and the
+  bridge Stop gate's stderr, via the same plumbing as the ungraded announce.
+- `no_verdict_rate` prints beside `ungraded_rate` with its split shown
+  (`ungraded` + `unverifiable`) — the plain-English total, so the word
+  "ungraded" stops meaning both.
+- Coverage tells the truth about the unmeasured half: deliverables with no
+  `check_map` derive `outcome.coverage: null`, never `0.0` — an absent join
+  is an absence of measurement, not a zero score.
+- `output.json`'s all-advisory flag is named `all_advisory` (`advisory` also
+  names an arming state and a dispatch verdict in the same record);
+  the 0.4.0 `advisory` key is dual-written for one release, removed in 0.7.0.
+
+### Strictness where the author still sits
+
+- Closed check-key sets, reified (`SPEC_CHECK_KEYS` / `MANIFEST_CHECK_KEYS`):
+  an unknown key — `expects` for `expect` — is refused at authoring time
+  (`dispatch intent`, `dispatch new`, `--preflight`) naming the key and the
+  legal set, and warned about loudly at the gate while the check runs as its
+  known keys declare — a manifest pinned under 0.5.0 must not start failing
+  mid-flight.
+- Per-sample control provenance, with `pending-capture` as the pass
+  direction's honest third state for creation work (recorded with no value at
+  all). Strict controls are satisfied by a captured pass OR a captured fail
+  beside a pending pass; `check control --upgrade` promotes the pass
+  direction from the work's real emission at closeout, and the gate's
+  verified transition names every control still pending with that remedy.
+- `fleetproof phase preflight`, the vacuous-successor tripwire: runs every
+  `succeeded_by` successor NOW against the current tree, recording nothing,
+  and exits non-zero naming each successor that already passes — a successor
+  must assert something the predecessor's completion causes, not something
+  its starting state already satisfies. The rule is in the README's *Grader
+  integrity* section verbatim, as rule 5.
+- `check_map` — parsed and validated since 0.3, named by no surface — is
+  documented (README manifest section with an example, `--manifest` help),
+  and `dispatch intent` / `dispatch new` warn when a manifest declares
+  deliverables AND checks but no map: coverage will read null.
+
+### Surfaces that say what happened
+
+- `show` badges every checker row by its verdict, not its process exit —
+  a checker that blocked a lane under a disarmed gate exits 0, and `[ok]`
+  off the exit code read as a pass. The row carries `verdict: fail
+  (blocking_failed: N)` in both formats; non-checker rows wear their exit
+  plainly (`[exit:0]`).
+- Every persisted check entry records `cmd`, the exact string/argv the
+  runner executed — local `output.json` only, excluded from telemetry and
+  export like check ids; redaction does not cover a command line, and the
+  record says so.
+- `dispatch intent` echoes the recorded tier and its provenance on every
+  write (`tier recorded: lane (defaulted — pass --tier to declare)`); JSON
+  carries `tier` + `tier_source`. The board splits the defaulted glyph:
+  `lane=` (sidecar matched, tier undeclared) vs `lane?` (no intent matched).
+- `--preflight` stops underselling its write: the sidecar line announces
+  `sidecar written (next spawn of X consumes it):` before the path, and the
+  help text names the write. New `--dry-run` parses, validates, and (with
+  `--preflight`) runs the checks while writing nothing at all.
+- Inheritance stamps `inherited_from_state` / `inherited_from_verdict` —
+  the predecessor as loaded at inherit time; a message-vs-resume trigger is
+  not observable from the SubagentStart payload, so no field pretends it is.
+  A no-verdict terminal predecessor warns on stderr and sharpens the board
+  glyph to `tier~!`.
+- One scope rule for every fleet footer count (orphans, ungraded, advisory):
+  ledger-scoped, never listing-scoped — "this session" with a session-scoped
+  count when a session is known, "on the board" over the whole ledger when
+  not. The orphan line no longer says "this session" from a session-less
+  shell over a full-disk count.
+- `arming.json`'s top-level 0.4.0 trio (`note`/`set_at`/`by`) is
+  bridge-pinned as one coherent view: setting the coordinator no longer
+  stamps the bridge's note with the coordinator's time and actor. Per-tier
+  truth stays in `notes`/`set`.
+
 ## 0.5.0 — 2026-08-25
 
 Confidence release. Every item below was shaped by a second field deployment
