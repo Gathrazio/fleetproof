@@ -917,13 +917,19 @@ def _cmd_dispatch_park(args: argparse.Namespace) -> int:
     is required and travels on the terminate transition under the ``parked:``
     namespace; the parked dispatch is terminal, so a later stop from its agent
     lands on the orphan path instead of re-grading it.
+
+    ``--unsatisfiable`` adds the structured non-satisfiability marker: the
+    agent reported the work cannot be satisfied and the operator, by flagging,
+    agrees. The marked park classes ``escalated`` in telemetry (neither a
+    success nor a failure) instead of leaving the escalation as prose only.
     """
     reason = (args.reason or "").strip()
     if not reason:
         _emit_error("bad_reason", "park needs a non-empty --reason.", args.format)
         return 2
     try:
-        record = close_dispatch(args.run_id, reason=REASON_PARKED_PREFIX + reason)
+        record = close_dispatch(args.run_id, reason=REASON_PARKED_PREFIX + reason,
+                                park_unsatisfiable=bool(args.unsatisfiable))
     except LedgerError as e:
         _emit_error("ledger_error", str(e), args.format)
         return 1
@@ -937,7 +943,8 @@ def _cmd_dispatch_park(args: argparse.Namespace) -> int:
     if args.format == "json":
         print(json.dumps(record.to_dict(), indent=2))
     else:
-        print(f"{record.run_id} -> parked: {reason}")
+        marker = " (unsatisfiable)" if args.unsatisfiable else ""
+        print(f"{record.run_id} -> parked{marker}: {reason}")
     return 0
 
 
@@ -1195,6 +1202,10 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
     if "parked" in labels:
         print("parked = terminated on purpose with a recorded reason; not "
               "graded further.")
+    if "parked (unsatisfiable)" in labels:
+        print("parked (unsatisfiable) = parked on the operator's "
+              "--unsatisfiable flag: the work could not be satisfied from "
+              "its seat. Classes as escalated — neither success nor failure.")
     if orphans:
         print(_orphan_count_line(orphans))
     if ungraded_line:
@@ -1255,11 +1266,18 @@ def _cmd_telemetry_summary(args: argparse.Namespace) -> int:
         for metric in ("delivery_failure_rate", "false_claim_rate",
                        "abandoned_rate",
                        "near_miss_rate", "verifier_flake_rate",
-                       "ungraded_rate", "unverifiable_rate", "advisory_rate",
+                       "ungraded_rate", "unverifiable_rate", "no_verdict_rate",
+                       "escalated_rate", "advisory_rate",
                        "telemetry_missing_rate", "stop_only_fraction"):
             m = block[metric]
             rate = f"{m['rate']:.3f}" if m["rate"] is not None else "n/a"
-            print(f"  {metric}: {m['numerator']}/{m['denominator']} = {rate}")
+            line = f"  {metric}: {m['numerator']}/{m['denominator']} = {rate}"
+            if metric == "no_verdict_rate":
+                # The split rides along: the total alone re-creates the word
+                # collision the companion metric exists to resolve.
+                line += (f" (ungraded {m['ungraded']} + "
+                         f"unverifiable {m['unverifiable']})")
+            print(line)
         sev = block["severity_distribution"]
         sev_shown = {k: v for k, v in sev.items() if v}
         if block["classifiable_dispatches"] == 0:
@@ -1594,6 +1612,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--reason", required=True,
         help="Why this dispatch is being parked (required; recorded on the "
              "terminate transition as 'parked: <reason>').")
+    p_dpark.add_argument(
+        "--unsatisfiable", action="store_true",
+        help="Record that the work cannot be satisfied from its seat — the "
+             "structured marker that classes this dispatch 'escalated' in "
+             "telemetry (counted, never a success or failure numerator) "
+             "instead of leaving the escalation in prose.")
     _add_format(p_dpark)
     p_dpark.set_defaults(func=_cmd_dispatch_park)
 

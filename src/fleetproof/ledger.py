@@ -378,6 +378,22 @@ class DispatchRecord:
         return None
 
     @property
+    def park_unsatisfiable(self) -> bool:
+        """True when this dispatch was parked with the ``--unsatisfiable`` marker.
+
+        The structured form of "the work cannot be satisfied from this seat":
+        an agent's non-satisfiability report the operator accepted by parking
+        with the flag. Read off the terminate transition — never inferred from
+        the prose reason — so derivation downstream keys on a field, not text.
+        False on every record written before the marker existed.
+        """
+        for entry in reversed(self.transitions):
+            if entry.get("state") == STATE_TERMINATED:
+                return (bool(entry.get("park_unsatisfiable"))
+                        and is_parked_reason(entry.get("reason")))
+        return False
+
+    @property
     def terminated_ungraded(self) -> bool:
         """True when this dispatch claimed something and was closed with no verdict.
 
@@ -498,6 +514,7 @@ class DispatchRecord:
             "report_count": self.report_count,
             "block_count": self.block_count,
             "terminated_ungraded": self.terminated_ungraded,
+            "park_unsatisfiable": self.park_unsatisfiable,
         }
 
 
@@ -1559,6 +1576,7 @@ def record_verdict(
 
 def close_dispatch(
     run_id: str, by: str = "cli", reason: str | None = None,
+    park_unsatisfiable: bool = False,
 ) -> DispatchRecord:
     """Terminate a dispatch. Legal from any non-terminal state.
 
@@ -1571,7 +1589,19 @@ def close_dispatch(
     reason would be underivable in exactly the way the vocabulary exists to
     prevent — the parked prefix is the one namespaced exception, classifiable
     by its prefix alone.
+
+    ``park_unsatisfiable`` marks a parked close as a non-satisfiability
+    escalation: the agent reported the work cannot be satisfied from its seat
+    and the operator agreed. A real field on the terminate transition, not a
+    reason-prefix convention, so derivation downstream never parses prose.
+    Only legal alongside a parked reason — the marker qualifies a park, it is
+    not a terminate reason of its own.
     """
+    if park_unsatisfiable and not is_parked_reason(reason):
+        raise LedgerError(
+            "park_unsatisfiable requires a parked reason "
+            f"('{REASON_PARKED_PREFIX}<text>'); it marks a park, not a close."
+        )
     extra: dict[str, Any] | None = None
     if reason is not None:
         if reason not in VALID_TERMINATE_REASONS and not is_parked_reason(reason):
@@ -1581,4 +1611,6 @@ def close_dispatch(
                 f"'{REASON_PARKED_PREFIX}<text>', or omit it."
             )
         extra = {"reason": reason}
+        if park_unsatisfiable:
+            extra["park_unsatisfiable"] = True
     return _append_transition(run_id, STATE_TERMINATED, by, extra=extra)

@@ -305,7 +305,7 @@ omission, so drills and synthetic load are the cases that need declaring —
 set it alongside the era, or your control-plane traffic counts as production
 from the day telemetry turns on.
 
-Each finished dispatch derives one of eleven **outcome classes** from its
+Each finished dispatch derives one of twelve **outcome classes** from its
 transition history — bookkeeping, not judgment:
 
 - `verified` — the claim survived the checks.
@@ -320,6 +320,12 @@ transition history — bookkeeping, not judgment:
 - `advisory` — a blocking check failed while that tier's gate was disarmed, so
   the stop was allowed on an operator's recorded switch. Graded, not verified,
   not contradicted; published as its own rate and never counted as success.
+- `escalated` — parked with `dispatch park --unsatisfiable`: the agent reported
+  the work cannot be satisfied from its seat and the operator agreed, on
+  record. Counted (`escalated_rate`), in no success and no failure numerator —
+  a lane that correctly refuses unsatisfiable work must never score worse than
+  one that guesses. A plain park after a contradiction stays `contradicted`;
+  only the flag reclasses, and a `verified` verdict always wins over it.
 - `ungraded` — checks existed but no verdict ever landed. This is a control
   failure and every summary says so; it is never folded into a benign class.
 - `unverifiable` — reported, but nothing in the claim was checkable. Never counts
@@ -339,7 +345,10 @@ fleetproof telemetry anchor                   # record the current chain head
 `summary` prints outcome and severity distributions with their numerators and
 denominators spelled out, override rates, and the corpus's own integrity rates
 (stop-only captures, missing telemetry files) — a dataset that can't measure its
-own holes isn't worth reading.
+own holes isn't worth reading. Beside `ungraded_rate` it prints
+`no_verdict_rate`, the plain-English total of dispatches that ended with no
+verdict at all, with the split shown (`ungraded` + `unverifiable`) — the two
+halves are different problems, and the word "ungraded" alone has meant both.
 
 `export` is built the opposite way from most exports: a strict per-field
 **allowlist** — closed enums, counts, bands, versions, and salted identifiers.

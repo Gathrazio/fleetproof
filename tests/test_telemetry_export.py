@@ -161,6 +161,10 @@ def test_summary_formulas_pin_numerators_and_denominators(era_runs):
             block["ungraded_rate"]["denominator"]) == (1, 11)
     assert (block["unverifiable_rate"]["numerator"],
             block["unverifiable_rate"]["denominator"]) == (1, 11)
+    # The plain-English companion total, with its split attached.
+    m = block["no_verdict_rate"]
+    assert (m["numerator"], m["denominator"]) == (2, 11)
+    assert (m["ungraded"], m["unverifiable"]) == (1, 1)
     assert (block["telemetry_missing_rate"]["numerator"],
             block["telemetry_missing_rate"]["denominator"]) == (1, 13)
     assert (block["stop_only_fraction"]["numerator"],
@@ -423,3 +427,29 @@ def test_advisory_class_counts_in_d_and_exports_as_its_own_enum(era_runs):
     out = export_telemetry("partner", out_dir=era_runs.parent / "export")
     bundle = json.loads((out / "telemetry-export.json").read_text(encoding="utf-8"))
     assert bundle["records"][0]["outcome.class"] == CLASS_ADVISORY
+
+
+def test_escalated_class_is_quarantined_like_advisory(era_runs):
+    # A flagged unsatisfiable park: in D, in escalated_rate, in no success
+    # and no failure numerator — the advisory quarantine, applied to the
+    # operator-accepted escalation exit.
+    from fleetproof.ledger import REASON_PARKED_PREFIX
+    from fleetproof.telemetry import CLASS_ESCALATED
+    run_id = create_dispatch("work", tier="lane")
+    record_report(run_id, _report())
+    record_verdict(run_id, "contradicted")
+    close_dispatch(run_id, reason=REASON_PARKED_PREFIX + "unsatisfiable",
+                   park_unsatisfiable=True)
+    build_telemetry(run_id)
+    block = summarize()["windows"]["full"]
+    assert block["counts"][CLASS_ESCALATED] == 1
+    assert block["counts"]["contradicted"] == 0  # reclassed, not double-counted
+    assert block["classifiable_dispatches"] == 1
+    assert (block["escalated_rate"]["numerator"],
+            block["escalated_rate"]["denominator"]) == (1, 1)
+    # Not a graded claim gone wrong, not a delivery failure.
+    assert block["false_claim_rate"]["numerator"] == 0
+    assert block["delivery_failure_rate"]["numerator"] == 0
+    out = export_telemetry("partner", out_dir=era_runs.parent / "export")
+    bundle = json.loads((out / "telemetry-export.json").read_text(encoding="utf-8"))
+    assert bundle["records"][0]["outcome.class"] == CLASS_ESCALATED

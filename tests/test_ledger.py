@@ -814,6 +814,32 @@ def test_close_rejects_a_blank_parked_reason(ledger_runs):
         close_dispatch(run_id, reason="parked:   ")
 
 
+def test_park_unsatisfiable_marker_round_trips_as_a_field(ledger_runs):
+    # A real field on the terminate transition, never a prose convention:
+    # derivation downstream keys on it without parsing the reason text.
+    from fleetproof.ledger import REASON_PARKED_PREFIX
+    run_id = create_dispatch("work", tier="lane")
+    record = close_dispatch(run_id, reason=REASON_PARKED_PREFIX + "unsatisfiable",
+                            park_unsatisfiable=True)
+    assert record.park_unsatisfiable is True
+    reloaded = load_dispatch(run_id)
+    assert reloaded.park_unsatisfiable is True
+    assert reloaded.to_dict()["park_unsatisfiable"] is True
+    # A plain park — even with "unsatisfiable" in its prose — carries no marker.
+    other = create_dispatch("work", tier="lane")
+    close_dispatch(other, reason=REASON_PARKED_PREFIX + "unsatisfiable, in prose")
+    assert load_dispatch(other).park_unsatisfiable is False
+
+
+def test_park_unsatisfiable_requires_a_parked_reason(ledger_runs):
+    # The marker qualifies a park; it is not a terminate reason of its own.
+    run_id = create_dispatch("work", tier="lane")
+    with pytest.raises(LedgerError):
+        close_dispatch(run_id, reason="operator-close", park_unsatisfiable=True)
+    with pytest.raises(LedgerError):
+        close_dispatch(run_id, park_unsatisfiable=True)
+
+
 # === invented tiers name the legal values ===
 
 def test_invented_tier_error_names_the_legal_tiers(ledger_runs):

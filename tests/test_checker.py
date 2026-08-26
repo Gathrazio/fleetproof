@@ -218,6 +218,9 @@ def test_all_advisory_report_renders_advisory_not_pass(tmp_project):
     # JSON compatibility: the verdict field itself does not change vocabulary.
     payload = report.to_dict()
     assert payload["verdict"] == "pass"
+    # Dual-write for one release: `all_advisory` is the current key, the
+    # legacy `advisory` stays equal until 0.7.0 removes it.
+    assert payload["all_advisory"] is True
     assert payload["advisory"] is True
     text = format_report_text(report)
     assert "ADVISORY - 0 blocking; 2 advisory check(s), 1 passed" in text
@@ -230,6 +233,7 @@ def test_report_with_any_blocking_check_is_not_advisory(tmp_project):
         [_check("b1", run=_OK, block=True), _check("a1", run=_OK, block=False)],
         cwd=tmp_project, record_to_log=False)
     assert report.all_advisory is False
+    assert report.to_dict()["all_advisory"] is False
     assert report.to_dict()["advisory"] is False
     assert "PASS -" in format_report_text(report)
 

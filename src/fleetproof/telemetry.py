@@ -79,7 +79,14 @@ SCHEMA_VERSION = "fleetproof-telemetry/1.1"
 # Purely additive each time: no record written under version 3 can carry an
 # advisory verdict transition, so re-deriving an older corpus under this
 # version classes every record exactly as before.
-DERIVATION_VERSION = 4
+# Version 5 makes two moves at once. The ``escalated`` class (a park carrying
+# the --unsatisfiable marker): additive, because no earlier record carries the
+# marker, so older corpora re-derive unchanged. And ``_coverage`` returning
+# null instead of 0.0 when deliverables exist but the manifest maps no checks
+# to them: NOT class-additive — a rebuilt record shifts 0.0 -> null for that
+# situation — which is exactly why the version moves instead of the shift
+# passing silently.
+DERIVATION_VERSION = 5
 
 # Every vocabulary a record leans on is pinned per record. The two nulls are
 # honest, not lazy: no OTel-named field carries a non-null value yet (the
@@ -113,6 +120,14 @@ CLASS_ABANDONED = "abandoned"
 # strike), not unverifiable (something checkable was checked — and failed).
 # Never counts as success anywhere.
 CLASS_ADVISORY = "advisory"
+# A park carrying the operator's --unsatisfiable marker: the agent reported
+# the work cannot be satisfied from its seat and the operator agreed, on
+# record. Its own class — not contradicted (correctly refusing unsatisfiable
+# work is not a false claim), and never a success (nothing was delivered).
+# Quarantined exactly like ``advisory``: in the denominator, in no success
+# and no failure numerator, no incident attached — a lane must never learn
+# that escalating scores worse than guessing.
+CLASS_ESCALATED = "escalated"
 CLASS_UNGRADED = "ungraded"
 CLASS_UNVERIFIABLE = "unverifiable"
 CLASS_SILENT_IDLE = "silent_idle"
@@ -126,6 +141,7 @@ OUTCOME_CLASSES = (
     CLASS_CONTRADICTED,
     CLASS_ABANDONED,
     CLASS_ADVISORY,
+    CLASS_ESCALATED,
     CLASS_UNGRADED,
     CLASS_UNVERIFIABLE,
     CLASS_SILENT_IDLE,
@@ -315,11 +331,20 @@ def derive_outcome_class(
             return CLASS_VERIFIER_FLAKE
         return CLASS_NEAR_MISS if contradicted_hash != verified_hash else CLASS_VERIFIER_FLAKE
 
+    # The structured non-satisfiability exit: parked with the --unsatisfiable
+    # marker. It outranks every branch below — an accepted escalation is the
+    # outcome whatever verdict preceded the park — but never a verified
+    # verdict (handled above): work that passed its checks was satisfied,
+    # whatever the park said afterwards.
+    if record.park_unsatisfiable:
+        return CLASS_ESCALATED
+
     if final_verdict == STATE_CONTRADICTED:
         # The abandonment terminate reason splits a wedged agent (three
         # contradicted stops, gate gave up) from a single wrong claim. A
-        # *parked* contradicted dispatch stays contradicted: parking closes
-        # the bookkeeping, it does not soften the verdict.
+        # plain *parked* contradicted dispatch stays contradicted: parking
+        # closes the bookkeeping, it does not soften the verdict. The one
+        # deliberate exit is the --unsatisfiable marker, handled above.
         if record.terminate_reason == REASON_ABANDONED:
             return CLASS_ABANDONED
         return CLASS_CONTRADICTED
@@ -445,8 +470,11 @@ def _coverage(
     if not deliverables:
         return None
     check_map = manifest.get("check_map")
-    if not isinstance(check_map, dict):
-        check_map = {}
+    if not isinstance(check_map, dict) or not check_map:
+        # Deliverables with no deliverable->check mapping: no check was ever
+        # joined to any of them, so nothing was measured — the docstring's
+        # own principle applies, and the answer is null, not a zero score.
+        return None
     covered = sum(
         1 for d in deliverables
         if any(cid in executed_check_ids for cid in check_map.get(d, []) if isinstance(cid, str))

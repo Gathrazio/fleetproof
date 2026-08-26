@@ -331,15 +331,32 @@ def test_zero_deliverable_coverage_is_null_never_one(era_runs):
 
 def test_agent_evidence_labels_play_no_role_in_coverage(era_runs):
     # RT-B S2-5: self-declared evidence: "executed" must not count as coverage.
+    run_id = create_dispatch("work", tier="lane", manifest={
+        "check_map": {"a.py": ["a-check-that-never-ran"]}})
+    record_report(run_id, _report("done", [
+        {"name": "a.py", "evidence": "executed"}]))
+    record_verdict(run_id, "verified")
+    close_dispatch(run_id)
+    report, checks = _graded(("some-check",))
+    # The map joins a.py to a check the checker never executed; the agent's
+    # own "executed" label must not stand in for it.
+    t = build_telemetry(run_id, check_report=report, checks=checks)
+    assert t["outcome.coverage"] == 0.0
+
+
+def test_unmapped_deliverables_make_coverage_null_not_zero(era_runs):
+    # Deliverables exist but the manifest maps no checks to them: nothing was
+    # measured, and an absent measurement is null — the same principle the
+    # zero-deliverable case already followed, applied to the other half
+    # (0.0 here read as "measured and found empty" in a field deployment).
     run_id = create_dispatch("work", tier="lane")
     record_report(run_id, _report("done", [
         {"name": "a.py", "evidence": "executed"}]))
     record_verdict(run_id, "verified")
     close_dispatch(run_id)
     report, checks = _graded(("some-check",))
-    # No check_map: nothing joins a.py to any executed check.
     t = build_telemetry(run_id, check_report=report, checks=checks)
-    assert t["outcome.coverage"] == 0.0
+    assert t["outcome.coverage"] is None
 
 
 def test_verifier_block_counts_kinds_but_never_ids(era_runs):
@@ -612,13 +629,61 @@ def test_parked_before_reporting_reads_as_terminated_unreported(era_runs):
 
 
 def test_parked_after_a_contradiction_stays_contradicted(era_runs):
-    # Parking closes the bookkeeping; it must not soften the verdict.
+    # Parking closes the bookkeeping; it must not soften the verdict. The one
+    # deliberate exit is the structured --unsatisfiable flag (its own tests
+    # below); a plain park — even one whose prose says "unsatisfiable" —
+    # never reclasses, because derivation must not parse prose.
     from fleetproof.ledger import REASON_PARKED_PREFIX
     run_id = create_dispatch("work", tier="lane")
     record_report(run_id, _report())
     record_verdict(run_id, "contradicted")
     close_dispatch(run_id, reason=REASON_PARKED_PREFIX + "unsatisfiable from this seat")
     assert derive_outcome_class(load_dispatch(run_id)) == CLASS_CONTRADICTED
+
+
+# === escalated (D1): the operator-flagged unsatisfiable park ===
+
+def test_flagged_park_after_a_contradiction_classes_escalated(era_runs):
+    # The lane refused work it could not satisfy, the gate blocked the stop,
+    # and the operator agreed by parking with the flag. Escalating correctly
+    # is neither a success nor a failure: no incident, no severity floor.
+    from fleetproof.ledger import REASON_PARKED_PREFIX
+    from fleetproof.telemetry import CLASS_ESCALATED
+    run_id = create_dispatch("work", tier="lane")
+    record_report(run_id, _report("cannot be satisfied from this seat"))
+    record_verdict(run_id, "contradicted")
+    close_dispatch(run_id, reason=REASON_PARKED_PREFIX + "unsatisfiable",
+                   park_unsatisfiable=True)
+    assert derive_outcome_class(load_dispatch(run_id)) == CLASS_ESCALATED
+    telemetry = build_telemetry(run_id)
+    assert telemetry["outcome.class"] == CLASS_ESCALATED
+    assert telemetry["failure.incident_id"] is None
+    assert telemetry["failure.severity_floor"] is None
+
+
+def test_flagged_park_before_reporting_classes_escalated(era_runs):
+    # The flag is the operator's structured signal, so it reclasses whether
+    # or not a report ever landed — unflagged, this exact shape reads as
+    # terminated_unreported (pinned above).
+    from fleetproof.ledger import REASON_PARKED_PREFIX
+    from fleetproof.telemetry import CLASS_ESCALATED
+    run_id = create_dispatch("work", tier="lane")
+    close_dispatch(run_id, reason=REASON_PARKED_PREFIX + "unsatisfiable",
+                   park_unsatisfiable=True)
+    assert derive_outcome_class(load_dispatch(run_id)) == CLASS_ESCALATED
+
+
+def test_verified_verdict_wins_over_a_flagged_park(era_runs):
+    # Work that passed its checks was satisfied, whatever the park said
+    # afterwards — the flag must not be able to launder a verified outcome
+    # out of the success column (or a success out of the record).
+    from fleetproof.ledger import REASON_PARKED_PREFIX
+    run_id = create_dispatch("work", tier="lane")
+    record_report(run_id, _report())
+    record_verdict(run_id, "verified")
+    close_dispatch(run_id, reason=REASON_PARKED_PREFIX + "parked anyway",
+                   park_unsatisfiable=True)
+    assert derive_outcome_class(load_dispatch(run_id)) == CLASS_VERIFIED
 
 
 def test_class_advisory_is_its_own_class_never_verified(era_runs):
@@ -635,4 +700,4 @@ def test_class_advisory_is_its_own_class_never_verified(era_runs):
     telemetry = build_telemetry(run_id, *_graded(("x",)))
     assert telemetry["outcome.class"] == CLASS_ADVISORY
     assert telemetry["failure.incident_id"] is None
-    assert telemetry["fleetproof.derivation_version"] == 4
+    assert telemetry["fleetproof.derivation_version"] == 5

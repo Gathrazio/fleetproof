@@ -54,6 +54,7 @@ from .telemetry import (
     CLASS_ABANDONED,
     CLASS_ADVISORY,
     CLASS_CONTRADICTED,
+    CLASS_ESCALATED,
     CLASS_NEAR_MISS,
     CLASS_SILENT_IDLE,
     CLASS_TERMINATED_UNREPORTED,
@@ -264,6 +265,16 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "abandoned_rate": _frequency(counts[CLASS_ABANDONED], d),
         # Integrity rates: the corpus's own health metrics, always published.
         "ungraded_rate": _frequency(counts[CLASS_UNGRADED], d),
+        # The plain-English companion: of D, how many ended with no verdict at
+        # all. The split stays attached because the halves are different
+        # problems — ungraded is the gate's own failure mode, unverifiable is
+        # a claim with nothing checkable in it — and a total that hides its
+        # split is how the two get confused (observed in a field deployment).
+        "no_verdict_rate": {
+            **_frequency(counts[CLASS_UNGRADED] + counts[CLASS_UNVERIFIABLE], d),
+            "ungraded": counts[CLASS_UNGRADED],
+            "unverifiable": counts[CLASS_UNVERIFIABLE],
+        },
         "telemetry_missing_rate": _rate(counts[BUCKET_TELEMETRY_MISSING], era_total),
         "stop_only_fraction": _rate(
             sum(1 for row in rows if row["era"] and row["stop_only"]), era_total),
@@ -274,6 +285,12 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         # decision, on record), published first-class so a fleet that runs
         # disarmed a lot can see how much of its grading it switched off.
         "advisory_rate": _frequency(counts[CLASS_ADVISORY], d),
+        # An operator-flagged unsatisfiable park: the lane refused work it
+        # could not satisfy and the operator agreed, on record. In D, in no
+        # success and no failure numerator — escalating is neither delivering
+        # nor failing to deliver, and folding it into either teaches lanes
+        # that escalating scores worse than guessing.
+        "escalated_rate": _frequency(counts[CLASS_ESCALATED], d),
         "override_rate_by_source": {
             source: _rate(overrides_by_source[source], events_by_source[source])
             for source in ("hook", "operator")

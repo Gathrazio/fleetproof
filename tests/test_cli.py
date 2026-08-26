@@ -680,6 +680,23 @@ def test_dispatch_park_terminates_with_the_reason(cli_runs, capsys):
     assert d.terminate_reason == "parked: blocked on operator approval"
 
 
+def test_dispatch_park_unsatisfiable_flag_round_trips(cli_runs, capsys):
+    # The structured non-satisfiability marker (D1): a real field on the
+    # record, and the human line says it — the operator should see what they
+    # just flagged. Without the flag, no marker.
+    from fleetproof.ledger import load_dispatch
+    run_id = _dispatch_new(capsys)
+    assert main(["dispatch", "park", run_id,
+                 "--reason", "cannot be satisfied from this seat",
+                 "--unsatisfiable"]) == 0
+    out = capsys.readouterr().out
+    assert "parked (unsatisfiable): cannot be satisfied from this seat" in out
+    assert load_dispatch(run_id).park_unsatisfiable is True
+    plain = _dispatch_new(capsys)
+    assert main(["dispatch", "park", plain, "--reason", "waiting"]) == 0
+    assert load_dispatch(plain).park_unsatisfiable is False
+
+
 def test_dispatch_park_requires_a_reason(cli_runs, capsys):
     run_id = _dispatch_new(capsys)
     with pytest.raises(SystemExit):
@@ -1276,6 +1293,29 @@ def test_telemetry_summary_with_classifiable_rows_prints_neither_line(cli_runs, 
     assert "severity: no failures" in out  # the existing wording, unchanged
     assert main(["telemetry", "summary", "--format", "json"]) == 0
     assert json.loads(capsys.readouterr().out)["telemetry_era"] == "2026-01-01"
+
+
+def test_telemetry_summary_prints_no_verdict_split_and_escalated(cli_runs, capsys):
+    # D12: the plain-English total prints WITH its split — the total alone
+    # re-creates the ungraded/unverifiable word collision. D1: escalated_rate
+    # prints beside the other quarantined rate (advisory).
+    from fleetproof.ledger import record_report, record_verdict
+    (cli_runs.parent / "config.json").write_text(
+        json.dumps({"telemetry_era": "2026-01-01"}), encoding="utf-8")
+    ungraded = _dispatch_new(capsys)
+    record_report(ungraded, {"summary": "claimed, never graded"})
+    assert main(["dispatch", "close", ungraded]) == 0
+    capsys.readouterr()
+    escalated = _dispatch_new(capsys)
+    record_report(escalated, {"summary": "cannot satisfy"})
+    record_verdict(escalated, "contradicted")
+    assert main(["dispatch", "park", escalated,
+                 "--reason", "unsatisfiable", "--unsatisfiable"]) == 0
+    capsys.readouterr()
+    assert main(["telemetry", "summary"]) == 0
+    out = capsys.readouterr().out
+    assert "no_verdict_rate: 1/2 = 0.500 (ungraded 1 + unverifiable 0)" in out
+    assert "escalated_rate: 1/2 = 0.500" in out
 
 
 # === phase verbs (C13) ===

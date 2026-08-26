@@ -203,6 +203,11 @@ class CheckReport:
             "verdict": self.verdict,
             # Sibling flag, not a third verdict value: consumers keyed on
             # pass/fail keep working, and an all-advisory pass is markable.
+            # ``all_advisory`` is the current key — the bare word also names
+            # an arming state and a dispatch verdict in this same record, so
+            # the flag says what it flags. ``advisory`` is the 0.4.0 key,
+            # dual-written for one release; remove in 0.7.0.
+            "all_advisory": self.all_advisory,
             "advisory": self.all_advisory,
             # SHA-256 of the checks.json that governed this verdict. Additive:
             # records written before this field existed simply omit it, and every

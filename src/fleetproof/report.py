@@ -98,6 +98,11 @@ def state_label(dispatch: DispatchRecord) -> str:
             # work was never verified, and the dispatcher owes it a decision.
             return "abandoned!"
         if is_parked_reason(reason):
+            # The --unsatisfiable marker is the operator-accepted escalation
+            # exit; it must read differently from an ordinary park because
+            # the dispatcher owes the two different follow-ups.
+            if dispatch.park_unsatisfiable:
+                return "parked (unsatisfiable)"
             return "parked"
         return "done" if dispatch.has_report else "done (no report)"
     return f"{state} (stalled)"
@@ -768,7 +773,9 @@ def _render_verdict(v: dict[str, Any], baseline_hash: str | None = None) -> str:
     # An all-advisory pass renders as 'advisory', never a green 'pass': zero
     # blocking checks means nothing was at stake in this verdict. The stored
     # verdict field keeps its pass/fail vocabulary; only the badge changes.
-    advisory = bool(v.get("advisory")) and verdict == "pass"
+    # ``all_advisory`` is the current key; ``advisory`` is the 0.4.0 name,
+    # still read for records written before the dual-write.
+    advisory = bool(v.get("all_advisory", v.get("advisory"))) and verdict == "pass"
     if advisory:
         verdict, tone = "advisory", "warn"
     else:
