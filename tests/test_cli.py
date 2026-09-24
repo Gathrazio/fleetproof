@@ -602,12 +602,14 @@ def test_liveness_warning_absent_with_a_hook_created_dispatch(
     assert "no hook has fired" not in capsys.readouterr().err
 
 
-def test_liveness_unknown_line_only_in_fleet_without_a_session(
-        cli_runs, tmp_path, capsys):
-    # No session id in env means liveness is unanswerable, not bad: only the
-    # board says so, softly; check and report stay silent.
+def test_liveness_unknown_is_silent_everywhere(cli_runs, tmp_path, capsys):
+    # No session id in env means liveness is unanswerable, not bad — and 0.7.0
+    # makes that silence (field ask: the "unknown" line above every plain-shell
+    # board was noise by the twentieth `fleet --open` of a session). The line
+    # prints only when the answer is NO (a hook session with no hook evidence).
     assert main(["fleet"]) == 0
-    assert "hooks-liveness unknown" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "hooks-liveness" not in err and "no hook has fired" not in err
     assert main(["report", "-o", str(tmp_path / "r.html")]) == 0
     err = capsys.readouterr().err
     assert "hooks-liveness" not in err and "no hook has fired" not in err

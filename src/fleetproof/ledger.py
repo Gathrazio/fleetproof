@@ -78,6 +78,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ._version import __version__
 from .checks import VALID_TIERS, checks_tree_hash, spec_hash, unknown_tier_message
 from .config import telemetry_era_stamp
 from .runlog import (
@@ -85,6 +86,7 @@ from .runlog import (
     RUN_ID_ENV,
     SESSION_ID_ENV,
     _generate_run_id,
+    ensure_ledger_gitignore,
     runs_dir,
 )
 
@@ -160,11 +162,20 @@ REASON_SESSION_END = "session-end"
 # stop on one dispatch is terminal — the gate stops arguing, the dispatch is
 # abandoned, and the work is on record as never verified.
 REASON_ABANDONED = "abandoned-after-3-contradictions"
+# Machine-set by the report-before-idle cap: the third no-report block on one
+# dispatch is terminal. An agent that ends with an empty final message was
+# blocked on every stop with no bound at all — five of five in one field
+# trial, and the block "never stops blocking by itself" (a harness-free trial
+# on macOS; convergent with an unbounded-loop finding at a second deployment).
+# Same ladder shape as REASON_ABANDONED: the gate stops arguing, the dispatch
+# is closed unverified, and the dispatcher is told.
+REASON_NO_REPORT = "no-report-after-3-blocks"
 VALID_TERMINATE_REASONS = frozenset({
     REASON_SWEEP_IDLE,
     REASON_OPERATOR_CLOSE,
     REASON_SESSION_END,
     REASON_ABANDONED,
+    REASON_NO_REPORT,
 })
 
 # The one open-ended reason: "parked: <operator text>". Prefix-namespaced so
@@ -399,6 +410,27 @@ class DispatchRecord:
         return None
 
     @property
+    def advisory_failures(self) -> list[str]:
+        """Check ids of non-blocking (``block:false``) checks that FAILED on the
+        last verdict, or an empty list.
+
+        Structured, never parsed from the detail prose: a ``verified`` verdict
+        whose advisory checks failed rendered clean everywhere a reader looks
+        — board said ``verified``, stop said nothing, and the only trace was a
+        "1/3" inside the transition detail (a harness-free field trial on
+        macOS, finding 1a). The gate records the failing ids as a field on the
+        verdict transition; readers key on the field. Empty on every record
+        written before the field existed, and on clean verdicts.
+        """
+        for entry in reversed(self.transitions):
+            if entry.get("state") in VERDICT_STATES:
+                raw = entry.get("advisory_failures")
+                if isinstance(raw, list):
+                    return [str(x) for x in raw if x]
+                return []
+        return []
+
+    @property
     def terminate_reason(self) -> str | None:
         """The machine-set reason on the terminate transition, or None.
 
@@ -585,6 +617,7 @@ class DispatchRecord:
             "park_unsatisfiable": self.park_unsatisfiable,
             "escalated_over_contradiction": self.escalated_over_contradiction,
             "escalated_unreported": self.escalated_unreported,
+            "advisory_failures": self.advisory_failures,
         }
 
 
@@ -729,10 +762,26 @@ def ungraded_termination_line(ungraded: list[DispatchRecord], scope_known: bool)
     # "on the board" says what the count actually runs over — everything on
     # the ledger — when no session scope is known.
     scope = "this session" if scope_known else "on the board"
-    ids = ", ".join(r.run_id for r in ungraded)
+    ids = _capped_id_list(r.run_id for r in ungraded)
     return (f"{len(ungraded)} dispatch(es) terminated ungraded {scope} — {ids}. "
             "A claim was recorded and closed with no verdict; an absent grade "
             "is not a passing grade.")
+
+
+# How many run ids a footer line names inline before summarizing. A footer
+# that printed all 220 ungraded run ids in one paragraph buried its own
+# signal (a field deployment on Windows); the count is the signal, the first
+# few ids are the handle, and `fleet --format json` carries the full list.
+FOOTER_ID_CAP = 8
+
+
+def _capped_id_list(run_ids) -> str:
+    ids = list(run_ids)
+    shown = ", ".join(ids[:FOOTER_ID_CAP])
+    extra = len(ids) - FOOTER_ID_CAP
+    if extra > 0:
+        shown += f", +{extra} more (full list: fleet --format json)"
+    return shown
 
 
 def list_advisory_verdicts(session_id: str | None) -> list[DispatchRecord]:
@@ -765,10 +814,51 @@ def advisory_verdict_line(advisory: list[DispatchRecord], scope_known: bool) -> 
     # Same scope rule as ungraded_termination_line: ledger-scoped wording.
     scope = "this session" if scope_known else "on the board"
     details = "; ".join(
-        f"{r.run_id}: {r.verdict_detail or 'no detail recorded'}" for r in advisory)
+        f"{r.run_id}: {r.verdict_detail or 'no detail recorded'}"
+        for r in advisory[:FOOTER_ID_CAP])
+    extra = len(advisory) - FOOTER_ID_CAP
+    if extra > 0:
+        details += f"; +{extra} more (full list: fleet --format json)"
     return (f"{len(advisory)} dispatch(es) graded advisory {scope} — a blocking "
             f"check failed under a disarmed gate and the stop was allowed. "
             f"{details}. Review before trusting the work.")
+
+
+def list_verified_with_advisory_failures(session_id: str | None) -> list[DispatchRecord]:
+    """Dispatches in ``session_id`` verified while one or more advisory
+    (``block:false``) checks FAILED, newest first.
+
+    ``None`` session means every dispatch on disk. Same posture as
+    :func:`list_advisory_verdicts`: this is a dispatcher-surface count. It
+    exists because an advisory-check failure inside a ``verified`` verdict
+    surfaced nowhere a reader would look — not on the graded agent's stop,
+    not on the bridge stop, and the board said plain ``verified`` (a
+    harness-free field trial on macOS, finding 1a).
+    """
+    return [r for r in list_dispatches(session_id=session_id)
+            if r.verdict == STATE_VERIFIED and r.advisory_failures]
+
+
+def advisory_failure_line(records: list[DispatchRecord], scope_known: bool) -> str | None:
+    """The one line naming verified dispatches whose advisory checks failed, or None.
+
+    Shared by the fleet board and the bridge Stop gate, like
+    :func:`advisory_verdict_line`. The verdict stands — the failing checks
+    were declared non-blocking on purpose — but a declared-advisory failure
+    the dispatcher never sees is not advice, it is silence.
+    """
+    if not records:
+        return None
+    scope = "this session" if scope_known else "on the board"
+    details = "; ".join(
+        f"{r.run_id}: {', '.join(r.advisory_failures)}"
+        for r in records[:FOOTER_ID_CAP])
+    extra = len(records) - FOOTER_ID_CAP
+    if extra > 0:
+        details += f"; +{extra} more (full list: fleet --format json)"
+    return (f"{len(records)} verified dispatch(es) {scope} had FAILING advisory "
+            f"(block:false) check(s) — {details}. The verdict stands; read the "
+            "failures before trusting what they cover.")
 
 
 def find_dispatch_by_agent(session_id: str | None, agent_id: str | None) -> DispatchRecord | None:
@@ -1374,6 +1464,7 @@ def _fresh_run_dir() -> tuple[str, Path]:
         run_dir = rd / run_id
         if not run_dir.exists():
             run_dir.mkdir(parents=True)
+            ensure_ledger_gitignore()
             return run_id, run_dir
     raise LedgerError("Could not allocate a unique dispatch run id.")
 
@@ -1503,6 +1594,7 @@ def create_dispatch(
         "host": socket.gethostname(),
         "user": os.environ.get("USER") or os.environ.get("USERNAME") or "unknown",
         "pid": os.getpid(),
+        "fleetproof_version": __version__,
     })
     dispatch: dict[str, Any] = {
         "prompt": prompt,
@@ -1695,19 +1787,22 @@ def record_verdict(
     verdict: str,
     detail: str = "",
     by: str = "checker",
+    extra: dict[str, Any] | None = None,
 ) -> DispatchRecord:
     """Append the checker's verdict on a reported dispatch.
 
     Only ``verified``, ``contradicted``, or ``advisory`` (a blocking failure
     under a disarmed gate — see :data:`STATE_ADVISORY`), and only after a
     report — grading a dispatch that never reported anything would be grading
-    nothing.
+    nothing. ``extra`` rides structured facts on the verdict transition (the
+    gate uses it for ``advisory_failures``: failing ids of non-blocking
+    checks, so readers key on a field rather than parsing the detail prose).
     """
     if verdict not in VERDICT_STATES:
         raise LedgerError(
             f"Verdict must be one of {sorted(VERDICT_STATES)}; got {verdict!r}."
         )
-    return _append_transition(run_id, verdict, by, detail)
+    return _append_transition(run_id, verdict, by, detail, extra=extra)
 
 
 def close_dispatch(
@@ -1750,3 +1845,57 @@ def close_dispatch(
         if park_unsatisfiable:
             extra["park_unsatisfiable"] = True
     return _append_transition(run_id, STATE_TERMINATED, by, extra=extra)
+
+
+def reopen_for_verify(run_id: str, summary: str, by: str = BY_CLI_VERIFY) -> DispatchRecord:
+    """Reopen a terminated-UNGRADED dispatch so an out-of-band grade can land.
+
+    The false-terminal shape, observed live: a subagent backgrounds its long
+    work and idles; the gate records the idle stop's interim text as the
+    report and closes the dispatch; the real DONE arrives minutes later over
+    a hand-back path no hook sees — and the ledger's ``terminated`` is wrong,
+    permanently, because every verb refuses a terminal dispatch (a harness
+    trial on macOS, finding H2; convergent with mailbox-report cases at a
+    second deployment). This is the one legal exit: it writes the operator's
+    synthetic report (``report.json`` + ``reports/NNN.json``) and appends a
+    ``reported`` transition carrying ``"reopened": true`` — deliberately
+    outside :data:`_ALLOWED_NEXT`, which keeps refusing the transition for
+    every other caller — leaving the dispatch in ``reported`` for
+    ``verify_dispatch`` to grade and close.
+
+    Guardrails: only a terminal dispatch with NO verdict qualifies. A verdict
+    on record is an outcome; re-grading finished outcomes is not a verb this
+    tool offers, and the refusal says so. The transition is stamped ``by``
+    (default ``cli-verify``) so the trail shows an operator reopened it —
+    hooks never call this.
+    """
+    record = _require_dispatch(run_id)
+    if not record.is_terminal:
+        raise LedgerError(
+            f"Dispatch {run_id} is not terminal ({record.state}); reopen exists "
+            "for a false terminal — a live dispatch is graded by `dispatch "
+            "verify` directly.")
+    if record.verdict is not None:
+        raise LedgerError(
+            f"Dispatch {run_id} already carries a verdict ({record.verdict}); "
+            "its outcome is on record and reopen does not re-grade finished "
+            "outcomes.")
+    if not isinstance(summary, str) or not summary.strip():
+        raise LedgerError("Reopen needs a non-empty summary for the synthetic report.")
+    validated = _validate_report({"summary": summary, "source": by})
+    _write_json(record.run_dir / REPORT_FILENAME, validated)
+    reports = record.run_dir / REPORTS_DIRNAME
+    reports.mkdir(exist_ok=True)
+    _write_json(reports / (_next_sequence_name(reports, ".json") + ".json"), validated)
+    raw = _read_json(record.run_dir / DISPATCH_FILENAME) or {}
+    transitions = raw.get("transitions")
+    if not isinstance(transitions, list):
+        transitions = []
+    transitions.append(_transition(
+        STATE_REPORTED, by,
+        detail="reopened out of band: late report after a false terminal",
+        extra={"reopened": True,
+               "report_sha256": report_content_hash(validated)}))
+    raw["transitions"] = transitions
+    _write_json(record.run_dir / DISPATCH_FILENAME, raw)
+    return load_dispatch(run_id) or record

@@ -40,6 +40,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from ._version import __version__
+
 
 # === Constants ===
 
@@ -189,6 +191,35 @@ def filter_env(env: dict[str, str]) -> dict[str, str]:
 
 # === Record writing ===
 
+def ensure_ledger_gitignore() -> None:
+    """Write ``.fleetproof/.gitignore`` (containing ``*``) if absent.
+
+    The ledger stores whole file contents, commands, and final messages —
+    for a privileged corpus that is privileged material, and two field
+    deployments independently had to hand-maintain gitignore rules for it in
+    every repo and worktree the hooks could land in (a miss is silent and
+    committed). A ``.gitignore`` of ``*`` inside the marker directory makes
+    the directory self-excluding wherever it is created. It never untracks:
+    a deployment that deliberately versions a file under ``.fleetproof/``
+    (one tracks its telemetry chain) keeps it — gitignore does not apply to
+    already-tracked paths. Best-effort and write-once: an existing file is
+    never touched, and an unwritable one must not break a hook.
+    """
+    marker = runs_dir().parent
+    path = marker / ".gitignore"
+    try:
+        if path.exists():
+            return
+        marker.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "# Written by fleetproof: the ledger records commands, file contents,\n"
+            "# and agent reports verbatim — treat it like shell history, never commit it.\n"
+            "*\n",
+            encoding="utf-8")
+    except OSError:
+        pass
+
+
 @dataclass
 class RunHandle:
     """Live handle to an in-progress recording."""
@@ -271,6 +302,7 @@ def _ensure_root_record(run_id: str, tool: str) -> None:
     if root_file.exists():
         return
     parent_dir.mkdir(parents=True, exist_ok=True)
+    ensure_ledger_gitignore()
     parent_run = os.environ.get(PARENT_RUN_ID_ENV)
     # Additive field: None for runs not created from a hook (and absent entirely
     # from records written before this field existed) — both read back as None.
@@ -284,6 +316,9 @@ def _ensure_root_record(run_id: str, tool: str) -> None:
         "host": socket.gethostname(),
         "user": os.environ.get("USER") or os.environ.get("USERNAME") or "unknown",
         "pid": os.getpid(),
+        # Which fleetproof wrote this record (field ask: version skew between a
+        # plugin's hooks and a shell CLI was underivable from the ledger).
+        "fleetproof_version": __version__,
     }
     root_file.write_text(json.dumps(root, indent=2), encoding="utf-8")
 

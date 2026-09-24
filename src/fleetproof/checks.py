@@ -72,10 +72,11 @@ _VALID_EXPECT_KEYS = {"exit", "regex", "file_exists"}
 # manifest pinned under an older release must not start failing mid-flight.
 SPEC_CHECK_KEYS = frozenset({
     "id", "run", "expect", "block", "description", "tier", "owner", "redact",
-    "succeeded_by",
+    "succeeded_by", "consult_output_on_nonzero",
 })
 MANIFEST_CHECK_KEYS = frozenset({
     "id", "cmd", "run", "expect", "block", "description", "owner", "redact",
+    "consult_output_on_nonzero",
 })
 
 
@@ -192,6 +193,14 @@ class Check:
     # this check, must share its tier, and the chain must not cycle. See
     # :mod:`fleetproof.phase`. Additive: absent reads as None.
     succeeded_by: str | None = None
+    # Regex checks gate the match on exit 0 (finding H1: a failing command's
+    # error text must not pass a content assertion). On a test script that
+    # already exits non-zero on failure, that gating makes a regex check add
+    # nothing over the exit check — measured in a harness-free field trial on
+    # macOS. Opting in here lets the regex decide on a completed-but-nonzero
+    # command; a command that never completed still fails. Additive, default
+    # off: every existing spec keeps H1's exact semantics.
+    consult_output_on_nonzero: bool = False
 
     def describe_run(self) -> str | None:
         """The command for display: string form verbatim, argv form joined
@@ -534,6 +543,15 @@ def _parse_check(entry: Any, index: int, *, where: str | None = None,
 
     expect = _normalize_expect(entry.get("expect", "exit0"), cid, where)
 
+    consult = entry.get("consult_output_on_nonzero", False)
+    if not isinstance(consult, bool):
+        raise CheckSpecError(
+            f"{where} ({cid}): 'consult_output_on_nonzero' must be true or false.")
+    if consult and expect["kind"] != "regex":
+        raise CheckSpecError(
+            f"{where} ({cid}): 'consult_output_on_nonzero' only applies to a "
+            "'regex' expect — other kinds never consult output.")
+
     # A file_exists check may have no command; every other kind needs one.
     if run is None and expect["kind"] != "file_exists":
         raise CheckSpecError(
@@ -542,7 +560,8 @@ def _parse_check(entry: Any, index: int, *, where: str | None = None,
 
     return Check(id=cid, run=run, expect=expect, block=block, description=description,
                  tier=tier, owner=owner, redact=tuple(redact_raw),
-                 succeeded_by=succeeded_by.strip() if succeeded_by else None)
+                 succeeded_by=succeeded_by.strip() if succeeded_by else None,
+                 consult_output_on_nonzero=consult)
 
 
 def _normalize_expect(expect: Any, cid: str, where: str) -> dict[str, Any]:

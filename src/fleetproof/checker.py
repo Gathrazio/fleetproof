@@ -309,12 +309,19 @@ def _grade(check: Check, returncode: int | None, stdout: str, stderr: str, cwd: 
         pattern = check.expect["pattern"]
         # Exit code gates the match (finding H1): a failing command whose *error
         # text* happens to contain the pattern — e.g. a tool echoing
-        # "ALL_TESTS_PASSED is not a flag" — must not read as a pass.
-        if returncode != 0:
+        # "ALL_TESTS_PASSED is not a flag" — must not read as a pass. The
+        # per-check `consult_output_on_nonzero` opt-in lifts the gating for a
+        # command that completed non-zero (a test script that exits 1 on
+        # failure yet prints the summary line the regex asserts); a command
+        # that never completed still failed above.
+        if returncode != 0 and not check.consult_output_on_nonzero:
             return False, f"exit {returncode} (expected 0); output not consulted for /{pattern}/"
         combined = f"{stdout}\n{stderr}"
         ok = re.search(pattern, combined) is not None
-        return ok, ("matched" if ok else "no match") + f" for /{pattern}/"
+        detail = ("matched" if ok else "no match") + f" for /{pattern}/"
+        if returncode != 0:
+            detail += f" (exit {returncode}; output consulted per consult_output_on_nonzero)"
+        return ok, detail
 
     if kind == "file_exists":
         raw_path = check.expect["path"]

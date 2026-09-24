@@ -32,6 +32,7 @@ from .ledger import (
     DISPATCH_FILENAME,
     DISPATCH_ROOT_TOOL,
     REASON_ABANDONED,
+    REASON_NO_REPORT,
     ROOT_FILENAME,
     STATE_ADVISORY,
     STATE_CONTRADICTED,
@@ -97,6 +98,11 @@ def state_label(dispatch: DispatchRecord) -> str:
             # one thing this row must never read as is a clean "done" — the
             # work was never verified, and the dispatcher owes it a decision.
             return "abandoned!"
+        if reason == REASON_NO_REPORT:
+            # Terminal after three empty-message stops: the agent went idle
+            # without ever reporting. Loud for the same reason abandoned! is —
+            # this row must never skim as a clean "done".
+            return "no-report!"
         if is_parked_reason(reason):
             # The --unsatisfiable marker is the operator-accepted escalation
             # exit; it must read differently from an ordinary park because
@@ -165,7 +171,13 @@ def verdict_label(dispatch: DispatchRecord) -> str:
 
     A dispatch nobody graded is the single thing on an audit surface that must not
     be mistakable for a pass, and a dash in a column of verdicts reads as "fine".
+    'verified*' marks a verified verdict recorded while one or more advisory
+    (block:false) checks FAILED — the verdict stands, but a reader skimming the
+    column must not mistake it for an unqualified pass (finding 1a: with only
+    advisory checks a false "done" rendered plain 'verified' everywhere).
     """
+    if dispatch.verdict == STATE_VERIFIED and dispatch.advisory_failures:
+        return "verified*"
     return dispatch.verdict or STATUS_UNGRADED
 
 

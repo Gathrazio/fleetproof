@@ -3,6 +3,109 @@
 Releases before 0.4.0 predate this file; their stories are in the README's
 version-marked sections and the git history.
 
+## 0.7.0 — 2026-09-23
+
+The no-unbounded-loop release. Driven by two independent field reports that
+converged on the same fault lines: a harness-free trial of 0.6.1 on macOS
+(5,101 hook invocations plus a live-window addendum; that site declined
+adoption on its findings, and this release's top three items are its stated
+acceptance criteria) and the fourth field letter from the Windows deployment
+(18 asks after four trials and three weeks of daily gated release trains).
+
+### No unbounded loop survives
+
+- **Bridge stop-block budget.** A failing blocking check blocked every bridge
+  stop with no bound (10/10 in the trial; 56 across turns live; the harness's
+  own per-turn cap ends a turn, not the wedge; +54,795 context tokens in ten
+  minutes). The bridge gate now spends a per-session budget (default 5;
+  `stop_block_budget` in `.fleetproof/config.json`): past it the gate stands
+  down to loud advisory context (`[FLEETPROOF GATE EXHAUSTED — HUMAN
+  ATTENTION REQUIRED]`, announced once un-suppressibly, then stderr), with
+  verdicts and the board untouched — the failure stays on record as
+  unresolved, and the fleet board footer says so. A clean stop resets the
+  budget; the missing-spec and stalled-sweep blocks draw on the same budget,
+  so no bridge-side ground to block loops forever.
+- **Report-before-idle ladder.** An agent ending with an empty final message
+  was blocked on every stop, unboundedly, with zero configuration (trial row
+  4c: "it never stops blocking by itself"). Same terminus as the
+  contradiction ladder now: the third no-report block is terminal — the
+  dispatch closes unverified with machine reason `no-report-after-3-blocks`,
+  renders `no-report!` on the board, and the dispatcher is told in
+  never-suppressed context.
+- **A retry is not a stall.** The bridge could not end a turn while its own
+  builder worked a gate-blocked fix (`contradicted` counted as stalled —
+  trial row 1c). Contradicted dispatches now render as `[in retry]` context
+  on the bridge stop and never block it; genuinely half-closed dispatches
+  (graded, never terminated) still do.
+
+### False terminals are correctable
+
+- **`dispatch verify <run_id> --terminal`.** A subagent that backgrounds its
+  work and idles was recorded `reported -> terminated` off the idle stop, and
+  its real DONE — arriving over a hand-back path no hook sees — could never
+  reach the ledger (trial finding H2; the same shape as the Windows site's
+  mailbox-report cases). `--terminal` accepts a terminal dispatch that
+  carries NO verdict, reopens it on record (`"reopened": true` on the
+  transition, stamped `cli-verify`), grades it through the gate's own
+  selection and runner, and closes it. A terminal dispatch with a verdict is
+  still refused: outcomes on record stay. The plain-verify refusal now names
+  this exit when it applies.
+
+### Advisory failures surface
+
+- A false "done" over `block:false` checks graded `verified` and surfaced
+  nowhere a reader would look (trial finding 1a — the only trace was "1/3"
+  inside the transition detail). Failing advisory ids now ride the verdict
+  transition as a structured field (`advisory_failures`), the detail names
+  them, the board renders `verified*` with a legend, the fleet footer and
+  every bridge stop announce them (stderr), and `fleet --format json`
+  carries the list. The bridge's own pass-with-failing-advisory says so on
+  stderr too.
+
+### Board and ledger hygiene (Windows-site asks 4, 13, 17)
+
+- **`dispatch sweep --older-than <N>d|<N>h [--session S] [--reason TEXT]
+  [--dry-run]`** bulk-closes stale non-terminal rows — attributed parks with
+  `--reason`, machine reason `sweep-idle` without.
+- **`fleet` scopes to the current hook session by default** (`--all` for the
+  whole ledger; a session-less shell is unchanged) — two concurrent bridges
+  in one repo could not tell whose rows were whose.
+- **Footer id lists cap at 8** (`+N more`; the full list stays in
+  `--format json`) — 220 ungraded run ids printed inline buried the signal.
+- **`cleanup --max-runs N`** bounds the total run dirs kept, whatever their
+  age (at 5,000 recorded events one ledger held 20,048 files / 10.5 MB with
+  1–2.5 s stops).
+- **The liveness line prints only when the answer is no.** The
+  "hooks-liveness unknown" line on every plain-shell board call is gone.
+
+### Sensitive-by-default ledger
+
+- **`.fleetproof/.gitignore` (containing `*`) is written on ledger
+  creation.** The ledger stores commands, file contents, and reports
+  verbatim; both field sites hand-maintained ignore rules in every repo and
+  worktree the hooks could land in. Self-exclusion makes the miss impossible
+  for new ledgers; deliberately tracked files stay tracked (gitignore never
+  untracks). The full privacy-mode config (hashes instead of bodies,
+  content-pattern redaction) is 0.7.x roadmap, stated honestly.
+
+### Small sharp edges
+
+- **`consult_output_on_nonzero: true`** (per regex check, spec or manifest):
+  lets the regex decide on a completed-but-nonzero command — on a test
+  script that already exits 1 on failure, the exit-0 gating made a regex
+  check add nothing over the exit check (trial side finding). Default off;
+  H1 semantics unchanged everywhere else.
+- **`fleetproof_version` is stamped into every `_root.json`** (runs and
+  dispatches) — version skew between a plugin's hooks and a shell CLI was
+  underivable from the ledger.
+
+Not in 0.7.0, named so nobody waits silently: message-wake dispatch minting
+(inherit-the-open-dispatch), spec pinning keyed to the resolved repo,
+tier-aware check selection with verdict caching by tree hash, the full
+privacy mode, and the remaining small asks (preflight vacuous-pair noise,
+control-sample hint, overlapping `allowed_paths` warning, telemetry chain
+placement). They are the 0.7.x/0.8 queue, in that order.
+
 ## 0.6.1 — 2026-08-26
 
 Two follow-ups to 0.6.0, both from the same Windows deployment's fourth-trial

@@ -75,6 +75,7 @@ from .ledger import (
     BY_CLI_VERIFY,
     CAPTURE_START,
     REASON_ABANDONED,
+    REASON_NO_REPORT,
     STATE_ADVISORY,
     STATE_CONTRADICTED,
     STATE_DISPATCHED,
@@ -84,6 +85,7 @@ from .ledger import (
     TIER_SOURCE_DEFAULTED,
     TIER_SOURCE_INHERITED,
     LedgerError,
+    advisory_failure_line,
     advisory_verdict_line,
     close_dispatch,
     consume_intent,
@@ -94,11 +96,13 @@ from .ledger import (
     list_advisory_verdicts,
     list_dispatches,
     list_ungraded_terminations,
+    list_verified_with_advisory_failures,
     load_dispatch,
     record_block,
     record_orphan_stop,
     record_report,
     record_verdict,
+    reopen_for_verify,
     ungraded_termination_line,
 )
 from .phase import apply_phase, format_retired_lines
@@ -436,6 +440,16 @@ def _spec_gate() -> tuple[str | None, str | None]:
         return reason, drift_ctx
 
     if report.verdict == "pass":
+        # A bridge pass over failing advisory checks says so on stderr — the
+        # transcript-quiet channel — because a block:false failure that
+        # renders nowhere is silence, not advice (finding 1a's bridge-tier
+        # face). Stderr, not context: context on a pass re-engages the agent
+        # (the nine-continuations lesson below).
+        warn_failed = [r.id for r in report.results if not r.passed and not r.blocking]
+        if warn_failed:
+            sys.stderr.write(
+                f"[fleetproof] bridge stop passed with {len(warn_failed)} "
+                f"FAILING advisory check(s): {', '.join(warn_failed)}\n")
         # A pass with drift still passes, but must not pass *silently*. Said once
         # per (session, baseline→current) pair, though: the first stop after a
         # spec edit announces it for review; repeating the same note on every
@@ -522,28 +536,39 @@ def _failure_reason(report) -> str:
     return "\n".join([GATE_BLOCK_MARKER, header, per_check, evidence, _BLOCK_EXITS])
 
 
-def ledger_sweep(session_id: str | None) -> tuple[list[str], list[str]]:
-    """Return ``(stalled, in_fleet)`` dispatch run ids for a session.
+def ledger_sweep(session_id: str | None) -> tuple[list[str], list[str], list[str]]:
+    """Return ``(stalled, retrying, in_fleet)`` dispatch run ids for a session.
 
     *stalled* — a dispatch that reported (or was graded) and then never terminated.
     Something started closing it out and stopped halfway, which is exactly the
     quiet half-finished state this tool exists to surface, so the bridge is blocked
     on it.
 
+    *retrying* — in state ``contradicted``: the gate blocked its stop and the
+    agent has its turn back to fix the failure. That is the retry loop working,
+    not a stall — yet it used to count as stalled, so the bridge could not end
+    a turn while its own builder worked the fix (a harness-free field trial on
+    macOS, row 1c). Context, never a block: the abandonment ladder bounds the
+    retry, and a retry the agent never finishes surfaces as ungraded work on
+    the board and the footers, one `dispatch verify` away.
+
     *in_fleet* — still in state ``dispatched``. That is a legitimately-running
     background agent, not a fault, so it is reported and not blocked on. Blocking
     here would make it impossible to ever stop while a long subagent runs.
     """
     if not session_id:
-        return [], []
+        return [], [], []
     stalled: list[str] = []
+    retrying: list[str] = []
     in_fleet: list[str] = []
     for record_obj in list_dispatches(session_id=session_id, non_terminal_only=True):
         if record_obj.state == STATE_DISPATCHED:
             in_fleet.append(record_obj.run_id)
+        elif record_obj.state == STATE_CONTRADICTED:
+            retrying.append(record_obj.run_id)
         else:
             stalled.append(record_obj.run_id)
-    return stalled, in_fleet
+    return stalled, retrying, in_fleet
 
 
 def _stalled_reason(stalled: list[str]) -> str:
@@ -555,17 +580,140 @@ def _stalled_reason(stalled: list[str]) -> str:
     )
 
 
-def _ledger_context(stalled: list[str], in_fleet: list[str]) -> str | None:
+def _ledger_context(
+    stalled: list[str], retrying: list[str], in_fleet: list[str],
+) -> str | None:
     """Operator-facing ledger summary, or None when this session has no dispatches."""
     parts: list[str] = []
     for run_id in stalled:
         parts.append(f"- [stalled] {run_id}: reported but never terminated")
+    for run_id in retrying:
+        parts.append(f"- [in retry] {run_id}: contradicted, awaiting the "
+                     "agent's fixed report")
     for run_id in in_fleet:
         parts.append(f"- [still in fleet] {run_id}: dispatched, no report yet")
     if not parts:
         return None
     parts.append("Board: `fleetproof fleet --open`")
     return "\n".join(parts)
+
+
+# === Stop-block budget: no unbounded wedge ===
+#
+# A failing blocking check blocked EVERY bridge stop — 10/10 in a harness-free
+# trial, 56 across several turns in a live window, +54,795 context tokens in
+# ten minutes — and the harness's own per-turn cap ends a turn without ending
+# the wedge (each later turn is blocked again). The stalled-dispatch sweep had
+# the same unbounded shape, and disarm does not cover it. An escape that needs
+# a human means a wedged unattended session sits wedged all night (both field
+# sites, independently). So the bridge gate carries its own budget: after
+# MAX_BRIDGE_BLOCKS blocked stops in one session, the gate stands down to
+# loud advisory context — the failure text still renders in full, the work is
+# still on record as unverified (checker verdicts and the board are untouched
+# by the stand-down), but nothing holds the turn hostage. A clean stop resets
+# the budget: the cap bounds one continuous wedge, not a session's honest
+# block/fix/pass cycles.
+
+STOP_BLOCKS_FILENAME = "stop-blocks.json"
+MAX_BRIDGE_BLOCKS = 5
+# How many session entries the budget file keeps; oldest are dropped.
+_STOP_BLOCKS_KEEP = 20
+
+GATE_EXHAUSTED_MARKER = "[FLEETPROOF GATE EXHAUSTED — HUMAN ATTENTION REQUIRED]"
+
+_EXHAUSTED_CONTEXT_TEMPLATE = (
+    GATE_EXHAUSTED_MARKER + "\n"
+    "The bridge stop gate blocked {n} consecutive stops this session and is "
+    "standing down to advisory context — the failure below stands UNRESOLVED "
+    "and the work is NOT verified. Nothing about the verdicts or the board "
+    "changed; only the blocking stopped. Fix the failure, or disarm on record "
+    "(`fleetproof disarm --tier bridge --note ...`) so the stand-down is "
+    "attributed. A later clean stop re-arms the budget.\n"
+    "--- last block reason ---\n{reason}")
+
+
+def _stop_blocks_path() -> Path:
+    return runs_dir().parent / STOP_BLOCKS_FILENAME
+
+
+def stop_block_budget() -> int:
+    """Blocked stops one session's bridge gate may issue before standing down.
+
+    ``stop_block_budget`` in ``.fleetproof/config.json`` (an integer >= 1)
+    overrides the default. Unreadable or out-of-range values fall back — the
+    budget must never be configurable to zero, which would be a gate that
+    never blocks, or to garbage, which would crash a hook.
+    """
+    from .config import load_config
+    raw = load_config().get("stop_block_budget")
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return MAX_BRIDGE_BLOCKS
+    return raw if raw >= 1 else MAX_BRIDGE_BLOCKS
+
+
+def _load_stop_blocks() -> dict[str, Any]:
+    try:
+        raw = json.loads(_stop_blocks_path().read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_stop_blocks(data: dict[str, Any]) -> None:
+    try:
+        if len(data) > _STOP_BLOCKS_KEEP:
+            data = dict(list(data.items())[-_STOP_BLOCKS_KEEP:])
+        _stop_blocks_path().parent.mkdir(parents=True, exist_ok=True)
+        _stop_blocks_path().write_text(
+            json.dumps(data, indent=1), encoding="utf-8")
+    except OSError:
+        # Budget bookkeeping is best-effort: a write failure means the count
+        # does not advance, so the gate errs toward blocking (its old
+        # behavior), never toward a phantom stand-down.
+        pass
+
+
+def _record_stop_block(session_id: str | None) -> int | None:
+    """Count one blocked bridge stop; returns the new count (None: no session)."""
+    if not session_id:
+        return None
+    data = _load_stop_blocks()
+    entry = data.get(session_id) if isinstance(data.get(session_id), dict) else {}
+    count = entry.get("blocks")
+    count = count + 1 if isinstance(count, int) and count >= 0 else 1
+    entry["blocks"] = count
+    if count == stop_block_budget() + 1:
+        entry["exhausted_at"] = datetime.now(timezone.utc).isoformat()
+    data[session_id] = entry
+    _write_stop_blocks(data)
+    return count
+
+
+def _clear_stop_blocks(session_id: str | None) -> None:
+    if not session_id:
+        return
+    data = _load_stop_blocks()
+    if session_id in data:
+        del data[session_id]
+        _write_stop_blocks(data)
+
+
+def stop_block_status(session_id: str | None) -> dict[str, Any] | None:
+    """``{"blocks", "budget", "exhausted"}`` for one session, or None if clean.
+
+    The board's read: a session whose gate stood down must say so on the
+    dispatcher surfaces, not only in the one context payload that announced it.
+    """
+    if not session_id:
+        return None
+    entry = _load_stop_blocks().get(session_id)
+    if not isinstance(entry, dict):
+        return None
+    blocks = entry.get("blocks")
+    if not isinstance(blocks, int) or blocks <= 0:
+        return None
+    budget = stop_block_budget()
+    return {"blocks": blocks, "budget": budget, "exhausted": blocks > budget}
 
 
 def stop_gate() -> tuple[dict[str, Any] | None, int]:
@@ -578,19 +726,47 @@ def stop_gate() -> tuple[dict[str, Any] | None, int]:
     Two independent grounds to block: the check spec failed (v0.1), or this
     session left dispatches stalled (v0.2). A session with no dispatches produces
     byte-identical output to v0.1 — the sweep adds nothing when there is nothing
-    to sweep.
+    to sweep. Every block draws on the session's stop-block budget (see the
+    budget block above); past the budget the gate stands down to loud advisory
+    context instead of blocking, and a clean stop resets it.
     """
     reason, context = _spec_gate()
 
     session_id = os.environ.get(SESSION_ID_ENV)
-    stalled, in_fleet = ledger_sweep(session_id)
+    stalled, retrying, in_fleet = ledger_sweep(session_id)
     if stalled:
         stalled_reason = _stalled_reason(stalled)
         reason = f"{reason} {stalled_reason}" if reason else stalled_reason
     _announce_ungraded_terminations(session_id)
     _announce_advisory_verdicts(session_id)
+    _announce_advisory_failures(session_id)
 
-    context_parts = [p for p in (context, _ledger_context(stalled, in_fleet)) if p]
+    context_parts = [p for p in (context, _ledger_context(stalled, retrying, in_fleet)) if p]
+
+    never_suppress = False
+    if reason is None:
+        # A clean stop (whatever context rides along) re-arms the budget: the
+        # cap bounds one continuous wedge, not the session's whole history.
+        _clear_stop_blocks(session_id)
+    else:
+        count = _record_stop_block(session_id)
+        budget = stop_block_budget()
+        if count is not None and count > budget:
+            exhausted_context = _EXHAUSTED_CONTEXT_TEMPLATE.format(
+                n=count - 1, reason=reason)
+            sys.stderr.write(
+                f"[fleetproof] bridge stop gate EXHAUSTED for this session "
+                f"({count - 1} blocked stops > budget {budget}) — standing down "
+                "to advisory context; the failure is unresolved\n")
+            if count == budget + 1:
+                # The stand-down announcement must reach the transcript once,
+                # even on a stop-hook continuation — it is the wedge's terminus
+                # and the dispatcher's only signal, same posture as the
+                # abandonment notice.
+                never_suppress = True
+                context_parts.insert(0, exhausted_context)
+            reason = None
+
     if reason is None and not context_parts:
         return None, 0
 
@@ -603,6 +779,8 @@ def stop_gate() -> tuple[dict[str, Any] | None, int]:
             "hookEventName": "Stop",
             "additionalContext": "\n".join(context_parts),
         }
+    if never_suppress:
+        decision[_NEVER_SUPPRESS_KEY] = True
     return decision, 0
 
 
@@ -645,6 +823,26 @@ def _announce_advisory_verdicts(session_id: str | None) -> None:
         return
     line = advisory_verdict_line(
         list_advisory_verdicts(session_id), scope_known=True)
+    if line:
+        sys.stderr.write(f"[fleetproof] {line}\n")
+
+
+def _announce_advisory_failures(session_id: str | None) -> None:
+    """One stderr line per bridge stop naming verified-with-failing-advisory rows.
+
+    Finding 1a (a harness-free field trial on macOS): with only advisory
+    (``block:false``) checks configured, a false "done" graded ``verified``
+    and the failure surfaced *nowhere a reader would look*. The failing ids
+    now ride the verdict transition as a field
+    (:attr:`fleetproof.ledger.DispatchRecord.advisory_failures`); this is the
+    bridge-stop half of the announcement, the fleet board is the other. Same
+    posture as the two announcers above: stderr only, every bridge stop, for
+    as long as the condition holds in the session.
+    """
+    if not session_id:
+        return
+    line = advisory_failure_line(
+        list_verified_with_advisory_failures(session_id), scope_known=True)
     if line:
         sys.stderr.write(f"[fleetproof] {line}\n")
 
@@ -717,7 +915,8 @@ def stop_gate_main() -> int:
     payload = _read_hook_input()
     _apply_session_id(payload)
     decision, code = stop_gate()
-    if decision is not None and _suppress_on_retry(payload, decision):
+    never_suppress = bool(decision.pop(_NEVER_SUPPRESS_KEY, False)) if decision else False
+    if decision is not None and not never_suppress and _suppress_on_retry(payload, decision):
         return code
     if decision is not None:
         sys.stdout.write(json.dumps(decision))
@@ -764,6 +963,16 @@ _ABANDONED_CONTEXT = (
     "[FLEETPROOF] dispatch {run_id} abandoned after {n} contradicted stops on "
     "{check_ids} — the work is NOT verified. Park it, fix the spec/tier, or "
     "re-dispatch.")
+
+# The report-before-idle ladder's height, deliberately the same as
+# MAX_CONTRADICTIONS: three refusals is a wedge, not a negotiation.
+MAX_NO_REPORT_BLOCKS = 3
+
+_NO_REPORT_CONTEXT = (
+    "[FLEETPROOF] dispatch {run_id} closed after {n} no-report blocks — the "
+    "agent went idle without ever reporting and the work is NOT verified "
+    "(terminate reason no-report-after-3-blocks). Re-dispatch it, park it, or "
+    "grade it out of band (`fleetproof dispatch verify {run_id} --terminal`).")
 
 # Internal marker on a decision dict whose context must reach the transcript
 # even on a stop-hook continuation: the abandonment notice is the loop's
@@ -1159,6 +1368,41 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     last_message = payload.get("last_assistant_message")
     last_message = last_message if isinstance(last_message, str) else ""
     if not last_message.strip():
+        # The report-before-idle ladder. Unbounded, this block fired on every
+        # stop of a silent agent — 5/5 in a harness-free field trial on macOS,
+        # "it never stops blocking by itself" — with zero configuration. Same
+        # terminus as MAX_CONTRADICTIONS: the third block is terminal. The
+        # dispatch closes UNVERIFIED with the machine-set reason
+        # ``no-report-after-3-blocks``, the board renders it loud, and the
+        # dispatcher is told in never-suppressed context. Prior no-report
+        # blocks are countable off ``blocks/`` because a never-reported
+        # dispatch has no other kind of block.
+        if dispatch.state == STATE_DISPATCHED and \
+                dispatch.block_count + 1 >= MAX_NO_REPORT_BLOCKS:
+            try:
+                record_block(
+                    dispatch.run_id,
+                    "[final no-report block — not delivered as a block] the "
+                    f"{MAX_NO_REPORT_BLOCKS}th empty-message stop is terminal; "
+                    "dispatch closed unverified (no-report-after-3-blocks).")
+            except (LedgerError, OSError) as e:
+                sys.stderr.write(
+                    f"[fleetproof] could not record final no-report block on "
+                    f"{dispatch.run_id}: {e}\n")
+            try:
+                close_dispatch(dispatch.run_id, by="hook", reason=REASON_NO_REPORT)
+            except LedgerError as e:
+                sys.stderr.write(
+                    f"[fleetproof] could not close no-report dispatch "
+                    f"{dispatch.run_id}: {e}\n")
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "SubagentStop",
+                    "additionalContext": _NO_REPORT_CONTEXT.format(
+                        run_id=dispatch.run_id, n=MAX_NO_REPORT_BLOCKS),
+                },
+                _NEVER_SUPPRESS_KEY: True,
+            }, 0
         return _block_dispatch(
             dispatch.run_id,
             f"{GATE_BLOCK_MARKER}\n"
@@ -1370,17 +1614,44 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
             f"still pending-capture — {listed}. The pass direction now "
             "exists: promote it from the real emission — fleetproof check "
             "control <check-id> --upgrade --pass-sample <captured-emission>\n")
+    detail, extra = _verified_detail(report, dispatch.tier)
     record_verdict(
         dispatch.run_id,
         STATE_VERIFIED,
-        detail=f"{report.passed}/{report.total} checks passed at tier {dispatch.tier}",
+        detail=detail,
         by=VERDICT_BY,
+        extra=extra,
     )
+    if extra:
+        sys.stderr.write(
+            f"[fleetproof] dispatch {dispatch.run_id} verified with FAILING "
+            f"advisory check(s): {', '.join(extra['advisory_failures'])} — "
+            "the verdict stands; the failure surfaces on the fleet board and "
+            "the next bridge stop\n")
     _try_close(dispatch.run_id)
     # Built after the close, so the outcome class derives from a finished
     # lifecycle rather than a snapshot mid-transition.
     _try_build_telemetry(dispatch.run_id, check_report=report, checks=runnable)
     return None, 0
+
+
+def _verified_detail(report, tier: str | None) -> tuple[str, dict[str, Any] | None]:
+    """``(detail, extra)`` for a verified verdict, carrying advisory failures.
+
+    Finding 1a (a harness-free field trial on macOS): a false "done" over
+    ``block:false`` checks graded ``verified`` with the only trace a "1/3"
+    inside this detail string. The failing advisory ids now ride the
+    transition as a structured field (``extra``) AND the detail names them —
+    the field is what readers key on, the prose is for the human already
+    looking at the record.
+    """
+    warn_failures = [r.id for r in report.results if not r.passed and not r.blocking]
+    detail = f"{report.passed}/{report.total} checks passed at tier {tier}"
+    if not warn_failures:
+        return detail, None
+    detail += ("; " + str(len(warn_failures))
+               + " advisory check(s) FAILED: " + ", ".join(warn_failures))
+    return detail, {"advisory_failures": warn_failures}
 
 
 def subagent_stop_main() -> int:
@@ -1402,7 +1673,9 @@ def subagent_stop_main() -> int:
     return code
 
 
-def verify_dispatch(run_id: str, note: str | None = None) -> dict[str, Any]:
+def verify_dispatch(
+    run_id: str, note: str | None = None, allow_terminal: bool = False,
+) -> dict[str, Any]:
     """Grade a stuck non-terminal dispatch out of band, as SubagentStop would.
 
     The L27 mechanization. When the harness drops a SubagentStop, a dispatch is
@@ -1430,10 +1703,28 @@ def verify_dispatch(run_id: str, note: str | None = None) -> dict[str, Any]:
     if dispatch is None:
         raise LedgerError(f"No dispatch record for run {run_id!r}.")
     if dispatch.is_terminal:
-        raise LedgerError(
-            f"Dispatch {run_id} is already terminal ({dispatch.state}); "
-            "`dispatch verify` grades a stuck NON-terminal dispatch out of "
-            "band, not a finished one. Its outcome is already on record.")
+        if not allow_terminal:
+            hint = ""
+            if dispatch.verdict is None:
+                hint = (" It terminated UNGRADED — for a false terminal (an "
+                        "idle stop closed it while the real work finished out "
+                        "of band), re-grade it with `dispatch verify "
+                        f"{run_id} --terminal`.")
+            raise LedgerError(
+                f"Dispatch {run_id} is already terminal ({dispatch.state}); "
+                "`dispatch verify` grades a stuck NON-terminal dispatch out of "
+                "band, not a finished one. Its outcome is already on record."
+                + hint)
+        # --terminal: the false-terminal exit (finding H2 — a backgrounding
+        # subagent's idle stop was recorded as its report and the dispatch
+        # closed; the real DONE arrived later over a path no hook sees).
+        # reopen_for_verify enforces the guardrails: terminal AND ungraded
+        # only — a verdict on record is an outcome, and outcomes stay.
+        summary = ("operator out-of-band verification of a false terminal via "
+                   "`fleetproof dispatch verify --terminal`")
+        if note:
+            summary += f": {note}"
+        dispatch = reopen_for_verify(run_id, summary, by=BY_CLI_VERIFY)
 
     session_id = dispatch.session_id or os.environ.get(SESSION_ID_ENV)
 
@@ -1500,14 +1791,16 @@ def verify_dispatch(run_id: str, note: str | None = None) -> dict[str, Any]:
         detail = (f"{len(report.blocking_failures)}/{report.total} blocking "
                   f"check(s) failed ({failing_ids}) — {dispatch.tier} gate "
                   "disarmed, failures did not block (verified out of band)")
+        extra = None
     elif report.blocking_failures:
         verdict = STATE_CONTRADICTED
         detail = "; ".join(r.id for r in report.blocking_failures)
+        extra = None
     else:
         verdict = STATE_VERIFIED
-        detail = f"{report.passed}/{report.total} checks passed at tier {dispatch.tier}"
+        detail, extra = _verified_detail(report, dispatch.tier)
 
-    record_verdict(run_id, verdict, detail=detail, by=BY_CLI_VERIFY)
+    record_verdict(run_id, verdict, detail=detail, by=BY_CLI_VERIFY, extra=extra)
     close_dispatch(run_id, by=BY_CLI_VERIFY)
     _try_build_telemetry(run_id, check_report=report, checks=runnable)
     return {"run_id": run_id, "verdict": verdict, "detail": detail,

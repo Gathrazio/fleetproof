@@ -1,6 +1,6 @@
-{
+﻿{
   "name": "fleetproof",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Independent, out-of-band verification for agent fleets. Blocks a false 'done' when the checker disagrees.",
   "author": {
     "name": "Gathrazio"

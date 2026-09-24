@@ -87,6 +87,7 @@ from .hookgate import (
     DEFAULT_ARMING_TIER,
     LANE_NEVER_DISARMED,
     load_arming,
+    stop_block_status,
     tier_arming,
     tier_set_meta,
     record_tool_main,
@@ -108,10 +109,12 @@ from .ledger import (
     REASON_ABANDONED,
     REASON_OPERATOR_CLOSE,
     REASON_PARKED_PREFIX,
+    REASON_SWEEP_IDLE,
     TIER_SOURCE_DECLARED,
     TIER_SOURCE_DEFAULTED,
     VALID_TERMINATE_REASONS,
     LedgerError,
+    advisory_failure_line,
     advisory_verdict_line,
     close_dispatch,
     create_dispatch,
@@ -119,6 +122,7 @@ from .ledger import (
     list_dispatches,
     list_orphan_stops,
     list_ungraded_terminations,
+    list_verified_with_advisory_failures,
     load_dispatch,
     record_report,
     ungraded_termination_line,
@@ -566,11 +570,22 @@ def _cmd_cleanup(args: argparse.Namespace) -> int:
     deleted, skipped = [], []
     if rd.exists():
         cutoff = datetime.now(timezone.utc) - timedelta(days=args.older_than_days)
-        for run_dir in sorted(rd.iterdir()):
-            if not run_dir.is_dir() or run_dir.name.startswith("."):
-                continue
+        run_dirs = [d for d in sorted(rd.iterdir())
+                    if d.is_dir() and not d.name.startswith(".")]
+        # --max-runs: keep only the newest N run dirs regardless of age. The
+        # ledger is never pruned by anything else, and at 5,000 recorded
+        # events one repo held 20,048 files with 1-2.5 s stops (a harness-free
+        # field trial on macOS) — age alone does not bound a busy day. Run ids
+        # are timestamp-prefixed, so name order is age order; the age rule
+        # still applies to what --max-runs keeps.
+        over_cap: set[str] = set()
+        if args.max_runs is not None and len(run_dirs) > args.max_runs:
+            for run_dir in run_dirs[: len(run_dirs) - args.max_runs]:
+                over_cap.add(run_dir.name)
+        for run_dir in run_dirs:
             started = _run_started_at(run_dir)
-            if started is None or started >= cutoff:
+            stale = started is not None and started < cutoff
+            if not stale and run_dir.name not in over_cap:
                 skipped.append(run_dir.name)
                 continue
             if not args.dry_run:
@@ -1152,7 +1167,8 @@ def _cmd_dispatch_verify(args: argparse.Namespace) -> int:
     :func:`fleetproof.hookgate.verify_dispatch`.
     """
     try:
-        result = verify_dispatch(args.run_id, note=(args.note or "").strip() or None)
+        result = verify_dispatch(args.run_id, note=(args.note or "").strip() or None,
+                                 allow_terminal=bool(args.terminal))
     except LedgerError as e:
         _emit_error("ledger_error", str(e), args.format)
         return 1
@@ -1168,6 +1184,75 @@ def _cmd_dispatch_verify(args: argparse.Namespace) -> int:
     else:
         print(f"{result['run_id']} -> {verdict} (operator out-of-band verify, "
               f"stamped cli-verify): {result['detail'] or 'no detail'}")
+    return 0
+
+
+def _parse_older_than(raw: str) -> timedelta:
+    """``--older-than`` value: '<N>d' (days) or '<N>h' (hours), N >= 1."""
+    text = (raw or "").strip().lower()
+    unit = text[-1:] if text else ""
+    try:
+        n = int(text[:-1])
+    except ValueError:
+        n = 0
+    if n < 1 or unit not in ("d", "h"):
+        raise argparse.ArgumentTypeError(
+            f"--older-than wants '<N>d' or '<N>h' (e.g. 2d, 12h); got {raw!r}.")
+    return timedelta(days=n) if unit == "d" else timedelta(hours=n)
+
+
+def _cmd_dispatch_sweep(args: argparse.Namespace) -> int:
+    """Bulk-close stale non-terminal dispatches (field ask: board hygiene).
+
+    A board carrying 16 stale in-fleet rows from three weeks back, parked one
+    `dispatch close` at a time, is a board nobody reconciles (a field
+    deployment on Windows). One command closes every non-terminal dispatch
+    older than the cutoff — with ``--reason`` as an attributed park
+    (``parked: <text>``), without as the machine reason ``sweep-idle``.
+    ``--session`` narrows to one session; ``--dry-run`` lists without closing.
+    """
+    cutoff = datetime.now(timezone.utc) - args.older_than
+    swept: list[str] = []
+    skipped_young: int = 0
+    for record in list_dispatches(session_id=args.session, non_terminal_only=True):
+        started = None
+        if record.started_at:
+            try:
+                started = datetime.fromisoformat(record.started_at)
+            except ValueError:
+                started = None
+        if started is not None and started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        # An undatable record is treated as stale, not young: the sweep exists
+        # to clear rows whose records have decayed, and skipping them would
+        # strand exactly those forever.
+        if started is not None and started >= cutoff:
+            skipped_young += 1
+            continue
+        if not args.dry_run:
+            reason = (REASON_PARKED_PREFIX + args.reason.strip()
+                      if (args.reason or "").strip() else REASON_SWEEP_IDLE)
+            try:
+                close_dispatch(record.run_id, reason=reason)
+            except LedgerError as e:
+                print(f"[fleetproof] could not sweep {record.run_id}: {e}",
+                      file=sys.stderr)
+                continue
+            try:
+                build_telemetry(record.run_id)
+            except Exception as e:
+                print(f"[fleetproof] telemetry build failed for {record.run_id}: {e}",
+                      file=sys.stderr)
+        swept.append(record.run_id)
+    if args.format == "json":
+        print(json.dumps({"swept": swept, "skipped_young": skipped_young,
+                          "dry_run": bool(args.dry_run)}, indent=2))
+        return 0
+    prefix = "DRY RUN — would sweep" if args.dry_run else "Swept"
+    print(f"{prefix} {len(swept)} dispatch(es); {skipped_young} younger than "
+          "the cutoff left alone.")
+    for run_id in swept:
+        print(f"  {run_id}")
     return 0
 
 
@@ -1433,10 +1518,12 @@ def _orphan_count_line(orphans: list[dict], scope_known: bool) -> str:
 
 
 def _cmd_fleet(args: argparse.Namespace) -> int:
-    _print_liveness_line(soft_when_unknown=True)
+    # Liveness prints only when the answer is NO (a hook session that left no
+    # hook evidence). The "unknown" line on every plain-shell `fleet` was
+    # noise above the board by the twentieth call (field ask 17).
+    _print_liveness_line()
     if args.orphans:
         return _cmd_fleet_orphans(args)
-    records = list_dispatches(session_id=args.session, non_terminal_only=args.open)
     # One scope rule for every footer count (orphans, ungraded, advisory):
     # ledger-scoped, never listing-scoped. "This session" is the --session
     # filter, else the hook session the CLI is running inside
@@ -1447,6 +1534,15 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
     # session" from a session-less shell while counting every orphan on disk
     # (observed in a field deployment on Windows).
     scope_session = args.session or os.environ.get(SESSION_ID_ENV) or None
+    # The ROW listing now shares that scope: two concurrent bridges in one
+    # repo each read the other's rows as "still in fleet" and could not tell
+    # whose they were (a field deployment on Windows, ask 13). Under a hook
+    # session the board defaults to that session's rows; --all widens to the
+    # whole ledger; a session-less shell keeps the whole-ledger default.
+    listing_session = None if args.all else (args.session or scope_session)
+    env_scoped = bool(listing_session) and not args.session
+    records = list_dispatches(session_id=listing_session,
+                              non_terminal_only=args.open)
     orphans = list_orphan_stops(session_id=scope_session)
     ungraded = list_ungraded_terminations(scope_session)
     ungraded_line = ungraded_termination_line(ungraded, scope_known=bool(scope_session))
@@ -1456,6 +1552,17 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
     advisory_graded = list_advisory_verdicts(scope_session)
     advisory_line = advisory_verdict_line(advisory_graded,
                                           scope_known=bool(scope_session))
+    # Verified verdicts whose advisory (block:false) checks failed — the
+    # finding-1a surface — and the session's stop-block budget, when spent.
+    warn_verified = list_verified_with_advisory_failures(scope_session)
+    warn_line = advisory_failure_line(warn_verified, scope_known=bool(scope_session))
+    budget = stop_block_status(scope_session)
+    budget_line = None
+    if budget and budget["exhausted"]:
+        budget_line = (f"bridge stop gate EXHAUSTED this session: {budget['blocks']} "
+                       f"blocked stop(s) > budget {budget['budget']} — the gate is "
+                       "standing down to advisory context and the underlying "
+                       "failure is UNRESOLVED. Fix it or disarm on record.")
     # The board echoes every disarmed gate (bridge, coordinator) whenever it
     # is advisory — the armed default stays quiet. Silence here is what makes
     # the echo a signal.
@@ -1467,6 +1574,7 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
             "dispatches": [
                 dict(r.to_dict(), age=_format_age(r.started_at)) for r in records
             ],
+            "listing_session": listing_session,
             "orphan_stop_count": len(orphans),
             "terminated_ungraded_count": len(ungraded),
             "terminated_ungraded": [r.run_id for r in ungraded],
@@ -1475,13 +1583,22 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
                 {"run_id": r.run_id, "detail": r.verdict_detail}
                 for r in advisory_graded
             ],
+            "verified_with_advisory_failures": [
+                {"run_id": r.run_id, "advisory_failures": r.advisory_failures}
+                for r in warn_verified
+            ],
         }
+        if budget:
+            payload["stop_block_budget"] = budget
         if advisory:
             payload["arming"] = arming
         print(json.dumps(payload, indent=2))
         return 0
     for line in arming_lines:
         print(line)
+    if env_scoped:
+        print(f"(scoped to session {_short_session(listing_session)} — "
+              "`fleet --all` for the whole ledger)")
     if not records:
         print("No dispatches found.")
         if orphans:
@@ -1490,6 +1607,10 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
             print(ungraded_line)
         if advisory_line:
             print(advisory_line)
+        if warn_line:
+            print(warn_line)
+        if budget_line:
+            print(budget_line)
         return 0
     print(f"{'run_id':<24} {'state':<26} {'tier':<12} {'agent':<18} "
           f"{'verdict':<13} {'age':>7} {'session':<14}")
@@ -1516,6 +1637,14 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
     if "abandoned!" in labels:
         print("abandoned! = terminated after 3 contradicted stops; the work "
               "was never verified. Park it, fix the spec/tier, or re-dispatch.")
+    if "no-report!" in labels:
+        print("no-report! = closed after 3 empty-message stops; the agent went "
+              "idle without ever reporting and the work was never verified. "
+              "Re-dispatch, park, or `dispatch verify <run_id> --terminal`.")
+    if any(verdict_label(r) == "verified*" for r in records):
+        print("verified* = verified while one or more advisory (block:false) "
+              "check(s) FAILED — the verdict stands; read the failing ids in "
+              "the record before trusting what they cover.")
     if "parked" in labels:
         print("parked = terminated on purpose with a recorded reason; not "
               "graded further.")
@@ -1544,6 +1673,10 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
         print(ungraded_line)
     if advisory_line:
         print(advisory_line)
+    if warn_line:
+        print(warn_line)
+    if budget_line:
+        print(budget_line)
     return 0
 
 
@@ -1812,8 +1945,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("-o", "--output", default=None, help="Output HTML path.")
     p_report.set_defaults(func=_cmd_report)
 
-    p_cleanup = sub.add_parser("cleanup", help="Delete run records older than N days.")
+    p_cleanup = sub.add_parser(
+        "cleanup",
+        help="Delete run records older than N days; --max-runs also bounds "
+             "the total kept (the ledger is otherwise never pruned).")
     p_cleanup.add_argument("--older-than-days", type=int, required=True)
+    p_cleanup.add_argument("--max-runs", type=int, default=None,
+                           help="Keep at most this many newest run dirs, "
+                                "whatever their age.")
     p_cleanup.add_argument("--dry-run", action="store_true")
     p_cleanup.set_defaults(func=_cmd_cleanup)
 
@@ -2031,8 +2170,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--note", default=None,
         help="Free-text note recorded on the synthetic report (why this is "
              "being verified out of band).")
+    p_dverify.add_argument(
+        "--terminal", action="store_true",
+        help="Also accept a TERMINAL dispatch that carries no verdict — the "
+             "false-terminal shape (an idle stop closed it while the real "
+             "work finished over a path no hook sees). Reopens it on record "
+             "('reopened: true' on the transition), grades, and closes. A "
+             "terminal dispatch WITH a verdict is still refused: outcomes on "
+             "record stay.")
     _add_format(p_dverify)
     p_dverify.set_defaults(func=_cmd_dispatch_verify)
+
+    p_dsweep = dsub.add_parser(
+        "sweep",
+        help="Bulk-close stale non-terminal dispatches: everything older than "
+             "--older-than (whole ledger, or --session). With --reason each "
+             "closes as an attributed park ('parked: <reason>'); without, as "
+             "the machine reason 'sweep-idle'. --dry-run lists first.")
+    p_dsweep.add_argument("--older-than", type=_parse_older_than, required=True,
+                          metavar="<N>d|<N>h",
+                          help="Age cutoff, e.g. 2d or 12h; younger rows are left alone.")
+    p_dsweep.add_argument("--session", default=None,
+                          help="Only sweep this session's dispatches.")
+    p_dsweep.add_argument("--reason", default=None,
+                          help="Park each swept dispatch with this reason "
+                               "(recorded as 'parked: <reason>').")
+    p_dsweep.add_argument("--dry-run", action="store_true",
+                          help="List what would be swept; close nothing.")
+    _add_format(p_dsweep)
+    p_dsweep.set_defaults(func=_cmd_dispatch_sweep)
 
     p_tel = sub.add_parser("telemetry", help="Verification-telemetry surfaces.")
     tsub = p_tel.add_subparsers(dest="telemetry_command", required=True)
@@ -2076,6 +2242,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_fleet.add_argument("--open", action="store_true",
                          help="Only dispatches that have not terminated.")
     p_fleet.add_argument("--session", default=None, help="Filter to one session id.")
+    p_fleet.add_argument("--all", action="store_true",
+                         help="List the whole ledger. Under a hook session the "
+                              "board defaults to that session's rows (two "
+                              "concurrent bridges in one repo could not tell "
+                              "whose rows were whose); a session-less shell "
+                              "already lists everything.")
     p_fleet.add_argument("--orphans", action="store_true",
                          help="List orphan stops (unpaired SubagentStops; "
                               "sightings, never graded) instead of dispatches.")
