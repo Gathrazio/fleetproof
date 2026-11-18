@@ -1572,7 +1572,10 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
     if args.format == "json":
         payload = {
             "dispatches": [
-                dict(r.to_dict(), age=_format_age(r.started_at)) for r in records
+                dict(r.to_dict(), age=_format_age(r.started_at),
+                     silent_age=(None if r.is_terminal
+                                 else _format_age(r.last_event_at)))
+                for r in records
             ],
             "listing_session": listing_session,
             "orphan_stop_count": len(orphans),
@@ -1612,12 +1615,20 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
         if budget_line:
             print(budget_line)
         return 0
+    # `silent` is the ledger-silence age (time since the last transition),
+    # distinct from `age` (time since dispatch): a lane that went quiet after
+    # an interim event looks young by `age` and dead by `silent`, and the
+    # passive board line hiding that difference is how a stalled wave went
+    # unnoticed until a human looked (GCC lesson L55). Terminal rows have
+    # nothing to be silent about, so they render '-'.
     print(f"{'run_id':<24} {'state':<26} {'tier':<12} {'agent':<18} "
-          f"{'verdict':<13} {'age':>7} {'session':<14}")
+          f"{'verdict':<13} {'age':>7} {'silent':>7} {'session':<14}")
     for r in records:
+        silent = "-" if r.is_terminal else _format_age(r.last_event_at)
         print(f"{r.run_id:<24} {state_label(r):<26} {tier_label(r):<12} "
               f"{_truncate(agent_label(r), 18):<18} {verdict_label(r):<13} "
-              f"{_format_age(r.started_at):>7} {_short_session(r.session_id):<14}")
+              f"{_format_age(r.started_at):>7} {silent:>7} "
+              f"{_short_session(r.session_id):<14}")
     open_count = sum(1 for r in records if r.is_open)
     ungraded = sum(1 for r in records if r.verdict is None)
     print(f"{len(records)} dispatch(es), {open_count} awaiting a report, "

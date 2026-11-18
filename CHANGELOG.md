@@ -3,6 +3,38 @@
 Releases before 0.4.0 predate this file; their stories are in the README's
 version-marked sections and the git history.
 
+## 0.7.1 — 2026-11-17
+
+The stale-dispatch release. One finding, three recurrences, one deployment:
+a dispatched lane went idle after an interim message, nothing re-invoked
+anyone, and the wave stalled invisibly until a human noticed — three times
+across the Windows deployment's sessions (0064/0067/0070, its lesson L55),
+the third caught by the operator, who then ordered the mechanization. The
+bridge stop's `[still in fleet]` line read identically for a working agent
+and a dead one; this release makes silence measurable and loud.
+
+- **Per-dispatch silence age.** Every non-terminal dispatch in the bridge
+  stop's ledger sweep now carries the time since its last ledger event (the
+  last transition's stamp, falling back to `started_at` on a damaged record
+  with no transitions — the same tolerance the state read extends; a record
+  with no stamp at all has an *unknown* age, which never escalates). The
+  `[stalled]` and `[in retry]` context lines append it as `(silent M min)`.
+- **`[STALE in fleet]` escalation.** An in-fleet dispatch silent strictly
+  past the threshold trades its passive line for
+  `- [STALE in fleet] <run_id>: dispatched, no ledger event for M min
+  (threshold N) — check the agent now: verify deliverables on disk, nudge
+  it, or take the work over`. Threshold: `stale_dispatch_minutes` in
+  `.fleetproof/config.json`, default 15; an explicit `0` (or negative, or
+  `false`) disables the escalation; a malformed value falls back to the
+  default rather than silently turning it off. Staleness stays context,
+  never a block — blocking would make it impossible to stop while a long
+  legitimate subagent runs, and the stop-block budget exists to kill
+  unbounded wedges. Louder, not blocking.
+- **`silent` column on the board.** `fleet` rows show ledger-silence age
+  beside `age` (`-` on terminal rows); `fleet --format json` carries it as
+  `silent_age`. A lane that went quiet after an interim event looks young by
+  `age` and dead by `silent`.
+
 ## 0.7.0 — 2026-09-23
 
 The no-unbounded-loop release. Driven by two independent field reports that

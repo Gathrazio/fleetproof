@@ -374,6 +374,24 @@ class DispatchRecord:
         return self.state in TERMINAL_STATES
 
     @property
+    def last_event_at(self) -> str | None:
+        """ISO stamp of the last ledger event on this record, or None.
+
+        The last transition's ``at``, falling back to ``started_at`` when the
+        transitions list is empty or its last entry carries no stamp — the
+        same damaged-record tolerance :attr:`state` extends (an empty list
+        reads as ``dispatched``, not a crash). A record with neither stamp
+        returns None, and silence math must read that as "age unknown",
+        never "infinitely old": escalating on a missing field would turn one
+        damaged file into a false alarm on every bridge stop.
+        """
+        if self.transitions:
+            at = self.transitions[-1].get("at")
+            if at:
+                return str(at)
+        return self.started_at
+
+    @property
     def is_open(self) -> bool:
         """True while this dispatch has not reported yet.
 

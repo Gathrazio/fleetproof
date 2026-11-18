@@ -136,6 +136,34 @@ def run_context(config: dict[str, Any] | None = None) -> str:
     return RUN_CONTEXT_PRODUCTION
 
 
+STALE_DISPATCH_DEFAULT_MINUTES = 15
+
+
+def stale_dispatch_minutes(config: dict[str, Any] | None = None) -> int:
+    """Minutes of ledger silence before an in-fleet dispatch escalates; 0 = off.
+
+    ``stale_dispatch_minutes`` in ``.fleetproof/config.json``. A dispatched
+    lane that went idle after an interim message re-invoked nobody, and the
+    wave stalled invisibly until a human noticed — three recurrences across
+    one field deployment's sessions before the operator ordered this
+    mechanized (GCC lesson L55, operator-caught third instance). So the
+    default is ON at 15 minutes: silence past the threshold turns the
+    dispatch's passive board line into an escalated one. An explicit ``0``
+    (or a negative number, or ``false``) disables the escalation entirely —
+    that is a deliberate operator posture, distinct from a malformed value,
+    which falls back to the default rather than crashing a hook or quietly
+    turning the escalation off.
+    """
+    cfg = config if config is not None else load_config()
+    raw = cfg.get("stale_dispatch_minutes")
+    if raw is False or (isinstance(raw, int)
+                        and not isinstance(raw, bool) and raw <= 0):
+        return 0
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return STALE_DISPATCH_DEFAULT_MINUTES
+    return raw
+
+
 def _config_str(key: str, config: dict[str, Any] | None = None) -> str | None:
     cfg = config if config is not None else load_config()
     value = cfg.get(key)

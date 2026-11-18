@@ -84,6 +84,7 @@ from .ledger import (
     TIER_COORDINATOR,
     TIER_SOURCE_DEFAULTED,
     TIER_SOURCE_INHERITED,
+    DispatchRecord,
     LedgerError,
     advisory_failure_line,
     advisory_verdict_line,
@@ -536,8 +537,10 @@ def _failure_reason(report) -> str:
     return "\n".join([GATE_BLOCK_MARKER, header, per_check, evidence, _BLOCK_EXITS])
 
 
-def ledger_sweep(session_id: str | None) -> tuple[list[str], list[str], list[str]]:
-    """Return ``(stalled, retrying, in_fleet)`` dispatch run ids for a session.
+def ledger_sweep(
+    session_id: str | None,
+) -> tuple[list[DispatchRecord], list[DispatchRecord], list[DispatchRecord]]:
+    """Return ``(stalled, retrying, in_fleet)`` dispatch records for a session.
 
     *stalled* — a dispatch that reported (or was graded) and then never terminated.
     Something started closing it out and stopped halfway, which is exactly the
@@ -555,43 +558,110 @@ def ledger_sweep(session_id: str | None) -> tuple[list[str], list[str], list[str
     *in_fleet* — still in state ``dispatched``. That is a legitimately-running
     background agent, not a fault, so it is reported and not blocked on. Blocking
     here would make it impossible to ever stop while a long subagent runs.
+
+    Whole records, not run ids: the context renderer reads each record's
+    silence age off its transitions, so a dispatch whose agent went quiet can
+    escalate instead of hiding in a passive list (GCC lesson L55).
     """
     if not session_id:
         return [], [], []
-    stalled: list[str] = []
-    retrying: list[str] = []
-    in_fleet: list[str] = []
+    stalled: list[DispatchRecord] = []
+    retrying: list[DispatchRecord] = []
+    in_fleet: list[DispatchRecord] = []
     for record_obj in list_dispatches(session_id=session_id, non_terminal_only=True):
         if record_obj.state == STATE_DISPATCHED:
-            in_fleet.append(record_obj.run_id)
+            in_fleet.append(record_obj)
         elif record_obj.state == STATE_CONTRADICTED:
-            retrying.append(record_obj.run_id)
+            retrying.append(record_obj)
         else:
-            stalled.append(record_obj.run_id)
+            stalled.append(record_obj)
     return stalled, retrying, in_fleet
 
 
-def _stalled_reason(stalled: list[str]) -> str:
+def _stalled_reason(stalled: list[DispatchRecord]) -> str:
     return (
         f"FleetProof: {len(stalled)} dispatch(es) reported but never terminated — "
-        + ", ".join(stalled)
+        + ", ".join(r.run_id for r in stalled)
         + ". Verify or close each one (`fleetproof dispatch close <run_id>`) "
         "before stopping; a half-closed dispatch is how work goes missing."
     )
 
 
+def _silence_minutes(
+    record: DispatchRecord, now: datetime | None = None,
+) -> int | None:
+    """Whole minutes since this record's last ledger event, or None.
+
+    None means "age unknown" — a record with no usable stamp at all, or one
+    whose stamp does not parse. Unknown must never read as stale: a damaged
+    record already degrades to ``dispatched`` on the board, and compounding
+    that with a false STALE escalation on every bridge stop would train the
+    dispatcher to ignore the one line that exists to interrupt it.
+    """
+    stamp = record.last_event_at
+    if not stamp:
+        return None
+    try:
+        last = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    reference = now if now is not None else datetime.now(timezone.utc)
+    seconds = (reference - last).total_seconds()
+    if seconds < 0:
+        return 0
+    return int(seconds // 60)
+
+
+def _silence_suffix(record: DispatchRecord, now: datetime | None = None) -> str:
+    """`` (silent M min)`` for a record with a known age, else nothing."""
+    minutes = _silence_minutes(record, now)
+    return f" (silent {minutes} min)" if minutes is not None else ""
+
+
 def _ledger_context(
-    stalled: list[str], retrying: list[str], in_fleet: list[str],
+    stalled: list[DispatchRecord],
+    retrying: list[DispatchRecord],
+    in_fleet: list[DispatchRecord],
+    now: datetime | None = None,
 ) -> str | None:
-    """Operator-facing ledger summary, or None when this session has no dispatches."""
+    """Operator-facing ledger summary, or None when this session has no dispatches.
+
+    An in-fleet dispatch silent past ``stale_dispatch_minutes`` escalates to
+    a ``[STALE in fleet]`` line. Field provenance: three times in one
+    deployment a dispatched lane went idle after an interim message, nothing
+    re-invoked anyone, and the wave stalled invisibly until a HUMAN noticed —
+    the passive "still in fleet" line read identically for a working agent
+    and a dead one (GCC lesson L55, third recurrence operator-caught).
+    Staleness stays context, never a block: blocking here would make it
+    impossible to stop while a long legitimate subagent runs, and the
+    stop-block budget exists precisely to kill unbounded wedges. Louder, not
+    blocking.
+    """
+    from .config import stale_dispatch_minutes
+    threshold = stale_dispatch_minutes()
     parts: list[str] = []
-    for run_id in stalled:
-        parts.append(f"- [stalled] {run_id}: reported but never terminated")
-    for run_id in retrying:
-        parts.append(f"- [in retry] {run_id}: contradicted, awaiting the "
-                     "agent's fixed report")
-    for run_id in in_fleet:
-        parts.append(f"- [still in fleet] {run_id}: dispatched, no report yet")
+    for record_obj in stalled:
+        parts.append(f"- [stalled] {record_obj.run_id}: reported but never "
+                     f"terminated{_silence_suffix(record_obj, now)}")
+    for record_obj in retrying:
+        parts.append(f"- [in retry] {record_obj.run_id}: contradicted, awaiting the "
+                     f"agent's fixed report{_silence_suffix(record_obj, now)}")
+    for record_obj in in_fleet:
+        minutes = _silence_minutes(record_obj, now)
+        # Strictly past the threshold: an agent silent for exactly the
+        # threshold has not yet exceeded it, and an unknown age never
+        # escalates (see _silence_minutes).
+        if threshold > 0 and minutes is not None and minutes > threshold:
+            parts.append(
+                f"- [STALE in fleet] {record_obj.run_id}: dispatched, no ledger "
+                f"event for {minutes} min (threshold {threshold}) — check the "
+                "agent now: verify deliverables on disk, nudge it, or take "
+                "the work over")
+        else:
+            parts.append(f"- [still in fleet] {record_obj.run_id}: dispatched, "
+                         "no report yet")
     if not parts:
         return None
     parts.append("Board: `fleetproof fleet --open`")
