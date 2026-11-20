@@ -37,6 +37,7 @@ from .ledger import (
     STATE_ADVISORY,
     STATE_CONTRADICTED,
     STATE_DISPATCHED,
+    STATE_REPORTED,
     STATE_TERMINATED,
     STATE_VERIFIED,
     TIER_SOURCE_DECLARED,
@@ -122,6 +123,12 @@ def state_label(dispatch: DispatchRecord) -> str:
                 return "parked (unsatisfiable)"
             return "parked"
         return "done" if dispatch.has_report else "done (no report)"
+    if state == STATE_REPORTED and dispatch.last_report_interim:
+        # A living report (dispatch report --interim): the work continues on
+        # purpose, so "stalled" — the face that means somebody stopped
+        # halfway — would be the wrong accusation. The bridge sweep treats
+        # it the same way: context, not a block, until the final report.
+        return "reported (interim)"
     return f"{state} (stalled)"
 
 

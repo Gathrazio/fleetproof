@@ -3,6 +3,110 @@
 Releases before 0.4.0 predate this file; their stories are in the README's
 version-marked sections and the git history.
 
+## 0.7.2 — 2026-11-20
+
+The grading-spine release, off the Windows deployment's own dogfooding: named
+teammate dispatches kept going terminal with the claim on record and no
+verdict ever attached (twice in one session, twice in the next; the macOS
+site reported the same class). The diagnosis, written up in
+`docs/0.7.2-grading-spine.md`: the spine never loses a verdict it could have
+recorded — the rows were the **no-contract shape**, where a named spawn
+reports its NAME as agent_type, no intent sidecar matches, and the capture is
+manifest-less, so at stop time nothing is runnable and the close is honestly
+ungraded. 0.7.2 attacks that at the capture, the visibility, and the recovery
+layer, and fixes two more verdict-integrity gaps found the same weeks.
+
+### The contract stops detaching
+
+- **SubagentStart joins a waiting CLI dispatch.** `dispatch new --agent-name
+  X` plus the real spawn minted TWO records — the join only existed at the
+  stop (two forked pairs in one field session, parked by hand). The start
+  capture now adopts the spawn's agent_id onto the unique open same-session
+  CLI record of that agent type instead of minting a twin; ambiguity captures
+  normally with the candidates named on stderr, and a matching sidecar is
+  left unconsumed with a warning rather than silently eaten.
+- **The intent miss is stamped and explained.** A spawn that matches no
+  sidecar while unconsumed sidecars sit on disk records `intent_miss`
+  (the filenames present) on the dispatch, and the stderr line states the
+  match-key rule: named spawns report the NAME as agent_type — register the
+  intent with `--agent <spawn-name>` or `--role <spawn-name>`. The
+  `dispatch intent --agent` help text now says the same at authoring time.
+- **Sidecar hygiene.** The fleet board footer lists unconsumed intent
+  sidecars with their age (`unconsumed_intents` in `--format json`) — a
+  stale sidecar is consumed by the NEXT spawn of its agent type, whatever
+  that is, which misattributes a prompt. `dispatch sweep --intents` clears
+  the ones older than `--older-than` (honors `--dry-run`). No consume-side
+  TTL, deliberately: a slow dispatcher's fresh-enough sidecar must keep
+  working.
+
+### The ungraded close is loud, and recoverable
+
+- **In-band announcement.** A SubagentStop that closes a reported dispatch
+  ungraded (nothing runnable at its tier, or every selected check retired)
+  now returns never-suppressed context naming the run, the reason, and the
+  remedy — the same channel the abandonment and no-report terminals use.
+  Context, never a block; the stderr/board/footer surfaces are unchanged.
+  Previously the moment of closure reached the dispatcher only as stderr,
+  and the rows were discovered sessions later.
+- **`dispatch verify --manifest <file>`** — the sanctioned post-hoc grade
+  for a record that never got its contract. Legal only on an UNGRADED
+  dispatch (stuck non-terminal, or terminal-ungraded with `--terminal`)
+  whose own manifest declares no checks; refused when any verdict exists
+  (outcomes on record stay) and when the supplied manifest declares no
+  checks. The record's manifest is never rewritten: the body lands beside it
+  as `post-hoc-manifest.json`, its SHA-256 and file name ride the verdict
+  transition, and the detail says "graded against operator-supplied post-hoc
+  manifest" — stamped `cli-verify` like every out-of-band grade.
+
+### A late artifact is not a false claim (check-grace, field lesson L58)
+
+- **`"grace_stops": N` in the manifest.** A long in-dispatch build failed
+  its late-artifact blocking checks at every intermediate stop and the
+  ladder minted a permanent false `contradicted` → `abandoned` BEFORE the
+  artifact finished (one 8-minute render, three contradicted stops, wrong
+  outcome on record forever). Under an armed gate, the first N failing
+  stops are now blocked **without a verdict** — the block text names the
+  budget position and is flagged `grace: true` in the block meta; the
+  abandonment ladder neither strikes nor resets. Grace exhausted, failures
+  grade `contradicted` exactly as before: the wedge stays bounded at
+  `grace_stops + 3` blocks, and grace defers a verdict, never rewrites one.
+  A disarmed tier ignores grace (that branch must never block — a long
+  build under a disarmed gate still grades `advisory` at its first failing
+  stop), and `dispatch verify` ignores it (an out-of-band grade is the
+  final look). A malformed declaration is ignored with a stderr note, never
+  a nuked manifest.
+- **`reported -> reported` is now legal.** A grace- or pin-drift-blocked
+  retry arrives with the dispatch still at `reported`; refusing the
+  re-report kept the stale first claim as the body on file while the gate
+  graded a newer one. The newest claim wins `report.json`, every attempt
+  survives in `reports/NNN.json`, every hash rides its transition.
+
+### An interim report is not a stall
+
+- **`dispatch report --interim`.** A lane filing a living report mid-flight
+  (report on disk, work continuing) tripped the bridge stop's "reported but
+  never terminated" verify-or-close block prematurely. The flag rides the
+  reported transition; the bridge sweep renders the row as `- [interim
+  report] ...` context instead of blocking, the board face reads `reported
+  (interim)`, and a plain final report or terminal close re-arms the
+  ordinary gating. The watchdog is NOT deferred: silent past
+  `stale_dispatch_minutes` the line escalates to `[STALE interim report]`
+  with the same check-the-agent-now wording — an interim lane that dies is
+  the L55 shape and must not hide behind its flag. Grace and interim each
+  relax a gate, so the pair carries a composed regression test (lesson
+  L25): with both in play a failing final still grades `contradicted` and a
+  genuinely stalled row still blocks.
+
+### Assessed, not built
+
+- **Undrained-inbox signal at stop time (field lesson L61):** hooks cannot
+  see it. The SubagentStop payload carries no mailbox or background-task
+  state, and the harness's queues have no on-disk surface a hook can read —
+  so "refuse a done report while the inbox is non-empty" is a harness
+  feature, not a hook feature, and the mechanization formally stays
+  bridge/harness-side. Written up in the design note so nobody waits on
+  this silently.
+
 ## 0.7.1 — 2026-11-17
 
 The stale-dispatch release. One finding, three recurrences, one deployment:

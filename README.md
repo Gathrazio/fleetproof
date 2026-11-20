@@ -211,16 +211,24 @@ The Stop hook keeps its v0.1 job and adds a ledger sweep. A dispatch that report
 and then never terminated blocks the bridge from stopping: something started
 closing it out and stopped halfway, which is exactly how work goes missing. A
 dispatch still in state `dispatched` is a legitimately running background agent, so
-it is reported and not blocked on.
+it is reported and not blocked on. A dispatch whose last report was filed
+`--interim` (v0.7.2) is a living claim — rendered as context, not blocked on,
+until a final report or close; the stale-silence escalation still covers it.
 
 ### Working with it
 
 ```
 fleetproof dispatch new --prompt "..."        # --prompt-file for a real, long one
 fleetproof dispatch new --agent-name worker \
-    --prompt-file p.md                        # joinable: the next SubagentStop of
-                                              # that spawn name adopts this record
-fleetproof dispatch report <run-id> --report report.json
+    --prompt-file p.md                        # joinable: the SubagentStart of that
+                                              # spawn name adopts this record at
+                                              # spawn (v0.7.2; the stop-side join
+                                              # remains the fallback) — no twin
+fleetproof dispatch report <run-id> --report report.json [--interim]
+                                              # --interim = living report: work
+                                              # continues, the bridge's verify-or-
+                                              # close gate stays un-armed until a
+                                              # final report or close (v0.7.2)
 fleetproof dispatch close <run-id>
 fleetproof dispatch park <run-id> --reason "..."  # terminate on purpose, reason kept
 fleetproof dispatch verify <run-id> [--note "..."]  # grade a stuck non-terminal
@@ -228,6 +236,15 @@ fleetproof dispatch verify <run-id> [--note "..."]  # grade a stuck non-terminal
                                               # SubagentStop was dropped; records
                                               # report/verdict/terminate stamped
                                               # cli-verify (v0.6.1)
+fleetproof dispatch verify <run-id> --terminal --manifest m.json
+                                              # post-hoc contract for a record that
+                                              # never got one (name-mismatched
+                                              # spawn): ungraded records only, own
+                                              # manifest never rewritten (v0.7.2)
+fleetproof dispatch sweep --older-than 2d [--intents]
+                                              # bulk-close stale rows; --intents
+                                              # also clears unconsumed sidecars
+                                              # older than the cutoff (v0.7.2)
 
 fleetproof dispatch intent --agent recon --prompt-file p.md \
     [--manifest m.json] [--tier lane] [--role tester] \
@@ -838,6 +855,16 @@ halves are present with no map (v0.6; the key was parsed and validated since
   }
 }
 ```
+
+A manifest may also declare `"grace_stops": N` (v0.7.2, int >= 1) for work
+whose blocking checks assert on artifacts produced late in a long build: the
+first N stops whose blocking checks fail are blocked *without a verdict* —
+the block text names the budget position, the abandonment ladder neither
+strikes nor resets — and once grace is exhausted, failures grade
+`contradicted` exactly as before (the wedge stays bounded at `grace_stops`
+plus the three-contradiction ladder). Grace defers a verdict; it never
+rewrites one. A disarmed tier ignores it (that branch never blocks), and so
+does the operator's out-of-band `dispatch verify`.
 
 An agent is welcome to propose or edit checks. The guarantee FleetProof makes is
 narrower and firmer than "the agent verified its work": it is that *something

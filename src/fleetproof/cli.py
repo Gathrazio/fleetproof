@@ -106,6 +106,7 @@ from .phase import (
 )
 from .ledger import (
     CAPTURE_CLI,
+    FOOTER_ID_CAP,
     REASON_ABANDONED,
     REASON_OPERATOR_CLOSE,
     REASON_PARKED_PREFIX,
@@ -120,6 +121,7 @@ from .ledger import (
     create_dispatch,
     list_advisory_verdicts,
     list_dispatches,
+    list_intents,
     list_orphan_stops,
     list_ungraded_terminations,
     list_verified_with_advisory_failures,
@@ -1084,12 +1086,18 @@ def _cmd_dispatch_report(args: argparse.Namespace) -> int:
         _emit_error("bad_report", str(e), args.format)
         return 2
     try:
-        record = record_report(args.run_id, payload)
+        record = record_report(args.run_id, payload,
+                               interim=bool(getattr(args, "interim", False)))
     except LedgerError as e:
         _emit_error("ledger_error", str(e), args.format)
         return 1
     if args.format == "json":
         print(json.dumps(record.to_dict(), indent=2))
+    elif getattr(args, "interim", False):
+        print(f"{record.run_id} -> {record.state} (interim — the bridge "
+              "sweep's verify-or-close gate stays un-armed until a final "
+              "report or a terminal close; stale-silence escalation still "
+              "applies)")
     else:
         print(f"{record.run_id} -> {record.state}")
     return 0
@@ -1165,10 +1173,37 @@ def _cmd_dispatch_verify(args: argparse.Namespace) -> int:
     report/verdict/terminate the hook would have, and stamps them ``cli-verify``
     so the trail shows an operator grade, not a live hook grade. See
     :func:`fleetproof.hookgate.verify_dispatch`.
+
+    ``--manifest`` supplies a post-hoc contract for a record that never got
+    one (the name-mismatch capture shape, L34/L51): legal only on an UNGRADED
+    dispatch whose own manifest declares no checks. The record's manifest is
+    never rewritten — the supplied body is written beside it and its hash
+    rides the verdict transition.
     """
+    post_hoc = None
+    if getattr(args, "manifest", None):
+        try:
+            post_hoc = _load_json_file(args.manifest, "manifest")
+        except ValueError as e:
+            _emit_error("bad_manifest", str(e), args.format)
+            return 2
+        inner = post_hoc.get("manifest")
+        if isinstance(inner, dict):
+            post_hoc = inner
+        if not _manifest_keys_ok(post_hoc, args.format):
+            return 2
+        # Strict parse here, where the author is in the seat: a malformed
+        # check must refuse the grade, not get skipped by the tolerant hook
+        # parser into an emptier contract than the operator supplied.
+        try:
+            _manifest_checks_strict(post_hoc)
+        except CheckSpecError as e:
+            _emit_error("bad_manifest_check", str(e), args.format)
+            return 2
     try:
         result = verify_dispatch(args.run_id, note=(args.note or "").strip() or None,
-                                 allow_terminal=bool(args.terminal))
+                                 allow_terminal=bool(args.terminal),
+                                 post_hoc_manifest=post_hoc)
     except LedgerError as e:
         _emit_error("ledger_error", str(e), args.format)
         return 1
@@ -1210,6 +1245,13 @@ def _cmd_dispatch_sweep(args: argparse.Namespace) -> int:
     older than the cutoff — with ``--reason`` as an attributed park
     (``parked: <text>``), without as the machine reason ``sweep-idle``.
     ``--session`` narrows to one session; ``--dry-run`` lists without closing.
+
+    ``--intents`` (0.7.2) extends the sweep to unconsumed intent sidecars
+    older than the same cutoff: a stale sidecar is consumed by the NEXT
+    spawn of its agent type, whatever that spawn is, so it misattributes a
+    prompt — worse than losing it. Deleted (listed under ``--dry-run``),
+    never a TTL on the consume side: a slow dispatcher's fresh-enough
+    sidecar must keep working.
     """
     cutoff = datetime.now(timezone.utc) - args.older_than
     swept: list[str] = []
@@ -1244,15 +1286,51 @@ def _cmd_dispatch_sweep(args: argparse.Namespace) -> int:
                 print(f"[fleetproof] telemetry build failed for {record.run_id}: {e}",
                       file=sys.stderr)
         swept.append(record.run_id)
+    intents_swept: list[str] = []
+    intents_young = 0
+    if getattr(args, "intents", False):
+        for intent in list_intents():
+            created = None
+            if intent.get("created_at"):
+                try:
+                    created = datetime.fromisoformat(str(intent["created_at"]))
+                except ValueError:
+                    created = None
+            if created is not None and created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            # Undatable reads as stale, same posture as the dispatch rows:
+            # a sidecar whose created_at decayed is exactly the kind the
+            # sweep exists to clear.
+            if created is not None and created >= cutoff:
+                intents_young += 1
+                continue
+            if not args.dry_run:
+                try:
+                    Path(intent["path"]).unlink()
+                except OSError as e:
+                    print(f"[fleetproof] could not remove intent "
+                          f"{intent['file']}: {e}", file=sys.stderr)
+                    continue
+            intents_swept.append(intent["file"])
     if args.format == "json":
-        print(json.dumps({"swept": swept, "skipped_young": skipped_young,
-                          "dry_run": bool(args.dry_run)}, indent=2))
+        payload = {"swept": swept, "skipped_young": skipped_young,
+                   "dry_run": bool(args.dry_run)}
+        if getattr(args, "intents", False):
+            payload["intents_swept"] = intents_swept
+            payload["intents_skipped_young"] = intents_young
+        print(json.dumps(payload, indent=2))
         return 0
     prefix = "DRY RUN — would sweep" if args.dry_run else "Swept"
     print(f"{prefix} {len(swept)} dispatch(es); {skipped_young} younger than "
           "the cutoff left alone.")
     for run_id in swept:
         print(f"  {run_id}")
+    if getattr(args, "intents", False):
+        verb = "would remove" if args.dry_run else "removed"
+        print(f"intent sidecars: {verb} {len(intents_swept)} unconsumed; "
+              f"{intents_young} younger than the cutoff left alone.")
+        for name in intents_swept:
+            print(f"  {name}")
     return 0
 
 
@@ -1556,6 +1634,24 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
     # finding-1a surface — and the session's stop-block budget, when spent.
     warn_verified = list_verified_with_advisory_failures(scope_session)
     warn_line = advisory_failure_line(warn_verified, scope_known=bool(scope_session))
+    # Unconsumed intent sidecars (0.7.2 hygiene): repo-global, not
+    # session-scoped — a sidecar is consumed by the NEXT spawn of its agent
+    # type from ANY session, which is exactly why a stale one is a hazard
+    # worth a footer line.
+    intents = list_intents()
+    intents_line = None
+    if intents:
+        shown = ", ".join(
+            f"{i['file']} (age {_format_age(i.get('created_at'))})"
+            for i in intents[:FOOTER_ID_CAP])
+        extra_intents = len(intents) - FOOTER_ID_CAP
+        if extra_intents > 0:
+            shown += f", +{extra_intents} more"
+        intents_line = (
+            f"{len(intents)} unconsumed intent sidecar(s) — {shown}. The next "
+            "spawn of each agent type consumes its sidecar, whatever that "
+            "spawn is; a stale intent misattributes a prompt. Clear: "
+            "fleetproof dispatch sweep --older-than <N>h --intents")
     budget = stop_block_status(scope_session)
     budget_line = None
     if budget and budget["exhausted"]:
@@ -1590,6 +1686,7 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
                 {"run_id": r.run_id, "advisory_failures": r.advisory_failures}
                 for r in warn_verified
             ],
+            "unconsumed_intents": intents,
         }
         if budget:
             payload["stop_block_budget"] = budget
@@ -1612,6 +1709,8 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
             print(advisory_line)
         if warn_line:
             print(warn_line)
+        if intents_line:
+            print(intents_line)
         if budget_line:
             print(budget_line)
         return 0
@@ -1652,6 +1751,11 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
         print("no-report! = closed after 3 empty-message stops; the agent went "
               "idle without ever reporting and the work was never verified. "
               "Re-dispatch, park, or `dispatch verify <run_id> --terminal`.")
+    if "reported (interim)" in labels:
+        print("reported (interim) = a living report is on file and the work "
+              "continues; the bridge's verify-or-close gate stays un-armed "
+              "until a final report or a terminal close (stale-silence "
+              "escalation still applies).")
     if any(verdict_label(r) == "verified*" for r in records):
         print("verified* = verified while one or more advisory (block:false) "
               "check(s) FAILED — the verdict stands; read the failing ids in "
@@ -1686,6 +1790,8 @@ def _cmd_fleet(args: argparse.Namespace) -> int:
         print(advisory_line)
     if warn_line:
         print(warn_line)
+    if intents_line:
+        print(intents_line)
     if budget_line:
         print(budget_line)
     return 0
@@ -2093,7 +2199,13 @@ def build_parser() -> argparse.ArgumentParser:
         "intent",
         help="Write the dispatch-intent sidecar for the next spawn of one agent type.")
     p_dint.add_argument("--agent", required=True,
-                        help="The agent_type the harness will report for the spawn.")
+                        help="The agent_type the harness will report for the "
+                             "spawn — THE MATCH KEY. A spawn given a name: "
+                             "parameter reports the NAME as agent_type, not "
+                             "the subagent_type, so for named spawns pass "
+                             "the spawn name here (or add --role <name>); an "
+                             "intent keyed by archetype never matches a "
+                             "named spawn.")
     p_dint.add_argument("--prompt-file", required=True,
                         help="File holding the dispatch prompt, verbatim.")
     p_dint.add_argument("--manifest", default=None,
@@ -2131,6 +2243,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_drep = dsub.add_parser("report", help="Record what a dispatched agent claimed.")
     p_drep.add_argument("run_id")
     p_drep.add_argument("--report", required=True, help="JSON file holding the report.")
+    p_drep.add_argument(
+        "--interim", action="store_true",
+        help="Flag this as a LIVING report: the body is on file, the work "
+             "continues, and the bridge stop's verify-or-close gate stays "
+             "un-armed until a plain (final) report or a terminal close. "
+             "The stale-silence escalation still applies — an interim lane "
+             "that goes quiet escalates like any other.")
     _add_format(p_drep)
     p_drep.set_defaults(func=_cmd_dispatch_report)
 
@@ -2189,6 +2308,16 @@ def build_parser() -> argparse.ArgumentParser:
              "('reopened: true' on the transition), grades, and closes. A "
              "terminal dispatch WITH a verdict is still refused: outcomes on "
              "record stay.")
+    p_dverify.add_argument(
+        "--manifest", default=None,
+        help="Supply a post-hoc contract (JSON manifest file with checks) "
+             "for a record that never got one — the name-mismatched-spawn "
+             "shape, where the capture was manifest-less and the grade had "
+             "nothing runnable. Legal only on an UNGRADED dispatch whose own "
+             "manifest declares no checks; the record's manifest is never "
+             "rewritten (the body lands beside it as post-hoc-manifest.json, "
+             "its SHA-256 on the verdict transition). A dispatch with a "
+             "verdict is refused: outcomes on record stay.")
     _add_format(p_dverify)
     p_dverify.set_defaults(func=_cmd_dispatch_verify)
 
@@ -2208,6 +2337,11 @@ def build_parser() -> argparse.ArgumentParser:
                                "(recorded as 'parked: <reason>').")
     p_dsweep.add_argument("--dry-run", action="store_true",
                           help="List what would be swept; close nothing.")
+    p_dsweep.add_argument(
+        "--intents", action="store_true",
+        help="Also remove unconsumed intent sidecars older than the cutoff. "
+             "A stale sidecar is consumed by the NEXT spawn of its agent "
+             "type, whatever that spawn is — it misattributes a prompt.")
     _add_format(p_dsweep)
     p_dsweep.set_defaults(func=_cmd_dispatch_sweep)
 

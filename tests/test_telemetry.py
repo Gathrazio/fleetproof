@@ -593,7 +593,9 @@ def test_subagent_gate_empty_selection_writes_unverifiable(tmp_path, monkeypatch
     decision, code = subagent_stop({
         "agent_id": "a1", "agent_type": "tester",
         "last_assistant_message": "Done."})
-    assert decision is None and code == 0
+    # 0.7.2: the ungraded close is announced as context — never a block.
+    assert code == 0 and "decision" not in decision
+    assert "closed UNGRADED" in decision["hookSpecificOutput"]["additionalContext"]
     d = list_dispatches()[0]
     t = load_telemetry(d.run_id)
     assert t["outcome.class"] == CLASS_UNVERIFIABLE

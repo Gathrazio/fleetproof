@@ -39,9 +39,11 @@ everything here is designed to fail open around the gaps):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
+from dataclasses import replace as _dataclass_replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -79,6 +81,7 @@ from .ledger import (
     STATE_ADVISORY,
     STATE_CONTRADICTED,
     STATE_DISPATCHED,
+    STATE_REPORTED,
     STATE_VERIFIED,
     TIER_BRIDGE,
     TIER_COORDINATOR,
@@ -89,11 +92,16 @@ from .ledger import (
     advisory_failure_line,
     advisory_verdict_line,
     close_dispatch,
+    coerce_manifest,
     consume_intent,
     create_dispatch,
+    find_dispatch_for_start,
     find_dispatch_for_stop,
     find_inheritable_intent,
+    intent_path,
     intents_dir,
+    MANIFEST_GRACE_KEY,
+    manifest_grace_stops,
     list_advisory_verdicts,
     list_dispatches,
     list_ungraded_terminations,
@@ -539,13 +547,24 @@ def _failure_reason(report) -> str:
 
 def ledger_sweep(
     session_id: str | None,
-) -> tuple[list[DispatchRecord], list[DispatchRecord], list[DispatchRecord]]:
-    """Return ``(stalled, retrying, in_fleet)`` dispatch records for a session.
+) -> tuple[list[DispatchRecord], list[DispatchRecord], list[DispatchRecord],
+           list[DispatchRecord]]:
+    """Return ``(stalled, retrying, in_fleet, interim)`` dispatch records for a session.
 
     *stalled* — a dispatch that reported (or was graded) and then never terminated.
     Something started closing it out and stopped halfway, which is exactly the
     quiet half-finished state this tool exists to surface, so the bridge is blocked
     on it.
+
+    *interim* — at ``reported``, but the last report was filed with
+    ``dispatch report --interim``: a living claim, the work continues, and
+    the verify-or-close expectation is deliberately NOT armed yet (0.7.2;
+    a lane filing a living report mid-flight read as a stop-gate violation
+    before its completion message existed — a field dogfood finding).
+    Context, never a block — but the stale escalation still covers it: an
+    interim lane that goes silent is exactly the L55 shape and must not
+    hide behind its flag. A graded-but-unclosed dispatch (verified/advisory)
+    is never interim: a verdict ends the living-report phase.
 
     *retrying* — in state ``contradicted``: the gate blocked its stop and the
     agent has its turn back to fix the failure. That is the retry loop working,
@@ -564,18 +583,22 @@ def ledger_sweep(
     escalate instead of hiding in a passive list (GCC lesson L55).
     """
     if not session_id:
-        return [], [], []
+        return [], [], [], []
     stalled: list[DispatchRecord] = []
     retrying: list[DispatchRecord] = []
     in_fleet: list[DispatchRecord] = []
+    interim: list[DispatchRecord] = []
     for record_obj in list_dispatches(session_id=session_id, non_terminal_only=True):
         if record_obj.state == STATE_DISPATCHED:
             in_fleet.append(record_obj)
         elif record_obj.state == STATE_CONTRADICTED:
             retrying.append(record_obj)
+        elif (record_obj.state == STATE_REPORTED
+              and record_obj.last_report_interim):
+            interim.append(record_obj)
         else:
             stalled.append(record_obj)
-    return stalled, retrying, in_fleet
+    return stalled, retrying, in_fleet, interim
 
 
 def _stalled_reason(stalled: list[DispatchRecord]) -> str:
@@ -624,6 +647,7 @@ def _ledger_context(
     stalled: list[DispatchRecord],
     retrying: list[DispatchRecord],
     in_fleet: list[DispatchRecord],
+    interim: list[DispatchRecord] | None = None,
     now: datetime | None = None,
 ) -> str | None:
     """Operator-facing ledger summary, or None when this session has no dispatches.
@@ -648,6 +672,23 @@ def _ledger_context(
     for record_obj in retrying:
         parts.append(f"- [in retry] {record_obj.run_id}: contradicted, awaiting the "
                      f"agent's fixed report{_silence_suffix(record_obj, now)}")
+    for record_obj in (interim or []):
+        minutes = _silence_minutes(record_obj, now)
+        # Same escalation rule as [STALE in fleet]: strictly past the
+        # threshold, known age only. An interim report defers the
+        # verify-or-close gate, not the watchdog — a lane that filed a
+        # living report and then died is the L55 shape wearing a flag.
+        if threshold > 0 and minutes is not None and minutes > threshold:
+            parts.append(
+                f"- [STALE interim report] {record_obj.run_id}: interim report "
+                f"filed, then no ledger event for {minutes} min (threshold "
+                f"{threshold}) — check the agent now: verify deliverables on "
+                "disk, nudge it, or take the work over")
+        else:
+            parts.append(
+                f"- [interim report] {record_obj.run_id}: interim report "
+                "filed, work continues — verify-or-close not armed until a "
+                f"final report or close{_silence_suffix(record_obj, now)}")
     for record_obj in in_fleet:
         minutes = _silence_minutes(record_obj, now)
         # Strictly past the threshold: an agent silent for exactly the
@@ -803,7 +844,7 @@ def stop_gate() -> tuple[dict[str, Any] | None, int]:
     reason, context = _spec_gate()
 
     session_id = os.environ.get(SESSION_ID_ENV)
-    stalled, retrying, in_fleet = ledger_sweep(session_id)
+    stalled, retrying, in_fleet, interim = ledger_sweep(session_id)
     if stalled:
         stalled_reason = _stalled_reason(stalled)
         reason = f"{reason} {stalled_reason}" if reason else stalled_reason
@@ -811,7 +852,8 @@ def stop_gate() -> tuple[dict[str, Any] | None, int]:
     _announce_advisory_verdicts(session_id)
     _announce_advisory_failures(session_id)
 
-    context_parts = [p for p in (context, _ledger_context(stalled, retrying, in_fleet)) if p]
+    context_parts = [p for p in (
+        context, _ledger_context(stalled, retrying, in_fleet, interim)) if p]
 
     never_suppress = False
     if reason is None:
@@ -1044,6 +1086,49 @@ _NO_REPORT_CONTEXT = (
     "(terminate reason no-report-after-3-blocks). Re-dispatch it, park it, or "
     "grade it out of band (`fleetproof dispatch verify {run_id} --terminal`).")
 
+# The in-band half of the ungraded-close announcement (0.7.2). The close
+# itself was always honest — board column, footer line, bridge-stop stderr —
+# but the MOMENT a reported dispatch closed with no verdict reached the
+# dispatcher only as stderr nobody is required to read, and the field's
+# terminated-ungraded rows (the L27 session-0070 shape; twice more in one
+# later session) were discovered sessions later. Same posture as the
+# abandonment and no-report notices: context, never a block, never
+# suppressed on a stop-hook continuation.
+_UNGRADED_CLOSE_CONTEXT = (
+    "[FLEETPROOF] dispatch {run_id} closed UNGRADED — {why}. A claim was "
+    "recorded and closed with no verdict; an absent grade is not a passing "
+    "grade. Verify the work first-hand, or grade it out of band: `fleetproof "
+    "dispatch verify {run_id} --terminal{manifest_flag}`.{miss}")
+
+_INTENT_MISS_CONTEXT = (
+    " At spawn, {n} unconsumed intent sidecar(s) existed ({names}) but none "
+    "matched agent_type '{agent_type}' — named spawns report the NAME as "
+    "agent_type; register the intent with `dispatch intent --agent "
+    "<spawn-name>` (or --role <spawn-name>).")
+
+
+def _ungraded_close_context(dispatch, why: str) -> dict[str, Any]:
+    """The never-suppressed context decision for a stop that closes ungraded."""
+    manifest_checks = (dispatch.manifest or {}).get("checks") or []
+    manifest_flag = "" if manifest_checks else " --manifest <file>"
+    miss = ""
+    if isinstance(dispatch.intent_miss, dict):
+        names = [str(x) for x in
+                 (dispatch.intent_miss.get("sidecars_present") or [])]
+        if names:
+            agent_type = (dispatch.agent or {}).get("agent_type") or "unknown"
+            miss = _INTENT_MISS_CONTEXT.format(
+                n=len(names), names=", ".join(names), agent_type=agent_type)
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "SubagentStop",
+            "additionalContext": _UNGRADED_CLOSE_CONTEXT.format(
+                run_id=dispatch.run_id, why=why, manifest_flag=manifest_flag,
+                miss=miss),
+        },
+        _NEVER_SUPPRESS_KEY: True,
+    }
+
 # Internal marker on a decision dict whose context must reach the transcript
 # even on a stop-hook continuation: the abandonment notice is the loop's
 # terminus and the dispatcher's only signal, so _suppress_on_retry must not
@@ -1089,14 +1174,43 @@ def capture_subagent_start(payload: dict[str, Any]) -> str:
     Degradations (malformed intent, malformed manifest, bad tier) are surfaced
     on stderr and in the manifest notes, never fatal — this runs inside a
     hook that must not break the spawn.
+
+    Before any of that, the capture tries to JOIN a waiting CLI dispatch
+    (``dispatch new --agent-name``, 0.7.2): the dispatcher already recorded
+    this spawn, so minting a second record forked the ledger — the CLI row
+    and the hook row described one spawn and one had to be parked by hand
+    (two forked pairs in one field session). A unique match adopts the
+    agent_id now and nothing new is created; a matching intent sidecar is
+    deliberately LEFT UNCONSUMED (the CLI record already carries its
+    contract) with a warning, so the hygiene surfaces clear it instead of a
+    later unrelated spawn eating it.
     """
     agent_id, agent_type = _agent_fields(payload)
+    joined, join_notes = find_dispatch_for_start(
+        os.environ.get(SESSION_ID_ENV), agent_id, agent_type)
+    for note in join_notes:
+        sys.stderr.write(f"[fleetproof] {note}\n")
+    if joined is not None:
+        sys.stderr.write(
+            f"[fleetproof] spawn of '{agent_type}' joined CLI-created dispatch "
+            f"{joined.run_id} (dispatch new --agent-name) — no duplicate "
+            "record captured\n")
+        leftover = intent_path(agent_type)
+        if leftover is not None and leftover.exists():
+            sys.stderr.write(
+                f"[fleetproof] intent sidecar {leftover.name} was NOT consumed "
+                "(the joined CLI dispatch already carries its contract) — "
+                "clear it (`fleetproof dispatch sweep --older-than ... "
+                "--intents`) or the next spawn of this agent type will "
+                "consume it\n")
+        return joined.run_id
     intent, notes = consume_intent(agent_type)
     for note in notes:
         sys.stderr.write(f"[fleetproof] {note}\n")
     inherited_from: str | None = None
     inherited_from_state: str | None = None
     inherited_from_verdict: str | None = None
+    intent_miss: dict[str, Any] | None = None
     if intent is None and not notes:
         source = find_inheritable_intent(os.environ.get(SESSION_ID_ENV), agent_type)
         if source is not None:
@@ -1137,12 +1251,31 @@ def capture_subagent_start(payload: dict[str, Any]) -> str:
             # in this session to inherit. Said loudly, because the silent
             # version of this is a placeholder prompt and a defaulted tier
             # that nobody notices until the verdicts are worthless (observed
-            # in a field deployment on Windows).
-            sys.stderr.write(
-                f"[fleetproof] no intent matched spawn '{agent_type or 'unknown'}' "
-                "— captured with placeholder prompt at defaulted tier "
-                f"'{CAPTURED_SUBAGENT_TIER}'. Sidecars present: "
-                f"{_sidecar_listing()}.\n")
+            # in a field deployment on Windows). When unconsumed sidecars DO
+            # sit on disk, this is almost always the name-mismatch shape
+            # (L34/L51: a named spawn reports its NAME as agent_type, so an
+            # archetype-keyed sidecar never matches) — the miss is stamped on
+            # the record (``intent_miss``) so the STOP can say so in-band
+            # when the manifest-less dispatch closes ungraded, and the stderr
+            # line states the match-key rule now.
+            present = _sidecar_names()
+            if present:
+                intent_miss = {"sidecars_present": present}
+                sys.stderr.write(
+                    f"[fleetproof] no intent matched spawn "
+                    f"'{agent_type or 'unknown'}' while {len(present)} "
+                    f"unconsumed sidecar(s) exist ({', '.join(present)}) — "
+                    "likely a name-mismatch: a named spawn reports its NAME "
+                    "as agent_type; register the intent with --agent "
+                    "<spawn-name> or --role <spawn-name>. Captured with "
+                    "placeholder prompt at defaulted tier "
+                    f"'{CAPTURED_SUBAGENT_TIER}'.\n")
+            else:
+                sys.stderr.write(
+                    f"[fleetproof] no intent matched spawn "
+                    f"'{agent_type or 'unknown'}' — captured with placeholder "
+                    "prompt at defaulted tier "
+                    f"'{CAPTURED_SUBAGENT_TIER}'. Sidecars present: none.\n")
     prompt = intent["prompt"] if intent else _placeholder_prompt(agent_type)
     manifest = intent["manifest"] if intent else None
     intent_tier = intent["tier"] if intent else None
@@ -1166,17 +1299,17 @@ def capture_subagent_start(payload: dict[str, Any]) -> str:
         inherited_from=inherited_from,
         inherited_from_state=inherited_from_state,
         inherited_from_verdict=inherited_from_verdict,
+        intent_miss=intent_miss,
         by="hook",
     )
 
 
-def _sidecar_listing() -> str:
-    """The intent files currently on disk, or 'none' — for the miss note."""
+def _sidecar_names() -> list[str]:
+    """The intent files currently on disk, sorted — for the miss note/stamp."""
     try:
-        names = sorted(p.name for p in intents_dir().glob("*.json"))
+        return sorted(p.name for p in intents_dir().glob("*.json"))
     except OSError:
-        names = []
-    return ", ".join(names) if names else "none"
+        return []
 
 
 def subagent_start_main() -> int:
@@ -1483,7 +1616,11 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
             "no report was recorded.",
         ), 0
 
-    if dispatch.state in (STATE_DISPATCHED, STATE_CONTRADICTED):
+    if dispatch.state in (STATE_DISPATCHED, STATE_CONTRADICTED, STATE_REPORTED):
+        # STATE_REPORTED included since 0.7.2 (reported -> reported is legal):
+        # a grace- or pin-drift-blocked retry arrives with the dispatch still
+        # at reported, and skipping the re-record kept the stale first claim
+        # as the body on file while this stop graded a newer one.
         record_report(
             dispatch.run_id,
             {"summary": last_message, "source": "last_assistant_message"},
@@ -1550,7 +1687,10 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
             check_report=CheckReport(spec_sha256=spec_hash(), tier=dispatch.tier),
             checks=[],
         )
-        return None, 0
+        return _ungraded_close_context(
+            dispatch,
+            f"nothing runnable at tier {dispatch.tier} (no repo check selects "
+            "this tier and the manifest declares none)"), 0
 
     if spec_pin_drift:
         return _block_dispatch(
@@ -1594,7 +1734,10 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
             check_report=CheckReport(spec_sha256=spec_hash(), tier=dispatch.tier,
                                      retired=retired),
             checks=[])
-        return None, 0
+        return _ungraded_close_context(
+            dispatch,
+            f"every check selected at tier {dispatch.tier} is retired "
+            f"({listed})"), 0
 
     # Read before the checker runs so the outstanding-upgrade fact lands on
     # the persisted verdict record itself (output.json), not just on stderr.
@@ -1639,6 +1782,37 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
         return None, 0
     if report.blocking_failures:
         failing_ids = "; ".join(r.id for r in report.blocking_failures)
+        # Check-grace (0.7.2, lesson L58): a dispatch whose manifest declares
+        # ``grace_stops: N`` gets its first N failing-blocking stops blocked
+        # WITHOUT a verdict — a long in-dispatch build fails its late-artifact
+        # checks at every intermediate stop, and under the plain ladder that
+        # minted a permanent false ``contradicted`` (then ``abandoned``)
+        # BEFORE the artifact finished. The grace block draws no contradiction
+        # (the ladder neither strikes nor resets) and is marked on the block
+        # meta (``grace: true``), so the total wedge stays bounded at
+        # grace_stops + MAX_CONTRADICTIONS blocks. Armed tiers only: the
+        # advisory branch above must never block, so grace never reaches it —
+        # a long build under a disarmed gate still grades ``advisory`` at its
+        # first failing stop, unchanged. Grace defers a verdict; it never
+        # rewrites one.
+        grace = manifest_grace_stops(dispatch.manifest)
+        if grace == 0 and MANIFEST_GRACE_KEY in (dispatch.manifest or {}):
+            sys.stderr.write(
+                f"[fleetproof] dispatch {dispatch.run_id} declares "
+                f"'{MANIFEST_GRACE_KEY}' but the value is not an int >= 1 — "
+                "ignored; failures grade immediately\n")
+        if grace > 0:
+            used = dispatch.grace_blocks_used
+            if used < grace:
+                reason = _grace_block_reason(report, used + 1, grace)
+                try:
+                    record_block(dispatch.run_id, reason,
+                                 checker_run_id=report.run_id, grace=True)
+                except (LedgerError, OSError) as e:
+                    sys.stderr.write(
+                        f"[fleetproof] could not record grace block on "
+                        f"{dispatch.run_id}: {e}\n")
+                return _subagent_block(reason, _evidence_context(report)), 0
         prior_contradictions = sum(
             1 for t in dispatch.transitions
             if isinstance(t, dict) and t.get("state") == STATE_CONTRADICTED)
@@ -1705,6 +1879,32 @@ def subagent_stop(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     return None, 0
 
 
+def _grace_block_reason(report, used: int, grace: int) -> str:
+    """The check-grace block text: a refusal that is explicitly NOT a verdict.
+
+    Leads with the gate marker like every block, names the budget position
+    (``used`` is the stop being consumed now, 1-based) and the failing ids,
+    and says what happens when grace runs out — the agent mid-build must know
+    the deferral is bounded, and the dispatcher reading ``blocks/`` later must
+    be able to tell a grace block from a contradiction block without the meta.
+    """
+    failing = report.blocking_failures
+    header = _capped(
+        f"Check-grace stop {used} of {grace} consumed — "
+        f"{len(failing)}/{report.total} blocking check(s) failed: "
+        + "; ".join(f"{r.id} ({r.detail})" for r in failing) + ".",
+        _FAILURE_HEADER_CAP,
+    )
+    return "\n".join([
+        GATE_BLOCK_MARKER,
+        header,
+        "NO verdict was recorded: this dispatch declared grace_stops for "
+        "late-produced artifacts. Finish the work and stop again when the "
+        "artifact exists. After grace is exhausted, a failing blocking check "
+        "grades contradicted (permanent).",
+    ])
+
+
 def _verified_detail(report, tier: str | None) -> tuple[str, dict[str, Any] | None]:
     """``(detail, extra)`` for a verified verdict, carrying advisory failures.
 
@@ -1743,8 +1943,15 @@ def subagent_stop_main() -> int:
     return code
 
 
+# Where the post-hoc contract body lands inside the dispatch's run dir. The
+# dispatch.json manifest is never touched: it records what was in force at
+# spawn (nothing), and the grade must say what it was ACTUALLY graded against.
+POST_HOC_MANIFEST_FILENAME = "post-hoc-manifest.json"
+
+
 def verify_dispatch(
     run_id: str, note: str | None = None, allow_terminal: bool = False,
+    post_hoc_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Grade a stuck non-terminal dispatch out of band, as SubagentStop would.
 
@@ -1767,11 +1974,47 @@ def verify_dispatch(
     re-graded — only its missing ``terminated`` close is written, since the
     state machine forbids a second verdict from there.
 
+    ``post_hoc_manifest`` (0.7.2) is the sanctioned recovery for a record
+    that never got its contract: a name-mismatched spawn (L34/L51) captures
+    manifest-less, closes ungraded with nothing runnable, and even
+    ``--terminal`` could only re-close it ungraded — the field's two
+    session-0082 terminated-ungraded rows had to be graded by hand in session
+    notes. The supplied manifest's checks are graded exactly as manifest
+    checks always are, but the record's own manifest is never rewritten: the
+    body is written beside it (``post-hoc-manifest.json``) and the verdict
+    transition carries its SHA-256, so the trail says the contract arrived
+    after the fact and from whom (``cli-verify``). Guardrails: refused when
+    the dispatch already carries ANY verdict (outcomes stay), when its own
+    manifest already declares checks (a dispatch with a contract is graded
+    against it, never a substitute), or when the supplied manifest declares
+    no checks (nothing to grade is not a grade).
+
     Returns ``{run_id, verdict, detail, graded, already_graded}``.
     """
     dispatch = load_dispatch(run_id)
     if dispatch is None:
         raise LedgerError(f"No dispatch record for run {run_id!r}.")
+
+    post_hoc_coerced: dict[str, Any] | None = None
+    if post_hoc_manifest is not None:
+        # All refusals up front, before reopen_for_verify writes anything:
+        # a refused grade must leave the record byte-identical.
+        if dispatch.verdict is not None:
+            raise LedgerError(
+                f"Dispatch {run_id} already carries a verdict "
+                f"({dispatch.verdict}); a post-hoc manifest grades UNGRADED "
+                "records only — outcomes on record stay.")
+        if (dispatch.manifest or {}).get("checks"):
+            raise LedgerError(
+                f"Dispatch {run_id} already declares manifest checks; it is "
+                "graded against its own contract, never a substitute. Omit "
+                "--manifest.")
+        post_hoc_coerced = coerce_manifest(post_hoc_manifest)
+        if not post_hoc_coerced.get("checks"):
+            raise LedgerError(
+                "The supplied post-hoc manifest declares no checks — there "
+                "is nothing to grade with. Declare at least one check.")
+
     if dispatch.is_terminal:
         if not allow_terminal:
             hint = ""
@@ -1824,7 +2067,22 @@ def verify_dispatch(
         checks = load_checks()
     except CheckSpecError:
         checks = []
-    runnable = _runnable_checks(dispatch, checks)
+    graded_against = dispatch
+    post_hoc_extra: dict[str, Any] | None = None
+    if post_hoc_coerced is not None:
+        # The grade selects off the supplied contract; the record's own
+        # manifest stays untouched on disk. Canonical-JSON hash, same scheme
+        # as report_content_hash, so the stamped digest is reproducible from
+        # the written body.
+        canonical = json.dumps(post_hoc_coerced, sort_keys=True,
+                               separators=(",", ":"), default=str)
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        (dispatch.run_dir / POST_HOC_MANIFEST_FILENAME).write_text(
+            json.dumps(post_hoc_coerced, indent=2) + "\n", encoding="utf-8")
+        graded_against = _dataclass_replace(dispatch, manifest=post_hoc_coerced)
+        post_hoc_extra = {"post_hoc_manifest_sha256": digest,
+                          "post_hoc_manifest_file": POST_HOC_MANIFEST_FILENAME}
+    runnable = _runnable_checks(graded_against, checks)
     active, retired = apply_phase(runnable, session_id)
 
     if not active:
@@ -1869,6 +2127,13 @@ def verify_dispatch(
     else:
         verdict = STATE_VERIFIED
         detail, extra = _verified_detail(report, dispatch.tier)
+
+    if post_hoc_extra is not None:
+        # The stamp rides the verdict transition, and the prose says it too:
+        # a reader skimming the detail must not mistake a post-hoc grade for
+        # one against a contract that was in force at spawn.
+        detail += " (graded against operator-supplied post-hoc manifest)"
+        extra = dict(extra or {}, **post_hoc_extra)
 
     record_verdict(run_id, verdict, detail=detail, by=BY_CLI_VERIFY, extra=extra)
     close_dispatch(run_id, by=BY_CLI_VERIFY)

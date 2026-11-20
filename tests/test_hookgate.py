@@ -471,7 +471,14 @@ def test_empty_tier_selection_terminates_without_a_verdict(tmp_path, monkeypatch
 
     _feed(monkeypatch, _stop_payload())
     assert subagent_stop_main() == 0
-    assert capsys.readouterr().out == ""
+    # 0.7.2: the ungraded close is announced in-band — context, never a block
+    # (the field's terminated-ungraded rows were discovered sessions later
+    # off stderr nobody is required to read).
+    decision = json.loads(capsys.readouterr().out)
+    assert "decision" not in decision  # the stop is still allowed
+    context = decision["hookSpecificOutput"]["additionalContext"]
+    assert "closed UNGRADED" in context
+    assert "nothing runnable" in context
 
     d = list_dispatches()[0]
     assert d.state == "terminated"
@@ -545,7 +552,11 @@ def test_pin_drift_does_not_block_a_tier_with_nothing_to_grade(
     _feed(monkeypatch, _stop_payload(message="Coordinated; nothing gradeable here."))
     assert subagent_stop_main() == 0
     captured = capsys.readouterr()
-    assert captured.out == ""  # the stop is allowed
+    # The stop is allowed (no block decision); 0.7.2 announces the ungraded
+    # close as context, and the drift is still said out loud on stderr.
+    decision = json.loads(captured.out)
+    assert "decision" not in decision
+    assert "closed UNGRADED" in decision["hookSpecificOutput"]["additionalContext"]
     assert "drift" in captured.err  # but the drift is still said out loud
 
     d = list_dispatches()[0]
@@ -648,7 +659,9 @@ def test_tree_drift_with_nothing_runnable_allows_the_stop_ungraded(
     _feed(monkeypatch, _stop_payload(message="Coordinated; nothing gradeable here."))
     assert subagent_stop_main() == 0
     captured = capsys.readouterr()
-    assert captured.out == ""
+    decision = json.loads(captured.out)
+    assert "decision" not in decision  # allowed; 0.7.2 announces the close
+    assert "closed UNGRADED" in decision["hookSpecificOutput"]["additionalContext"]
     assert "drift" in captured.err
 
     d = list_dispatches()[0]
@@ -1871,7 +1884,8 @@ def test_cli_dispatch_with_a_manifest_is_an_inheritance_source(tmp_path, monkeyp
     # verified, then was re-messaged. A CLI dispatch that supplied a manifest
     # carried a contract; one with a bare prompt (derived manifest) did not.
     from fleetproof.hookgate import subagent_start_main
-    from fleetproof.ledger import CAPTURE_CLI, create_dispatch, list_dispatches
+    from fleetproof.ledger import (
+        CAPTURE_CLI, close_dispatch, create_dispatch, list_dispatches)
     _setup_project(tmp_path, [_LANE_PASS], monkeypatch)
     monkeypatch.setenv(runlog.SESSION_ID_ENV, "sess-fleet")
     with_manifest = create_dispatch(
@@ -1880,6 +1894,12 @@ def test_cli_dispatch_with_a_manifest_is_an_inheritance_source(tmp_path, monkeyp
     bare = create_dispatch(
         "bare work", tier="lane",
         agent={"agent_type": "cli-bare", "agent_id": None, "capture": CAPTURE_CLI})
+    # Both CLI records are CLOSED before the spawns: an OPEN CLI record is
+    # joined at SubagentStart since 0.7.2 (the fork fix) — inheritance is for
+    # the re-message of a lane that already finished, which is the field case
+    # this test pins.
+    close_dispatch(with_manifest)
+    close_dispatch(bare)
 
     _feed(monkeypatch, _start_payload(agent_id="agent-9", agent_type="cli-lane"))
     subagent_start_main()

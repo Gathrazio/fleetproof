@@ -135,8 +135,14 @@ STATE_TERMINATED = "terminated"
 # not enforce that agents die politely.
 _ALLOWED_NEXT: dict[str, frozenset[str]] = {
     STATE_DISPATCHED: frozenset({STATE_REPORTED, STATE_TERMINATED}),
-    STATE_REPORTED: frozenset({STATE_VERIFIED, STATE_CONTRADICTED, STATE_ADVISORY,
-                               STATE_TERMINATED}),
+    # reported -> reported is legal (0.7.2): a dispatch may re-report before
+    # any verdict. A grace-blocked or pin-drift-blocked retry lands on a
+    # dispatch still at ``reported``, and refusing the re-report kept the
+    # STALE first claim as the body on file while the transitions hashed a
+    # claim that was never written (the per-attempt ``reports/NNN.json``
+    # history keeps every body, so nothing is lost to the overwrite).
+    STATE_REPORTED: frozenset({STATE_REPORTED, STATE_VERIFIED, STATE_CONTRADICTED,
+                               STATE_ADVISORY, STATE_TERMINATED}),
     STATE_VERIFIED: frozenset({STATE_TERMINATED}),
     STATE_ADVISORY: frozenset({STATE_TERMINATED}),
     # Back to reported: the gate blocked this agent's stop, so the retry lands on
@@ -356,6 +362,14 @@ class DispatchRecord:
     # verdict means "stamped, and no verdict existed", which is different.
     inherited_from_state: str | None = None
     inherited_from_verdict: str | None = None
+    # The intent-miss stamp (0.7.2): written at capture when a spawn matched
+    # no sidecar WHILE unconsumed sidecars sat on disk — the L34/L51 shape
+    # (a named spawn reports its NAME as agent_type, so the archetype-keyed
+    # sidecar never matches). ``{"sidecars_present": [...]}``. The stamp is
+    # what lets the stop warn in-band hours later, when the manifest-less
+    # dispatch closes ungraded. Additive: None on every older record and on
+    # every clean capture.
+    intent_miss: dict[str, Any] | None = None
 
     @property
     def state(self) -> str:
@@ -447,6 +461,35 @@ class DispatchRecord:
                     return [str(x) for x in raw if x]
                 return []
         return []
+
+    @property
+    def last_report_interim(self) -> bool:
+        """True when the most recent ``reported`` transition is flagged interim.
+
+        An interim report (``dispatch report --interim``) is a living claim:
+        the report body is on file, the work continues, and the bridge sweep's
+        verify-or-close expectation is not yet armed. Any later plain report,
+        verdict, or terminal transition supersedes the flag. False on every
+        record written before the flag existed and on every hook-recorded
+        report (hooks never file interim).
+        """
+        for entry in reversed(self.transitions):
+            if entry.get("state") == STATE_REPORTED:
+                return bool(entry.get("interim"))
+        return False
+
+    @property
+    def grace_blocks_used(self) -> int:
+        """How many grace blocks this dispatch has consumed (``blocks/`` meta).
+
+        A grace block (0.7.2) is a blocking-check failure the gate blocked
+        WITHOUT recording a ``contradicted`` verdict, because the manifest
+        declared ``grace_stops`` and the budget was not yet spent — the L58
+        cure: a late-produced artifact must not mint a permanent false
+        verdict at an intermediate stop. Counted off the block metas, where
+        the gate stamps ``grace: true``; 0 on every older record.
+        """
+        return sum(1 for b in self.load_blocks() if b.get("grace"))
 
     @property
     def terminate_reason(self) -> str | None:
@@ -604,6 +647,9 @@ class DispatchRecord:
                 "text": text,
                 "at": meta.get("at"),
                 "checker_run_id": meta.get("checker_run_id"),
+                # Grace marker (0.7.2): this block deferred a verdict instead
+                # of recording one. Absent on older metas, read as False.
+                "grace": bool(meta.get("grace")),
             })
         return out
 
@@ -626,6 +672,8 @@ class DispatchRecord:
             "inherited_from": self.inherited_from,
             "inherited_from_state": self.inherited_from_state,
             "inherited_from_verdict": self.inherited_from_verdict,
+            "intent_miss": self.intent_miss,
+            "last_report_interim": self.last_report_interim,
             "state": self.state,
             "verdict": self.verdict,
             "has_report": self.has_report,
@@ -694,6 +742,7 @@ def load_dispatch(run_id: str) -> DispatchRecord | None:
     manifest = dispatch.get("manifest")
     agent = dispatch.get("agent")
     intent_source = dispatch.get("intent_source")
+    intent_miss = dispatch.get("intent_miss")
     return DispatchRecord(
         run_id=run_id,
         run_dir=run_dir,
@@ -713,6 +762,7 @@ def load_dispatch(run_id: str) -> DispatchRecord | None:
         inherited_from=str(dispatch.get("inherited_from") or "") or None,
         inherited_from_state=str(dispatch.get("inherited_from_state") or "") or None,
         inherited_from_verdict=str(dispatch.get("inherited_from_verdict") or "") or None,
+        intent_miss=intent_miss if isinstance(intent_miss, dict) else None,
     )
 
 
@@ -974,6 +1024,57 @@ def find_dispatch_for_stop(
     return _adopt_agent(candidates[0], agent_id, by="hook"), []
 
 
+def find_dispatch_for_start(
+    session_id: str | None,
+    agent_id: str | None,
+    agent_type: str | None,
+) -> tuple[DispatchRecord | None, list[str]]:
+    """The CLI-created dispatch a SubagentStart should JOIN, plus surfacing notes.
+
+    The fork this closes (0.7.2): ``dispatch new --agent-name X`` records the
+    spawn before it happens, but the SubagentStart hook still start-captured a
+    DUPLICATE record for the same spawn — the join only existed at the stop,
+    so every CLI-plus-hook pair put two rows on the board and one had to be
+    parked by hand (observed in a field deployment on Windows, two forked
+    pairs in one session).
+
+    Match rule, deliberately the stop-side name-fallback's mirror: among
+    *open* dispatches whose session equals the payload's exactly, the unique
+    record whose ``agent.capture`` is ``cli``, whose ``agent.agent_type``
+    equals the payload's agent_type, and whose ``agent_id`` is still null.
+    That record adopts this spawn's agent_id now (audit transition appended,
+    same as the stop-side adoption), and the caller creates no new record.
+    Restricted to ``capture == "cli"`` on purpose: only a dispatcher's
+    pre-recorded dispatch is waiting for a spawn; joining anything else would
+    merge two distinct spawns of one agent type.
+
+    Two or more candidates is not a guess a hook gets to make: no join, a
+    note naming them, and the caller captures normally (the 0.7.1 behavior,
+    now with the fork said out loud).
+    """
+    if not agent_type:
+        return None, []
+    candidates = [
+        r for r in list_dispatches(non_terminal_only=True)
+        if r.is_open
+        and (r.session_id or None) == (session_id or None)
+        and isinstance(r.agent, dict)
+        and r.agent.get("capture") == CAPTURE_CLI
+        and r.agent.get("agent_type") == agent_type
+        and not r.agent_id
+    ]
+    if not candidates:
+        return None, []
+    if len(candidates) > 1:
+        listed = ", ".join(r.run_id for r in candidates)
+        return None, [
+            f"ambiguous CLI-dispatch join at spawn: {len(candidates)} open "
+            f"`dispatch new --agent-name` records await an agent of type "
+            f"{agent_type!r} ({listed}) — joining none; capturing a new "
+            "record instead"]
+    return _adopt_agent(candidates[0], agent_id, by="hook"), []
+
+
 # === Intent inheritance ===
 
 def carried_declared_intent(record: DispatchRecord) -> bool:
@@ -1168,6 +1269,20 @@ def _coerce_manifest(raw: Any) -> dict[str, Any]:
     return out
 
 
+def coerce_manifest(raw: Any) -> dict[str, Any]:
+    """Public face of manifest validation/normalization.
+
+    Raises :class:`LedgerError` (never a bare ValueError) so callers outside
+    this module get the same error type every other ledger verb raises.
+    Added for the post-hoc grade path (``dispatch verify --manifest``), which
+    must validate an operator-supplied manifest before touching the record.
+    """
+    try:
+        return _coerce_manifest(raw)
+    except ValueError as e:
+        raise LedgerError(f"Unusable manifest: {e}") from e
+
+
 def derive_manifest(prompt: str) -> dict[str, Any]:
     """Derive a manifest from a dispatch prompt. Derivation template v1.
 
@@ -1271,6 +1386,60 @@ def write_intent(
     path.parent.mkdir(parents=True, exist_ok=True)
     _write_json(path, intent)
     return path
+
+
+def list_intents() -> list[dict[str, Any]]:
+    """Every unconsumed intent sidecar on disk: ``{file, agent_type, role,
+    created_at}``, sorted by file name. Unreadable sidecars are listed with
+    null fields rather than hidden — an unreadable sidecar still gets
+    consumed-and-degraded by the next matching spawn, so it is still a fact
+    the hygiene surfaces must show.
+
+    This is the staleness surface (0.7.2): an unconsumed sidecar is consumed
+    by the NEXT spawn of its agent type, whatever that spawn is, so a stale
+    one misattributes a prompt. The board footer lists these with their age;
+    ``dispatch sweep --intents`` clears the old ones.
+    """
+    directory = intents_dir()
+    if not directory.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    for path in sorted(directory.glob("*.json")):
+        raw = _read_json(path) or {}
+        out.append({
+            "file": path.name,
+            "path": str(path),
+            "agent_type": raw.get("agent_type"),
+            "role": raw.get("role"),
+            "created_at": raw.get("created_at"),
+        })
+    return out
+
+
+# The manifest key that declares check-grace (0.7.2, lesson L58): how many
+# failing-blocking-check stops the gate blocks WITHOUT recording a verdict
+# before failures start grading ``contradicted``. For dispatches whose
+# blocking checks assert on artifacts produced late in a long build —
+# intermediate stops fail the check while the work is mid-flight, and a
+# contradicted verdict is permanent by design.
+MANIFEST_GRACE_KEY = "grace_stops"
+
+
+def manifest_grace_stops(manifest: dict[str, Any] | None) -> int:
+    """The declared check-grace budget, tolerantly read: an int >= 1, else 0.
+
+    Tolerant on purpose, never raising: this is read inside the gate, and a
+    typo'd declaration must degrade to "no grace" (the pre-0.7.2 behavior)
+    with the caller free to say so — not crash a hook, and not nuke the
+    manifest the way a coerce-side rejection would. ``True`` is not a budget
+    (bool is an int in Python; an explicit count keeps the bound visible).
+    """
+    if not isinstance(manifest, dict):
+        return 0
+    raw = manifest.get(MANIFEST_GRACE_KEY)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return 0
+    return raw if raw >= 1 else 0
 
 
 def _intent_by_role(agent_type: str | None) -> Path | None:
@@ -1522,6 +1691,7 @@ def create_dispatch(
     inherited_from: str | None = None,
     inherited_from_state: str | None = None,
     inherited_from_verdict: str | None = None,
+    intent_miss: dict[str, Any] | None = None,
 ) -> str:
     """Record a dispatch at launch and return its run id.
 
@@ -1646,6 +1816,11 @@ def create_dispatch(
         if inherited_from_state:
             dispatch["inherited_from_state"] = inherited_from_state
             dispatch["inherited_from_verdict"] = inherited_from_verdict
+    # The intent-miss stamp: only a capture that missed while sidecars sat on
+    # disk writes it (see DispatchRecord.intent_miss). Omitted entirely
+    # otherwise, so clean records keep their exact shape.
+    if intent_miss is not None:
+        dispatch["intent_miss"] = dict(intent_miss)
     _write_json(run_dir / DISPATCH_FILENAME, dispatch)
     return run_id
 
@@ -1740,18 +1915,29 @@ def report_content_hash(report: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def record_report(run_id: str, report: dict[str, Any], by: str = "cli") -> DispatchRecord:
+def record_report(
+    run_id: str, report: dict[str, Any], by: str = "cli", interim: bool = False,
+) -> DispatchRecord:
     """Store what the dispatched agent claimed, then mark it ``reported``.
 
     The report is written verbatim: it is the agent's own claim, and the whole
     point of keeping it is being able to diff a claim against a verdict later.
 
-    Legal from ``dispatched`` and from ``contradicted`` (the gate-blocked retry).
-    A retry overwrites ``report.json`` with the newer claim and *appends* the
-    same payload as ``reports/NNN.json``, so every attempt's body survives —
-    the transition list keeps the per-attempt hash, and the numbered file is
-    the body that hash is of. (Before this, two of an agent's three reports
-    were gone from disk — observed in a field deployment on Windows.)
+    Legal from ``dispatched``, from ``contradicted`` (the gate-blocked retry),
+    and — 0.7.2 — from ``reported`` itself (a grace- or drift-blocked retry,
+    or an interim report superseded by the final one). A retry overwrites
+    ``report.json`` with the newer claim and *appends* the same payload as
+    ``reports/NNN.json``, so every attempt's body survives — the transition
+    list keeps the per-attempt hash, and the numbered file is the body that
+    hash is of. (Before this, two of an agent's three reports were gone from
+    disk — observed in a field deployment on Windows.)
+
+    ``interim`` flags a living report: the body is on file, the work
+    continues, and the bridge sweep's verify-or-close expectation stays
+    un-armed until a plain (final) report or a terminal transition lands
+    (session-0083 dogfood finding: a report folded in before its completion
+    message read as a stop-gate violation). The flag rides the transition,
+    never the body — the claim is the agent's, the lifecycle is the ledger's.
     """
     record = _require_dispatch(run_id)
     validated = _validate_report(report)
@@ -1768,14 +1954,15 @@ def record_report(run_id: str, report: dict[str, Any], by: str = "cli") -> Dispa
     reports = record.run_dir / REPORTS_DIRNAME
     reports.mkdir(exist_ok=True)
     _write_json(reports / (_next_sequence_name(reports, ".json") + ".json"), validated)
-    return _append_transition(
-        run_id, STATE_REPORTED, by,
-        extra={"report_sha256": report_content_hash(validated)},
-    )
+    extra: dict[str, Any] = {"report_sha256": report_content_hash(validated)}
+    if interim:
+        extra["interim"] = True
+    return _append_transition(run_id, STATE_REPORTED, by, extra=extra)
 
 
 def record_block(
     run_id: str, text: str, checker_run_id: str | None = None,
+    grace: bool = False,
 ) -> Path:
     """Persist the verbatim block text an agent was handed. Returns the .txt path.
 
@@ -1785,7 +1972,10 @@ def record_block(
     the exact text the agent read, which decides whether a wedged agent was
     wedged by a bad check or by bad wording. ``checker_run_id`` names the
     evidence run the text was composed from, when there was one (a pin-drift
-    or no-report block runs no checker).
+    or no-report block runs no checker). ``grace`` marks a check-grace block
+    (0.7.2): a blocking failure the gate blocked without recording a verdict,
+    drawing on the manifest's declared ``grace_stops`` budget — the marker is
+    what :attr:`DispatchRecord.grace_blocks_used` counts.
     """
     record = _require_dispatch(run_id)
     blocks = record.run_dir / BLOCKS_DIRNAME
@@ -1793,10 +1983,13 @@ def record_block(
     seq = _next_sequence_name(blocks, BLOCK_TEXT_SUFFIX)
     path = blocks / (seq + BLOCK_TEXT_SUFFIX)
     path.write_text(text, encoding="utf-8")
-    _write_json(blocks / (seq + BLOCK_META_SUFFIX), {
+    meta: dict[str, Any] = {
         "at": _now_iso(),
         "checker_run_id": checker_run_id,
-    })
+    }
+    if grace:
+        meta["grace"] = True
+    _write_json(blocks / (seq + BLOCK_META_SUFFIX), meta)
     return path
 
 

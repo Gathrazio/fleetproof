@@ -246,12 +246,20 @@ def test_nothing_follows_terminated(ledger_runs):
     assert load_dispatch(run_id).has_report is False
 
 
-def test_second_report_rejected(ledger_runs):
+def test_second_report_supersedes_with_history_kept(ledger_runs):
+    # 0.7.2: reported -> reported is legal. A grace- or pin-drift-blocked
+    # retry (and an interim report's final) lands on a dispatch still at
+    # ``reported``; refusing the re-report kept the STALE first claim as the
+    # body on file. The newest claim wins report.json; every attempt's body
+    # survives in reports/NNN.json with its hash on the transition.
     run_id = create_dispatch("work")
     record_report(run_id, _ok_report("first"))
-    with pytest.raises(LedgerError):
-        record_report(run_id, _ok_report("revised"))
-    assert load_dispatch(run_id).load_report()["summary"] == "first"
+    record_report(run_id, _ok_report("revised"))
+    record = load_dispatch(run_id)
+    assert record.load_report()["summary"] == "revised"
+    assert [r["summary"] for r in record.load_reports()] == ["first", "revised"]
+    assert [t["state"] for t in record.transitions] == [
+        STATE_DISPATCHED, STATE_REPORTED, STATE_REPORTED]
 
 
 def test_contradicted_dispatch_may_report_again(ledger_runs):
